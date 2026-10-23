@@ -10,6 +10,7 @@ from typing import Any, Literal, NamedTuple
 from healthcheck.config import Config, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, ScratchRead
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
+from healthcheck.util.status import Status, ok
 
 type Severity = Literal["fail", "warn"]
 
@@ -52,7 +53,7 @@ def _step(node: dict[str, Any], name: str, findings: list[Finding]) -> dict[str,
     if result is None:
         findings.append(Finding("fail", name, "not run"))
         return None
-    if result["status"] != "ok":
+    if not ok(result):
         findings.append(Finding("fail", name, f"{result['status']}: {result.get('error', '')}".strip(": ")))
         return None
     return result["data"]
@@ -116,7 +117,7 @@ def check_sysinfo(data: dict[str, Any], gpu_cfg: Gpu, nic_cfg: Nic) -> list[Find
 
 
 def check_scratch_read(data: dict[str, Any], cfg: ScratchRead) -> list[Finding]:
-    if data["status"] != "ok":
+    if not ok(data):
         return [Finding("warn", "scratch.read", f"{data['status']}: {data['path']} (run setup)")]
     if data["gbps"] < cfg.min_gbps:
         return [Finding(cfg.severity, "scratch.read", f"read {data['gbps']} < {cfg.min_gbps} GB/s")]
@@ -148,7 +149,7 @@ def check_local_tmp(data: dict[str, Any], cfg: LocalTmp) -> list[Finding]:
 
 
 def check_dcgm(data: dict[str, Any], cfg: Dcgm) -> list[Finding]:
-    if data["status"] == "skipped":
+    if data["status"] == Status.SKIPPED:
         return [Finding("warn", "dcgm", f"not run (dcgm={data['mode']})")] if cfg.enabled else []
     out = []
     for name, test in data["tests"].items():
@@ -172,11 +173,10 @@ def check_logs(data: dict[str, Any], cfg: Logs) -> list[Finding]:
         for key, increase in delta["increased"].items():
             if key.startswith("ecc_aggregate"):
                 continue  # rises with ecc_volatile, which is reported
+            nvlink_over = key.startswith("nvlink_errors") and increase > cfg.max_nvlink_error_delta
             if key.endswith("uncorrected") or key.startswith("remapped_rows"):
                 out.append(Finding("fail", "logs.counters", f"GPU{delta['index']} {key} +{increase}"))
-            elif key.startswith("nvlink_errors") and increase > cfg.max_nvlink_error_delta:
-                out.append(Finding("warn", "logs.counters", f"GPU{delta['index']} {key} +{increase}"))
-            elif key.endswith("corrected"):
+            elif nvlink_over or key.endswith("corrected"):
                 out.append(Finding("warn", "logs.counters", f"GPU{delta['index']} {key} +{increase}"))
         if delta["hw_throttle"]:
             out.append(Finding("warn", "logs.throttle", f"GPU{delta['index']} {','.join(delta['hw_throttle'])}"))
@@ -243,13 +243,12 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
     for test in tests:
         by_kind[test["kind"]].append(test)
     medians = {
-        kind: _median([test["peak_busbw"] for test in kind_tests if test["status"] == "ok"])
-        for kind, kind_tests in by_kind.items()
+        kind: _median([test["peak_busbw"] for test in kind_tests if ok(test)]) for kind, kind_tests in by_kind.items()
     }
 
     for kind, minimum in (("intra", cfg.intra_min_busbw), ("loopback", cfg.loopback_min_busbw)):
         for test in by_kind[kind]:
-            if test["status"] != "ok":
+            if not ok(test):
                 out[test["nodes"][0]].append(Finding("fail", f"nccl.{kind}", f"{test['status']} ({test['log']})"))
             elif test["peak_busbw"] < minimum:
                 out[test["nodes"][0]].append(Finding("fail", f"nccl.{kind}", f"busbw {test['peak_busbw']} < {minimum}"))
@@ -261,7 +260,7 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
     pairs_of: Counter[str] = Counter()
     for test in by_kind["pair"]:
         pairs_of.update(test["nodes"])
-        if test["status"] != "ok" or test["peak_busbw"] < pair_floor:
+        if not ok(test) or test["peak_busbw"] < pair_floor:
             for node in test["nodes"]:
                 other = next(peer for peer in test["nodes"] if peer != node)
                 slow[node].append(f"{other}: {test['status']} {test['peak_busbw']}")
@@ -277,10 +276,10 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
 
     group_floor = max(cfg.group_min_busbw, (medians.get("group") or 0) * cfg.group_min_frac_of_median)
     for test in by_kind["group"]:
-        if test["status"] != "ok" or test["peak_busbw"] < group_floor:
+        if not ok(test) or test["peak_busbw"] < group_floor:
             # A hung group with no node already failing for it can't be blamed on one, so every node in it fails
             blamed = any(finding.severity == "fail" for node in test["nodes"] for finding in out.get(node, []))
-            severity = "fail" if test["status"] == "timeout" and not blamed else "warn"
+            severity = "fail" if test["status"] == Status.TIMEOUT and not blamed else "warn"
             for node in test["nodes"]:
                 out[node].append(
                     Finding(
@@ -316,7 +315,7 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
             findings[host] += check_sysinfo(data, cfg.gpu, cfg.nic)
         if data := _step(node, "scratch", findings[host]):
             findings[host] += check_scratch_read(data, cfg.scratch.read)
-            if data["status"] == "ok":
+            if ok(data):
                 scratch[host] = data["gbps"]
         if data := _step(node, "local_tmp", findings[host]):
             findings[host] += check_local_tmp(data, cfg.local_tmp)

@@ -201,6 +201,10 @@ class Paths(Section):
     def group_logs(self, job_id: str) -> Path:
         return self.groups / job_id
 
+    def numa(self, host: str) -> Path:
+        """The node's NUMA layout table, from its sysinfo."""
+        return self.root / "numa" / f"{host}.json"
+
     def xid(self, host: str) -> Path:
         return self.root / "xid" / f"{host}.jsonl"
 

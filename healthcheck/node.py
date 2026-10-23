@@ -1,6 +1,6 @@
 """Per-node entry point, one srun task per node: `python -m healthcheck.node {local,watch,finalize}`.
 
-Each node writes only its own <run>/nodes/<host>.json.
+Each node writes only its own <run>/nodes/<host>.json and <run>/numa/<host>.json.
 """
 
 import argparse
@@ -19,15 +19,16 @@ from healthcheck import dcgm, local_tmp, logs, scratch, sysinfo
 from healthcheck.config import cfg
 from healthcheck.util.file import JsonDict, read_json, write_json
 from healthcheck.util.nvml import session
+from healthcheck.util.status import Status, ok
 
 
 def step(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> JsonDict:
     """Run one check; a crash is recorded rather than propagated, so other checks still report."""
     start = time.monotonic()
     try:
-        result = {"status": "ok", "data": fn(*args, **kwargs)}
+        result = {"status": Status.OK, "data": fn(*args, **kwargs)}
     except Exception as error:  # noqa: BLE001 - any failure is a node finding
-        result = {"status": "error", "error": f"{type(error).__name__}: {error}"}
+        result = {"status": Status.ERROR, "error": f"{type(error).__name__}: {error}"}
     result["elapsed_s"] = round(time.monotonic() - start, 2)
     return result
 
@@ -46,7 +47,7 @@ def local() -> None:
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {
-            "sysinfo": pool.submit(step, sysinfo.collect, host),
+            "sysinfo": pool.submit(step, sysinfo.collect, host, cfg.nic.link_layer),
             "scratch": pool.submit(step, scratch.collect, cfg.paths.base, cfg.scratch, host),
             "local_tmp": pool.submit(step, local_tmp.collect, cfg.local_tmp, host),
             "dcgm": pool.submit(step, dcgm.collect, cfg.dcgm, env, cfg.paths.dcgm_logs(host)),
@@ -54,7 +55,11 @@ def local() -> None:
         for name, future in futures.items():
             out[name] = future.result()
             print(f"{host} {name}: {out[name]['status']} in {out[name]['elapsed_s']}s", flush=True)
+    # sysinfo returns the NUMA layout for its own file; the node's results are written first, so they survive a failure
+    numa_layout = out["sysinfo"].get("data", {}).pop(sysinfo.NUMA_LAYOUT, None) if ok(out["sysinfo"]) else None
     write_json(path, out)
+    if numa_layout is not None:
+        write_json(cfg.paths.numa(host), numa_layout)
 
 
 def watch() -> None:

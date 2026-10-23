@@ -1,3 +1,4 @@
+import sys
 import time
 
 from healthcheck import nccl
@@ -67,7 +68,39 @@ def test_run_round_terminates_stragglers(tmp_path):
         def command(self, test):
             return ["sleep", "30"]
 
+    logs = tmp_path / "nccl"
+    logs.mkdir()
+    (logs / "pair-a-b.b.7.log").touch()  # a remote rank that may outlive srun: its log is kept
     start = time.monotonic()
-    [result] = nccl.run_round([nccl.Run("pair", ("a", "b"))], Sleeper(), tmp_path, timeout=0.5)
+    [result] = nccl.run_round([nccl.Run("pair", ("a", "b"))], Sleeper(), tmp_path, timeout=0.5, debug_dir=logs)
     assert result["status"] == "timeout"
     assert time.monotonic() - start < 10
+    assert (logs / "pair-a-b.b.7.log").exists()
+
+
+def test_run_round_names_debug_logs_and_removes_empty_ones(tmp_path):
+    """Two ranks fill in NCCL_DEBUG_FILE's %h and %p as NCCL does; only rank 0 writes, its version line."""
+    rank = tmp_path / "rank.py"
+    rank.write_text(
+        "import os, sys\n"
+        'path = os.environ["NCCL_DEBUG_FILE"].replace("%h", sys.argv[1]).replace("%p", sys.argv[2])\n'
+        'open(path, "w").write(" ".join(sys.argv[3:]))\n'
+    )
+
+    class Ranks:
+        """Stands in for Launch."""
+
+        def command(self, test):
+            host = test.nodes[0]
+            return [
+                "sh",
+                "-c",
+                f"{sys.executable} {rank} {host} 100 NCCL version && {sys.executable} {rank} {host} 101",
+            ]
+
+    logs = tmp_path / "nccl"
+    logs.mkdir()
+    (logs / "intra-b.b.7.log").touch()  # another job's rank, still running
+    nccl.run_round([nccl.Run("intra", ("a",))], Ranks(), tmp_path / "groups", debug_dir=logs)
+    assert sorted(path.name for path in logs.iterdir()) == ["intra-a.a.100.log", "intra-b.b.7.log"]
+    assert (logs / "intra-a.a.100.log").read_text() == "NCCL version"

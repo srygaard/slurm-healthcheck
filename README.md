@@ -53,6 +53,8 @@ Each node runs three phases:
 
 1. **Phase A**, four steps in parallel; the job's time limit caps them:
    - **sysinfo**: GPU driver, CUDA, ECC, remapped rows, PCIe, NVLink; IB firmware, port state and rate; MTU;
+     NUMA nodes and each GPU's and HCA's PCI address, ids, NUMA node and PCIe root port, from which each node
+     writes its NUMA layout table to `<run>/numa/<host>.json`;
      kernel, OS and OFED.
    - **scratch**: `$SCRATCH` read.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
@@ -86,7 +88,9 @@ results/<job_id>/
   switches.json                      node -> leaf switch, written at submit
   nodes/<host>.json                  per-node results, including the env.json they ran with
   groups/<job_id>.json               NCCL results; raw output in groups/<job_id>/
-  logs/nccl/  xid/                   NCCL debug logs, Xid events
+  logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log), kept only if a rank wrote one
+  numa/<host>.json                   per-node NUMA layout table
+  xid/<host>.jsonl                   Xid events
 ```
 Setup jobs only have `jobs/`, plus the probe's DCGM and MPI test output.
 

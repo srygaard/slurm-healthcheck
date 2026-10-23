@@ -15,6 +15,7 @@ from healthcheck.config import Logs, Paths
 from healthcheck.sysinfo import gpu
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict
+from healthcheck.util.status import Status
 
 
 def _matches(lines: list[str], patterns: list[str], limit: int = 50) -> list[str]:
@@ -26,7 +27,7 @@ def kernel(patterns: list[str], since: float) -> JsonDict:
     out: dict[str, Json] = {}
     dmesg = run(["dmesg", "--time-format", "iso", "--level", "emerg,alert,crit,err,warn"], timeout=15)
     if dmesg.returncode:
-        out["dmesg"] = {"status": "unavailable", "error": dmesg.stderr.strip()[:200]}
+        out["dmesg"] = {"status": Status.UNAVAILABLE, "error": dmesg.stderr.strip()[:200]}
     else:
         recent = []
         for line in dmesg.stdout.splitlines():
@@ -36,18 +37,33 @@ def kernel(patterns: list[str], since: float) -> JsonDict:
                 continue
             if stamp.timestamp() >= since:
                 recent.append(line)
-        out["dmesg"] = {"status": "ok", "matches": _matches(recent, patterns)}
+        out["dmesg"] = {"status": Status.OK, "matches": _matches(recent, patterns)}
 
     journal = run(["journalctl", "-k", "-p", "warning", "--since", f"@{int(since)}", "--no-pager", "-q"], timeout=15)
     if journal.returncode or "insufficient permissions" in journal.stderr + journal.stdout:
-        out["journal"] = {"status": "unavailable", "error": (journal.stderr or journal.stdout).strip()[:200]}
+        out["journal"] = {"status": Status.UNAVAILABLE, "error": (journal.stderr or journal.stdout).strip()[:200]}
     else:
-        out["journal"] = {"status": "ok", "matches": _matches(journal.stdout.splitlines(), patterns)}
+        out["journal"] = {"status": Status.OK, "matches": _matches(journal.stdout.splitlines(), patterns)}
     return out
 
 
+def _rank_log(host: str) -> re.Pattern[str]:
+    return re.compile(rf"[^.]*\.{re.escape(host)}(\.[\w-]+)*\.\d+\.log")
+
+
 def nccl_logs(log_dir: Path, host: str, patterns: list[str]) -> JsonDict:
-    files = sorted(log_dir.glob(f"{host}*.log"))
+    """
+    The host's ranks' debug logs, <test label>.<host>.<pid>.log: a pair's label names the other host too, and %h may
+    add the host's domain.
+
+    >>> name = _rank_log("n1")
+    >>> [bool(name.fullmatch(log)) for log in ["pair-n1-n2.n1.7.log", "pair-n1-n2.n2.7.log", "intra-n1.n1.ex.org.7.log"]]
+    [True, False, True]
+    >>> bool(name.fullmatch("intra-rack-n1.rack-n1.7.log"))
+    False
+    """
+    name = _rank_log(host)
+    files = sorted(path for path in log_dir.glob("*.log") if name.fullmatch(path.name))
     lines = [line for log in files for line in log.read_text(errors="replace").splitlines()]
     matches = _matches(lines, patterns, limit=10_000)
     return {"files": len(files), "count": len(matches), "matches": matches[:30]}
@@ -57,11 +73,11 @@ def xid_events(path: Path, ignore: list[int]) -> JsonDict:
     try:
         events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     except FileNotFoundError:
-        return {"status": "unavailable", "error": "watcher wrote nothing"}
+        return {"status": Status.UNAVAILABLE, "error": "watcher wrote nothing"}
     xids = [event for event in events if event.get("event") == "xid"]
     errors = [event for event in events if event.get("event") == "error"]
     return {
-        "status": "ok" if any(event.get("event") == "started" for event in events) else "unavailable",
+        "status": Status.OK if any(event.get("event") == "started" for event in events) else Status.UNAVAILABLE,
         "events": [xid for xid in xids if xid["xid"] not in ignore],
         "ignored": [xid for xid in xids if xid["xid"] in ignore],
         "errors": errors,
@@ -99,7 +115,7 @@ def collect(
     since: float,
     before: Sequence[Mapping[str, Any]] | None,
 ) -> JsonDict:
-    after = gpu.counters()
+    after = [snapshot.to_json() for snapshot in gpu.counters()]
     return {
         "kernel": kernel(cfg.kernel_patterns, since),
         "nccl": nccl_logs(run.nccl_logs, host, cfg.nccl_fail_patterns),
