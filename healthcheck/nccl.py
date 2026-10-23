@@ -20,6 +20,7 @@ from healthcheck.config import cfg
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, read_json, write_json
 from healthcheck.util.hostlist import Hostlist
+from healthcheck.util.status import Status
 from healthcheck.util.switches import node_switches
 
 
@@ -116,21 +117,34 @@ class Launch(NamedTuple):
         ]
 
 
-def run_round(tests: list[Run], launch: Launch, out_dir: Path, timeout: float | None = None) -> list[dict[str, Any]]:
-    """Run tests concurrently; a straggler past the timeout, if given, is terminated and reported as such."""
+def run_round(
+    tests: list[Run],
+    launch: Launch,
+    out_dir: Path,
+    timeout: float | None = None,
+    debug_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Run tests concurrently; a straggler past the timeout, if given, is terminated and reported as such.
+
+    With debug_dir, each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and the empty ones of
+    tests that finished are removed after it: at NCCL_DEBUG=WARN a healthy rank writes nothing, rank 0 only the
+    version. A timed-out test's are all kept, since its remote ranks may outlive srun and still be writing.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
     start = time.monotonic()
     for test in tests:
         log = out_dir / f"{test.label}.txt"
+        env = os.environ | test.env
+        if debug_dir is not None:
+            env["NCCL_DEBUG_FILE"] = str(debug_dir / f"{test.label}.%h.%p.log")
         with open(log, "w") as output:
             procs.append(
                 (
                     test,
                     log,
-                    subprocess.Popen(
-                        launch.command(test), stdout=output, stderr=subprocess.STDOUT, env=os.environ | test.env
-                    ),
+                    subprocess.Popen(launch.command(test), stdout=output, stderr=subprocess.STDOUT, env=env),
                 )
             )
     # Poll rather than wait on each in turn, so each test's elapsed time is its own
@@ -145,8 +159,8 @@ def run_round(tests: list[Run], launch: Launch, out_dir: Path, timeout: float | 
         time.sleep(0.2)
     results = []
     for index, (test, log, proc) in enumerate(procs):
-        status = "ok" if index in ended else "timeout"
-        if status == "timeout":
+        status = Status.OK if index in ended else Status.TIMEOUT
+        if status == Status.TIMEOUT:
             proc.send_signal(signal.SIGTERM)  # srun cancels the step
             try:
                 proc.wait(timeout=15)
@@ -154,10 +168,10 @@ def run_round(tests: list[Run], launch: Launch, out_dir: Path, timeout: float | 
                 proc.kill()
                 proc.wait()
         parsed = parse(log.read_text(errors="replace"))
-        if status == "ok" and (proc.returncode or parsed["peak_busbw"] is None):
-            status = "error"
-        elif status == "ok" and parsed["wrong"]:
-            status = "wrong"
+        if status == Status.OK and (proc.returncode or parsed["peak_busbw"] is None):
+            status = Status.ERROR
+        elif status == Status.OK and parsed["wrong"]:
+            status = Status.WRONG
         results.append(
             {
                 "kind": test.kind,
@@ -171,10 +185,20 @@ def run_round(tests: list[Run], launch: Launch, out_dir: Path, timeout: float | 
                 "log": str(log),
             }
         )
+    if debug_dir is not None:
+        # Only this round's finished tests: the run's other jobs share debug_dir, and their ranks may still be writing
+        for index, (test, _, _) in enumerate(procs):
+            for path in debug_dir.glob(f"{test.label}.*.log") if index in ended else ():
+                if path.stat().st_size == 0:
+                    path.unlink(missing_ok=True)
     return results
 
 
-def plan(nodes: list[str], loopback_env: dict[str, str], switch_of: Mapping[str, str]) -> list[list[Run]]:
+def plan(
+    nodes: list[str],
+    loopback_env: dict[str, str],
+    switch_of: Mapping[str, str],
+) -> list[list[Run]]:
     """
     Rounds of concurrent tests; each kind takes about the same time at any node count.
 
@@ -202,9 +226,9 @@ def plan(nodes: list[str], loopback_env: dict[str, str], switch_of: Mapping[str,
 
 def main() -> int:
     results = cfg.paths
-    # srun passes these to every rank; finalize scans the logs for warnings
+    # srun passes these to every rank; run_round names each rank's debug log, and finalize scans them for warnings
     results.nccl_logs.mkdir(parents=True, exist_ok=True)
-    os.environ |= {"NCCL_DEBUG": cfg.nccl.debug, "NCCL_DEBUG_FILE": str(results.nccl_logs / "%h-%p.log")}
+    os.environ["NCCL_DEBUG"] = cfg.nccl.debug
     env = read_json(cfg.paths.env) or {}
     job_id = os.environ["SLURM_JOB_ID"]
     nodes = run(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]], timeout=30).stdout.split()
@@ -214,7 +238,8 @@ def main() -> int:
     finished: list[dict[str, Any]] = []
     out: dict[str, Json] = {"job_id": job_id, "nodes": nodes, "mpi": launch.mpi, "tests": finished}
     for tests in plan(nodes, cfg.nccl.loopback_env, node_switches()):
-        finished += run_round(tests, launch, results.group_logs(job_id), timeout=cfg.nccl.timeout_s[tests[0].kind])
+        timeout = cfg.nccl.timeout_s[tests[0].kind]
+        finished += run_round(tests, launch, results.group_logs(job_id), timeout, results.nccl_logs)
         out["elapsed_s"] = round(time.monotonic() - start, 1)  # the phase's wall time; a round's tests overlap
         write_json(results.group(job_id), out)  # after each round, in case the job is killed
         print(

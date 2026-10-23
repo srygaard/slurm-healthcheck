@@ -9,6 +9,7 @@ from healthcheck.config import LocalTmp
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict
 from healthcheck.util.io_throughput import read_throughput, write_throughput
+from healthcheck.util.status import Status, ok
 
 
 def rw(directory: Path, host: str, gib: float, max_s: float, block_mib: int) -> JsonDict:
@@ -26,7 +27,7 @@ def smart() -> JsonDict:
     """SMART health per local disk; needs root on most systems, so unavailable is expected."""
     lsblk = run(["lsblk", "-J", "-d", "-o", "NAME,TYPE,TRAN,MODEL,SIZE"], timeout=10)
     if lsblk.returncode:
-        return {"status": "unavailable", "error": lsblk.stderr.strip()}
+        return {"status": Status.UNAVAILABLE, "error": lsblk.stderr.strip()}
     disks = [device for device in json.loads(lsblk.stdout)["blockdevices"] if device["type"] == "disk"]
     results: dict[str, JsonDict] = {}
     for disk in disks:
@@ -34,17 +35,17 @@ def smart() -> JsonDict:
         try:
             report = json.loads(out.stdout)
         except json.JSONDecodeError:
-            results[disk["name"]] = {"status": "unavailable", "error": out.stderr.strip()[:200]}
+            results[disk["name"]] = {"status": Status.UNAVAILABLE, "error": out.stderr.strip()[:200]}
             continue
         passed = report.get("smart_status", {}).get("passed")
         messages = [message.get("string") for message in report.get("smartctl", {}).get("messages", [])]
         results[disk["name"]] = {
-            "status": "unavailable" if passed is None else "ok",
+            "status": Status.UNAVAILABLE if passed is None else Status.OK,
             "passed": passed,
             "model": disk.get("model"),
             "messages": messages,
         }
-    status = "ok" if any(result["status"] == "ok" for result in results.values()) else "unavailable"
+    status = Status.OK if any(ok(result) for result in results.values()) else Status.UNAVAILABLE
     return {"status": status, "disks": results}
 
 

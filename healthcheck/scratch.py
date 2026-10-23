@@ -8,6 +8,7 @@ from pathlib import Path
 from healthcheck.config import Scratch, cfg
 from healthcheck.util.file import JsonDict
 from healthcheck.util.io_throughput import read_throughput
+from healthcheck.util.status import Status
 
 
 def file_path(base: Path, index: int) -> Path:
@@ -30,9 +31,9 @@ def collect(base: Path, cfg: Scratch, host: str) -> JsonDict:
     """Read one of the files written by setup; spread nodes across files to avoid one hot OST set."""
     path = file_path(base, zlib.crc32(host.encode()) % cfg.files)
     if not path.is_file():
-        return {"status": "missing", "path": str(path)}
+        return {"status": Status.MISSING, "path": str(path)}
     return {
-        "status": "ok",
+        "status": Status.OK,
         "path": str(path),
         **read_throughput(path, float("inf"), cfg.read.max_s, cfg.read.block_mib * 2**20, loop=True),
     }

@@ -9,6 +9,7 @@ from typing import Any
 from healthcheck import dcgm, nccl
 from healthcheck.config import cfg
 from healthcheck.util.file import write_json
+from healthcheck.util.status import ok
 
 
 def main() -> int:
@@ -62,7 +63,7 @@ def main() -> int:
             [nccl.Run("probe", (cfg.host.name,))], launch, base / "results" / str(env["probe_job"]) / mpi, timeout=120
         )
         env["attempts"].append({"mpi": mpi, **result})
-        if result["status"] == "ok":
+        if ok(result):
             env["mpi"] = mpi
             break
 

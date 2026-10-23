@@ -10,6 +10,7 @@ from typing import Any
 from healthcheck.config import Dcgm
 from healthcheck.util.cmd import Cmd, run
 from healthcheck.util.file import JsonDict
+from healthcheck.util.status import Status
 
 # Our own hostengine, for hosts without a running one: non-root, so keep pid and log in a temp dir.
 SELF_HOSTED = """
@@ -115,12 +116,12 @@ def parse(stdout: str) -> dict[str, Any]:
 def collect(cfg: Dcgm, env: dict[str, Any], log_dir: Path) -> JsonDict:
     mode = env.get("dcgm", "none")
     if not cfg.enabled or mode == "none":
-        return {"status": "skipped", "mode": mode}
+        return {"status": Status.SKIPPED, "mode": mode}
     tests = ",".join(cfg.tests) or str(
         cfg.level
     )  # the `dcgmi diag -r` argument: the listed tests if any, else the level
     return {
-        "status": "ok",
+        "status": Status.OK,
         "mode": mode,
         "suite": tests,
         **diag(mode, tests, cfg.port, None, log_dir, ";".join(cfg.parameters)),
