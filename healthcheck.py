@@ -5,7 +5,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
@@ -21,6 +23,7 @@ from launcher.sbatch import sbatch
 from launcher.slurm import detect_cluster, sacct_states, wait_for
 
 REPO = Path(__file__).parent
+
 
 
 class Ansi(StrEnum):
@@ -76,10 +79,18 @@ def sbatch_options(base: Path, label: str, run_id: int | None, env: Mapping[str,
     ]
 
 
+def template(name: str) -> str:
+    return (REPO / "slurm" / "templates" / f"{name}.{detect_cluster()}.sh").read_text()
+
+
 def job_script(name: str, command: str) -> str:
     """slurm/templates/<name>.<cluster>.sh followed by command."""
-    template = REPO / "slurm" / "templates" / f"{name}.{detect_cluster()}.sh"
-    return f"{template.read_text().rstrip()}\n\n{command}\n"
+    return f"{template(name).rstrip()}\n\n{command}\n"
+
+
+def sbatch_directives(name: str) -> dict[str, str]:
+    """The template's `#SBATCH --option=value` lines as {option: value}."""
+    return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(name), re.MULTILINE))
 
 
 def submit(
@@ -108,21 +119,19 @@ def submit(
 
 
 def cmd_setup() -> int:
-    """Submit the build job, then the probe job once the build succeeds."""
+    """Build on the login node, which can reach git and PyPI, then submit the probe job."""
     base = base_dir()
     uv = shutil.which("uv")
     if not uv:
         raise SystemExit(f"{Ansi.RED}uv not found on PATH{Ansi.RESET}")
-    commands = {
-        "build": 'bash "$HC_CODE/slurm/scripts/build.sh"',
-        "probe": 'exec "$HC_VENV/bin/python" -m healthcheck.probe',
-    }
-    job_id = None
-    for name, command in commands.items():
-        job_id = submit(name, command, base, name, {"HC_UV": uv}, [f"--dependency=afterok:{job_id}"] if job_id else [])
-        if not job_id:
-            return 1
-        print(f"{name} job {Ansi.PURPLE}{job_id}{Ansi.RESET}: log {base}/results/{job_id}/jobs/{job_id}-stdout.txt")
+    env = {name: str(value) for name, value in job_env(base, None, {"HC_UV": uv}).items()}
+    if subprocess.run(["bash", REPO / "slurm" / "scripts" / "build.sh"], env=os.environ | env).returncode:
+        print(f"{Ansi.RED}Build failed{Ansi.RESET}")
+        return 1
+    job_id = submit("probe", 'exec "$HC_VENV/bin/python" -m healthcheck.probe', base, "probe")
+    if not job_id:
+        return 1
+    print(f"probe job {Ansi.PURPLE}{job_id}{Ansi.RESET}: log {base}/results/{job_id}/jobs/{job_id}-stdout.txt")
     return 0
 
 
@@ -142,14 +151,28 @@ def cmd_run(args: argparse.Namespace) -> int:
         groups = {f"any{args.any}": Hostlist()}
         print(f"1 job on any {args.any} free node(s)")
     else:
+        # The nodes the healthcheck template's jobs can run on
+        directives = sbatch_directives("healthcheck")
+        constraint = directives.get("constraint", "")
+        if re.search(r"[|\[\]*()]", constraint):
+            raise SystemExit(f"{Ansi.RED}Only AND constraints (a&b) can select nodes, not {constraint}{Ansi.RESET}")
         selected, skipped = topology.select_nodes(
-            topology.sinfo_nodes(), args.features.split(","), topology.USABLE_STATES
+            topology.sinfo_nodes(directives.get("partition")),
+            f"gpu:{directives['gpus-per-node']}",
+            constraint.split("&") if constraint else [],
+            topology.USABLE_STATES,
         )
         if skipped:
             states = Counter(node.state for node in skipped)
             counts = ", ".join(f"{state} {count}" for state, count in states.items())
             print(f"Skipping {len(skipped)} nodes by state ({counts}): {Hostlist(node.name for node in skipped)}")
         all_switches = node_switches()
+        if not all_switches and args.switches:
+            raise SystemExit(f"{Ansi.RED}Slurm has no switch topology here, so --switches matches no node{Ansi.RESET}")
+        if not all_switches and args.mode == "switch":
+            # topology/flat, e.g. Trillium's non-blocking fabric: every node is under the same switch
+            print("No switch topology: one job across all nodes, as --mode cluster")
+            args.mode = "cluster"
         nodes, missing = topology.filter_nodes(
             (node.name for node in selected),
             all_switches,
@@ -235,7 +258,7 @@ def parse_args() -> argparse.Namespace:
 
     sub.add_parser(
         "setup",
-        help="CPU build job (nccl-tests, read-test files, venv), then a GPU probe job "
+        help="Build on the login node (nccl-tests, read-test files, venv), then a GPU probe job "
         "(how to run DCGM, which srun MPI plugin works)",
     )
 
@@ -257,12 +280,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         metavar="N",
         help="One job on any N free nodes chosen by Slurm, instead of enumerated nodes",
-    )
-    run_parser.add_argument(
-        "-f",
-        "--features",
-        default="h100,nvlink",
-        help="Only nodes with all these features (comma separated); MIG nodes have h100mig instead of h100",
     )
     run_parser.add_argument("-d", "--dependency", default=None, help="sbatch --dependency, e.g. afterok:12345")
     run_parser.add_argument("--no-wait", action="store_true", help="Submit and exit; run `report` later")

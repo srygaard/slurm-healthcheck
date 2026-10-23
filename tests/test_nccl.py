@@ -51,8 +51,13 @@ def test_pair_rounds_cover_ring_once_per_round():
 def test_plan_single_node_has_no_pairs_or_group():
     kinds = [test.kind for tests in nccl.plan(["a"], {}, {}) for test in tests]
     assert kinds == ["intra", "loopback"]
-    kinds = {test.kind for tests in nccl.plan(["a", "b", "c"], {}, {}) for test in tests}
+    kinds = {test.kind for tests in nccl.plan(["a", "b", "c"], {}, dict.fromkeys("abc", "s1")) for test in tests}
     assert kinds == {"intra", "loopback", "pair", "group"}
+
+
+def test_plan_without_topology_has_no_group():
+    kinds = {test.kind for tests in nccl.plan(["a", "b", "c"], {}, {}) for test in tests}
+    assert kinds == {"intra", "loopback", "pair"}
 
 
 def test_run_round_terminates_stragglers(tmp_path):

@@ -3,7 +3,7 @@
 #SBATCH --account=rrg-bengioy-ad
 #SBATCH --exclusive
 #SBATCH --gpus-per-node=h100:4
-#SBATCH --constraint=h100
+#SBATCH --constraint=h100&nvlink
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0

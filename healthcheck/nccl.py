@@ -179,18 +179,22 @@ def plan(nodes: list[str], loopback_env: dict[str, str], switch_of: Mapping[str,
     Rounds of concurrent tests; each kind takes about the same time at any node count.
 
     The group test runs once per leaf switch with more than two of the nodes, all at once: a group across the whole
-    job would slow down with its size, and the pairs already name a bad node.
+    job would slow down with its size, and the pairs already name a bad node. Nodes with no known switch (a cluster
+    with topology/flat, like Trillium's non-blocking fabric) get no group test, since it would span the whole job.
 
     >>> [[test.label for test in tests] for tests in plan(["a", "b", "c", "d"], {}, {"a": "s1", "b": "s1"})][2:]
     [['pair-a-b', 'pair-c-d'], ['pair-b-c', 'pair-d-a']]
     >>> plan(list("abcdef"), {}, dict.fromkeys("abc", "s1") | dict.fromkeys("def", "s2"))[-1]
     [Run(kind='group', nodes=('a', 'b', 'c'), env={}), Run(kind='group', nodes=('d', 'e', 'f'), env={})]
+    >>> [test.kind for test in plan(list("abcdef"), {}, {})[-1]]
+    ['pair', 'pair', 'pair']
     """
     rounds = [[Run("intra", (node,)) for node in nodes], [Run("loopback", (node,), loopback_env) for node in nodes]]
     rounds += [[Run("pair", pair) for pair in pairs] for pairs in pair_rounds(nodes)]
     leaves: dict[str, list[str]] = {}
     for node in nodes:
-        leaves.setdefault(switch_of.get(node, "unknown"), []).append(node)
+        if node in switch_of:
+            leaves.setdefault(switch_of[node], []).append(node)
     if groups := [Run("group", tuple(members)) for members in leaves.values() if len(members) > 2]:
         rounds.append(groups)
     return rounds
