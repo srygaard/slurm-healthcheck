@@ -2,8 +2,7 @@
 
 A pre-flight health check for full-H100 nodes on Rorqual, run before a large multi-node training job.
 Each job takes about four minutes, and the result is an `#SBATCH --exclude=` line for the nodes that fail
-the checks (see [Configuration](#configuration)). The design is in [PLAN.md](PLAN.md); the launcher is
-adapted from [slurm-launcher](https://github.com/srygaard/slurm-launcher).
+the checks (see [Configuration](#configuration)).
 
 ## Configuration
 | file | sets | takes effect |
@@ -17,7 +16,7 @@ queued. `$SCRATCH/slurm-healthcheck/env.json` is written by the probe; run `setu
 
 ## Setup
 ```bash
-uv run healthcheck.py setup               # build job (nccl-tests, read-test files, venv), then a probe job
+uv run healthcheck.py setup               # build here (nccl-tests, read-test files, venv), then a probe job
 cat $SCRATCH/slurm-healthcheck/env.json   # probe result: how to run DCGM, which srun --mpi plugin works
 ```
 Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.env`; anything already
@@ -36,9 +35,12 @@ uv run healthcheck.py run --dependency afterok:12345           # sbatch --depend
 uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>                         # re-evaluate a run
 uv run healthcheck.py report --exclude-on fail,warn $SCRATCH/slurm-healthcheck/results/<job_id>  # also exclude nodes that only warn
 ```
-Eligible nodes have all of `--features` (default `h100,nvlink`) and are in `USABLE_STATES` (launcher/topology.py).
+The healthcheck template's `#SBATCH` lines also decide the eligible nodes: exactly `gpu:<--gpus-per-node>` in
+`sinfo %G` (so no MIG or partial-GPU nodes), all the `--constraint` features, in the `--partition` if set, and in
+`USABLE_STATES` (launcher/topology.py). Trillium's fabric is non-blocking and Slurm has no switch topology there,
+so `--mode switch` runs as `--mode cluster`.
 The cluster is detected from `$CC_CLUSTER` (or the `mila.quebec` domain), and each cluster needs its own job templates,
-`slurm/templates/{build,probe,healthcheck}.<cluster>.sh`. Templates hold only the resources;
+`slurm/templates/{probe,healthcheck}.<cluster>.sh`. Templates hold only the resources;
 healthcheck.py passes the per-job name, logs, nodes and `--dependency` as sbatch options.
 
 The report is printed and written to the run directory. Paste one of its headers into the training job:

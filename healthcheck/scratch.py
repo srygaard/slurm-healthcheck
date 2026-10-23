@@ -1,4 +1,4 @@
-"""Step 2a: $SCRATCH read throughput. `python -m healthcheck.scratch` writes the read-test files (build job)."""
+"""Step 2a: $SCRATCH read throughput. `python -m healthcheck.scratch` writes the read-test files (`healthcheck.py setup`)."""
 
 import os
 import zlib
@@ -27,7 +27,7 @@ def write_random(path: Path, size: int, block: int) -> bool:
 
 
 def collect(base: Path, cfg: Scratch, host: str) -> JsonDict:
-    """Read one of the build job's files; spread nodes across files to avoid one hot OST set."""
+    """Read one of the files written by setup; spread nodes across files to avoid one hot OST set."""
     path = file_path(base, zlib.crc32(host.encode()) % cfg.files)
     if not path.is_file():
         return {"status": "missing", "path": str(path)}

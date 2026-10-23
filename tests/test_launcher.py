@@ -22,20 +22,29 @@ SwitchName=ihpc325u25 Level=0 LinkSpeed=1 Nodes=rg[32501-32503]
 SwitchName=ihpc207u18 Level=1 LinkSpeed=1 Nodes=rg[32501-32503]
 """
 
-# sinfo -N -h -o "%N|%t|%f"
+# Rorqual, sinfo -N -h -o "%N|%t|%f|%G"; the MIG gres types are made up, anything but "h100" works
 SINFO = r"""
-rg12501|drng|sapphirerapids,h100mig
-rg12502|mix-|sapphirerapids,h100mig
-rg21701|mix-|sapphirerapids,h100,nvlink
-rg21702|mix-|sapphirerapids,h100,nvlink
-rg21703|mix-|sapphirerapids,h100,nvlink
-rg31501|mix-|sapphirerapids,h100,nvlink
-rg31502|mix-|sapphirerapids,h100,nvlink
-rg31503|mix-|sapphirerapids,h100,nvlink
-rg31601|mix-|sapphirerapids,h100,nvlink
-rg31602|mix-|sapphirerapids,h100,nvlink
-rg31603|mix-|sapphirerapids,h100,nvlink
-rg31604|drain*|sapphirerapids,h100,nvlink
+rg12501|drng|sapphirerapids,h100mig|gpu:h100_3g.40gb:2(S:0-1),gpu:h100_2g.20gb:2(S:0-1)
+rg12502|mix-|sapphirerapids,h100mig|gpu:h100_3g.40gb:2(S:0-1),gpu:h100_2g.20gb:2(S:0-1)
+rg21701|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg21702|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg21703|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31501|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31502|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31503|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31601|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31602|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31603|mix-|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+rg31604|drain*|sapphirerapids,h100,nvlink|gpu:h100:4(S:0-1)
+"""
+
+# Trillium GPU: no features; the H200 socket list holds a comma
+SINFO_TRILLIUM = r"""
+trig0001|mix|(null)|gpu:h100:4(S:2-3)
+trig0002|idle|(null)|gpu:h100:4(S:2-3)
+trig0063|mix-|(null)|gpu:h200:4(S:1-2,6-7)
+trig0101|down*|(null)|gpu:b200:8(S:0-1)
+vm-trig0062-1|resv|(null)|gpu:h100:1(S:0)
 """
 
 
@@ -67,12 +76,21 @@ def test_parse_scontrol_topology():
 
 def test_select_nodes_full_h100_only():
     nodes = topology.parse_sinfo(SINFO)
-    usable, skipped = topology.select_nodes(nodes, ["h100", "nvlink"], topology.USABLE_STATES)
+    usable, skipped = topology.select_nodes(nodes, "gpu:h100:4", [], topology.USABLE_STATES)
     names = [node.name for node in usable]
     assert "rg12501" not in names  # MIG
     assert "rg31601" in names and "rg21701" in names
     assert [node.name for node in skipped] == ["rg31604"]  # "drain*" -> "drain"
     assert all(node.state == "mix" for node in usable)  # "mix-" suffix stripped
+    assert topology.select_nodes(nodes, "gpu:h100:4", ["nvlink"], topology.USABLE_STATES) == (usable, skipped)
+
+
+def test_select_nodes_by_gres_without_features():
+    nodes = topology.parse_sinfo(SINFO_TRILLIUM)
+    assert next(node for node in nodes if node.name == "trig0063").gres == {"gpu:h200:4"}
+    usable, skipped = topology.select_nodes(nodes, "gpu:h100:4", [], topology.USABLE_STATES)
+    assert [node.name for node in usable] == ["trig0001", "trig0002"]  # not the 1-GPU VM, H200 or B200
+    assert skipped == []
 
 
 def test_filter_and_group_nodes():

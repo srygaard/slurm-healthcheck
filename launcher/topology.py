@@ -1,5 +1,6 @@
 """Find the healthcheck candidate nodes and group them into jobs."""
 
+import re
 import subprocess
 from collections.abc import Iterable, Mapping
 from typing import Literal, NamedTuple
@@ -19,33 +20,39 @@ class Node(NamedTuple):
     name: str
     state: str  # `sinfo %t`, lowercased with the STATE_SUFFIXES flags stripped
     features: frozenset[str]
+    gres: frozenset[str]  # `sinfo %G` entries without the socket suffix, e.g. "gpu:h100:4" from "gpu:h100:4(S:2-3)"
 
 
 def parse_sinfo(text: str) -> list[Node]:
-    """Parse `sinfo -N -h -o "%N|%t|%f"`; nodes in several partitions appear once."""
+    """Parse `sinfo -N -h -o "%N|%t|%f|%G"`; nodes in several partitions appear once."""
     nodes: dict[str, Node] = {}
     for line in text.splitlines():
-        if line.count("|") != 2:
+        if line.count("|") != 3:
             continue
-        name, state, features = (field.strip() for field in line.split("|"))
-        nodes[name] = Node(name, state.rstrip(STATE_SUFFIXES).lower(), frozenset(features.split(",")))
+        name, state, features, gres = (field.strip() for field in line.split("|"))
+        gres = re.sub(r"\([^)]*\)", "", gres)  # the socket list can hold commas: "(S:1-2,6-7)"
+        state = state.rstrip(STATE_SUFFIXES).lower()
+        nodes[name] = Node(name, state, frozenset(features.split(",")), frozenset(gres.split(",")))
     return sorted(nodes.values())
 
 
-def sinfo_nodes() -> list[Node]:
-    out = subprocess.run(["sinfo", "-N", "-h", "-o", "%N|%t|%f"], capture_output=True, text=True, check=True).stdout
+def sinfo_nodes(partition: str | None = None) -> list[Node]:
+    """Nodes in partition, or in any partition."""
+    command = ["sinfo", "-N", "-h", "-o", "%N|%t|%f|%G", *(["-p", partition] if partition else [])]
+    out = subprocess.run(command, capture_output=True, text=True, check=True).stdout
     return parse_sinfo(out)
 
 
 def select_nodes(
     nodes: Iterable[Node],
+    gres: str,
     features: Iterable[str],
     usable_states: Iterable[str],
 ) -> tuple[list[Node], list[Node]]:
-    """Split nodes having all features into (usable, skipped by state)."""
+    """Split nodes having exactly this gres entry and all features into (usable, skipped by state)."""
     required = set(features)
     usable = set(usable_states)
-    matching = [node for node in nodes if required <= node.features]
+    matching = [node for node in nodes if gres in node.gres and required <= node.features]
     return [node for node in matching if node.state in usable], [node for node in matching if node.state not in usable]
 
 
