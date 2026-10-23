@@ -1,10 +1,11 @@
 import json
+import subprocess
 
 import pytest
 
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import parse_topology
-from launcher import topology
+from launcher import slurm, topology
 
 # slurm.conf topology.conf: nodes only under leaves; spines list switches, and some are commented out
 TOPOLOGY_CONF = r"""
@@ -101,3 +102,55 @@ def test_filter_and_group_nodes():
     assert topology.group_nodes("abc", switch_of, "switch") == {"sw1": ("a", "b"), "sw2": ("c",)}
     assert topology.group_nodes("abc", switch_of, "cluster") == {"cluster": ("a", "b", "c")}
     assert topology.group_nodes("ab", switch_of, "node") == {"a": ("a",), "b": ("b",)}
+
+
+def test_with_dependency():
+    assert slurm.with_dependency(None, []) is None
+    assert slurm.with_dependency("afterok:7", []) == "afterok:7"
+    assert slurm.with_dependency(None, [12]) == "afterok:12"
+
+
+# Rorqual (Slurm 25.11, data_parser v0.0.44), cut down to the fields the parsers read
+SQUEUE_JSON = r"""
+{"jobs": [
+ {"job_id": 25034106, "name": "hc-probe", "job_state": ["PENDING"], "state_reason": "Priority"},
+ {"job_id": 25035268, "name": "hc-any1", "job_state": ["PENDING"], "state_reason": "Dependency"}
+], "meta": {"plugin": {"data_parser": "data_parser/v0.0.44"}}}
+"""
+
+SACCT_JSON = r"""
+{"jobs": [
+ {"job_id": 24798900, "state": {"current": ["COMPLETED"], "reason": "None"}, "time": {"elapsed": 13},
+  "nodes": "rc31801"},
+ {"job_id": 25034938, "state": {"current": ["CANCELLED"], "reason": "None"}, "time": {"elapsed": 0},
+  "nodes": "None assigned"},
+ {"job_id": 25035269, "state": {"current": ["COMPLETED"], "reason": "None"}, "time": {"elapsed": 301},
+  "nodes": "rg[31601-31602]"}
+]}
+"""
+
+
+def test_squeue(monkeypatch):
+    def run(stdout, returncode=0, stderr=""):
+        monkeypatch.setattr(
+            slurm.subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        )
+
+    run(SQUEUE_JSON)
+    assert slurm.squeue(["--me"]).jobs == {25034106: "PENDING", 25035268: "PENDING"}
+    run("", 1, "slurm_load_jobs error: Invalid job id specified\n")  # squeue -j with only finished jobs
+    assert slurm.squeue(["-j", "1"]) == ({}, 1, "slurm_load_jobs error: Invalid job id specified\n")
+
+
+def test_sacct_states(monkeypatch):
+    def run(stdout):
+        monkeypatch.setattr(slurm.subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, 0, stdout, ""))
+
+    run(SACCT_JSON)
+    jobs = slurm.sacct_states([24798900, 25034938, 25035269])
+    assert jobs[24798900] == {"state": "COMPLETED", "elapsed_s": 13, "nodes": ("rc31801",)}
+    assert jobs[25034938]["nodes"] == ()  # never started
+    assert jobs[25035269]["nodes"] == ("rg31601", "rg31602")
+    run("")
+    assert slurm.sacct_states([1]) == {}
+    assert slurm.sacct_states([]) == {}  # no sacct call

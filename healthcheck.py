@@ -19,8 +19,7 @@ from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, topology
-from launcher.sbatch import sbatch
-from launcher.slurm import detect_cluster, sacct_states, wait_for
+from launcher.slurm import detect_cluster, my_queued, sacct_states, sbatch, wait_for, with_dependency
 
 REPO = Path(__file__).parent
 
@@ -139,11 +138,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     base = base_dir()
     venv = venv_dir(base)
     env_json = Paths(base=base).env
-    if not (venv.is_dir() and env_json.is_file()):
+    # The jobs read env.json when they start, so they wait for a probe still in the queue to rewrite it
+    probes = my_queued("hc-probe")
+    if not (venv.is_dir() and (env_json.is_file() or probes)):
         raise SystemExit(
             f"{Ansi.RED}Missing {venv if not venv.is_dir() else env_json}: "
             f"run `uv run healthcheck.py setup` first{Ansi.RESET}"
         )
+    if probes:
+        print(f"Waiting for probe job(s) {', '.join(map(str, probes))} to succeed")
+    dependency = with_dependency(args.dependency, probes)
 
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
@@ -194,7 +198,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_id = jobs[0]["job_id"] if jobs else None  # the first job's id names the run dir; later jobs get HC_RUN_ID
         options = [f"--nodes={len(members) or args.any}"]
         options += [f"--nodelist={members}"] if members else []
-        options += [f"--dependency={args.dependency}"] if args.dependency else []
+        options += [f"--dependency={dependency}"] if dependency else []
         if job_id := submit(
             "healthcheck",
             'exec "$HC_VENV/bin/python" -m healthcheck.batch',
@@ -281,7 +285,12 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="One job on any N free nodes chosen by Slurm, instead of enumerated nodes",
     )
-    run_parser.add_argument("-d", "--dependency", default=None, help="sbatch --dependency, e.g. afterok:12345")
+    run_parser.add_argument(
+        "-d",
+        "--dependency",
+        default=None,
+        help="sbatch --dependency, e.g. afterok:12345; a queued probe job is added with afterok",
+    )
     run_parser.add_argument("--no-wait", action="store_true", help="Submit and exit; run `report` later")
     run_parser.add_argument("-e", "--exclude-on", default="fail", help=exclude_on_help)
 
