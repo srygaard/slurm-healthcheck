@@ -11,7 +11,7 @@ from typing import Literal, TypedDict, cast, get_args
 
 from healthcheck.util.hostlist import Hostlist
 
-type Cluster = Literal["mila", "fir", "narval", "nibi", "rorqual", "trillium", "unknown"]
+type Cluster = Literal["mila", "fir", "narval", "nibi", "rorqual", "tamia", "trillium", "unknown"]
 type JobState = Literal[
     "BOOT_FAIL",
     "CANCELLED",
