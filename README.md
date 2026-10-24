@@ -85,7 +85,7 @@ results/<job_id>/
   exclude.sbatch  include.sbatch     #SBATCH --exclude= failed nodes, --nodelist= passed nodes
   jobs.json                          submitted jobs, with states from sacct
   jobs/<job_id>-{stdout,stderr}.txt  job logs
-  switches.json                      node -> leaf switch, written at submit
+  switches.json                      leaf switch -> its nodes, written at submit
   nodes/<host>.json                  per-node results, including the env.json they ran with
   groups/<job_id>.json               NCCL results; raw output in groups/<job_id>/
   logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log), kept only if a rank wrote one
@@ -97,12 +97,12 @@ Setup jobs only have `jobs/`, plus the probe's DCGM and MPI test output.
 ## Calibrating thresholds
 The medians at the top of `report.txt` are there to set the thresholds from. Typical values on Rorqual:
 
-| median                 | measured | threshold                    |
-|------------------------|----------|------------------------------|
-| `nccl_intra_busbw`     | ~337     | `nccl.intra_min_busbw: 300`  |
-| `nccl_loopback_busbw`  | ~6.4     | `nccl.loopback_min_busbw: 5` |
-| `nccl_pair_busbw`      | ~40      | `nccl.pair_min_busbw: 20`    |
-| `scratch_read_gbps`    | 0.05–0.3 | `scratch.read.min_gbps: 0.5`, warn only |
+| median (GB/s)              | measured | threshold                         |
+|----------------------------|----------|-----------------------------------|
+| `nccl_intra_busbw_GBps`    | ~337     | `nccl.intra_min_busbw_GBps: 300`  |
+| `nccl_loopback_busbw_GBps` | ~6.4     | `nccl.loopback_min_busbw_GBps: 5` |
+| `nccl_pair_busbw_GBps`     | ~40      | `nccl.pair_min_busbw_GBps: 20`    |
+| `scratch_read_GBps`        | 0.05–0.3 | `scratch.read.min_GBps: 0.5`, warn only |
 
 Bandwidths are GB/s. `$SCRATCH` read speed depends on the load on Lustre, which is why it only warns. Use
 `gpu.min_nvlinks` and `nic.*` to pin the expected hardware. The thresholds are pydantic defaults in

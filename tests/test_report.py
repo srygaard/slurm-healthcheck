@@ -90,7 +90,7 @@ def run(tmp_path):
     (tmp_path / "groups").mkdir()
     for host in hosts:
         (tmp_path / "nodes" / f"{host}.json").write_text(json.dumps(healthy(host)))
-    (tmp_path / "switches.json").write_text(json.dumps({host: "sw1" for host in hosts}))
+    (tmp_path / "switches.json").write_text(json.dumps({"sw1": hosts}))
     (tmp_path / "jobs.json").write_text(json.dumps([{"job_id": 1, "nodes": hosts, "state": "COMPLETED"}]))
     tests = [nccl_test("intra", [host], 350) for host in hosts]
     tests += [nccl_test("loopback", [host], 40) for host in hosts]
@@ -108,7 +108,8 @@ def edit(run, host, fn):
 
 
 def switches(run):
-    return json.loads((run / "switches.json").read_text())
+    by_switch = json.loads((run / "switches.json").read_text())
+    return {node: switch for switch, nodes in by_switch.items() for node in nodes}
 
 
 def evaluate(run, cfg=None):
@@ -169,7 +170,7 @@ def test_homogeneity_without_majority_flags_every_node(run):
 
 
 def test_scratch_relative_to_median(run):
-    edit(run, "rg5", lambda node: node["scratch"]["data"].update(gbps=0.8))  # above min_gbps 0.5
+    edit(run, "rg5", lambda node: node["scratch"]["data"].update(gbps=0.8))  # above min_GBps 0.5
     assert statuses(run)["rg5"] == "warn"  # severity: warn
     assert statuses(run, Config(scratch=Scratch(read=ScratchRead(severity="fail"))))["rg5"] == "fail"
 

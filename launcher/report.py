@@ -109,9 +109,9 @@ def check_sysinfo(data: dict[str, Any], gpu_cfg: Gpu, nic_cfg: Nic) -> list[Find
             )
         )
     for name, port in active:
-        if (port["rate_gbps"] or 0) < nic_cfg.min_rate_gbps:
+        if (port["rate_gbps"] or 0) < nic_cfg.min_rate_Gbps:
             out.append(
-                Finding("fail", "nic.rate", f"{name}/{port['port']} {port['rate']} < {nic_cfg.min_rate_gbps} Gb/s")
+                Finding("fail", "nic.rate", f"{name}/{port['port']} {port['rate']} < {nic_cfg.min_rate_Gbps} Gb/s")
             )
     return out
 
@@ -119,8 +119,8 @@ def check_sysinfo(data: dict[str, Any], gpu_cfg: Gpu, nic_cfg: Nic) -> list[Find
 def check_scratch_read(data: dict[str, Any], cfg: ScratchRead) -> list[Finding]:
     if not ok(data):
         return [Finding("warn", "scratch.read", f"{data['status']}: {data['path']} (run setup)")]
-    if data["gbps"] < cfg.min_gbps:
-        return [Finding(cfg.severity, "scratch.read", f"read {data['gbps']} < {cfg.min_gbps} GB/s")]
+    if data["gbps"] < cfg.min_GBps:
+        return [Finding(cfg.severity, "scratch.read", f"read {data['gbps']} < {cfg.min_GBps} GB/s")]
     return []
 
 
@@ -134,13 +134,13 @@ def check_local_tmp(data: dict[str, Any], cfg: LocalTmp) -> list[Finding]:
             continue
         if "same_device_as" in tmp:  # benchmarked under that path
             continue
-        if tmp["write"]["gbps"] < cfg.rw.min_write_gbps:
+        if tmp["write"]["gbps"] < cfg.rw.min_write_GBps:
             out.append(
-                Finding("fail", "local_tmp.rw", f"{path} write {tmp['write']['gbps']} GB/s < {cfg.rw.min_write_gbps}")
+                Finding("fail", "local_tmp.rw", f"{path} write {tmp['write']['gbps']} GB/s < {cfg.rw.min_write_GBps}")
             )
-        if tmp["read"]["gbps"] < cfg.rw.min_read_gbps:
+        if tmp["read"]["gbps"] < cfg.rw.min_read_GBps:
             out.append(
-                Finding("fail", "local_tmp.rw", f"{path} read {tmp['read']['gbps']} GB/s < {cfg.rw.min_read_gbps}")
+                Finding("fail", "local_tmp.rw", f"{path} read {tmp['read']['gbps']} GB/s < {cfg.rw.min_read_GBps}")
             )
     for name, disk in data["smart"].get("disks", {}).items():
         if cfg.fail_on_smart and disk.get("passed") is False:
@@ -246,7 +246,7 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
         kind: _median([test["peak_busbw"] for test in kind_tests if ok(test)]) for kind, kind_tests in by_kind.items()
     }
 
-    for kind, minimum in (("intra", cfg.intra_min_busbw), ("loopback", cfg.loopback_min_busbw)):
+    for kind, minimum in (("intra", cfg.intra_min_busbw_GBps), ("loopback", cfg.loopback_min_busbw_GBps)):
         for test in by_kind[kind]:
             if not ok(test):
                 out[test["nodes"][0]].append(Finding("fail", f"nccl.{kind}", f"{test['status']} ({test['log']})"))
@@ -255,7 +255,7 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
 
     # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
     # bad fails too: with two nodes there is one pair, and nothing tells the two apart.
-    pair_floor = max(cfg.pair_min_busbw, (medians.get("pair") or 0) * cfg.pair_min_frac_of_median)
+    pair_floor = max(cfg.pair_min_busbw_GBps, (medians.get("pair") or 0) * cfg.pair_min_frac_of_median)
     slow: dict[str, list[str]] = defaultdict(list)
     pairs_of: Counter[str] = Counter()
     for test in by_kind["pair"]:
@@ -274,7 +274,7 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
             )
         )
 
-    group_floor = max(cfg.group_min_busbw, (medians.get("group") or 0) * cfg.group_min_frac_of_median)
+    group_floor = max(cfg.group_min_busbw_GBps, (medians.get("group") or 0) * cfg.group_min_frac_of_median)
     for test in by_kind["group"]:
         if not ok(test) or test["peak_busbw"] < group_floor:
             # A hung group with no node already failing for it can't be blamed on one, so every node in it fails
@@ -334,8 +334,9 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
     for by_host in (scratch_findings, homogeneity_findings, nccl_findings):
         for host, fs in by_host.items():
             findings[host] += fs
-    medians = {"scratch_read_gbps": scratch_median}
-    medians |= {f"nccl_{kind}_busbw": median for kind, median in nccl_medians.items()}
+    # GBps: gigabytes per second, as nccl-tests reports busbw
+    medians = {"scratch_read_GBps": scratch_median}
+    medians |= {f"nccl_{kind}_busbw_GBps": median for kind, median in nccl_medians.items()}
 
     nodes = {}
     for host in sorted(set(findings) | set(switch_of)):

@@ -160,7 +160,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             selection.sinfo_nodes(directives.get("partition")),
             f"gpu:{directives['gpus-per-node']}",
             constraint.split("&") if constraint else [],
-            selection.USABLE_STATES,
+            # A MAINT reservation's nodes show as maint; the template's --reservation can still run on them
+            selection.USABLE_STATES | ({"maint"} if "reservation" in directives else set()),
         )
         if skipped:
             states = Counter(node.state for node in skipped)
@@ -203,16 +204,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     run = Paths(base=base, root=(base / "results" / str(jobs[0]["job_id"])).resolve())
     run.jobs.write_text(json.dumps(jobs, indent=1))
     # The report lists every node here, so one that never writes nodes/<host>.json shows as no_report
-    run.switches.write_text(json.dumps(switch_of, indent=1))
+    by_switch: dict[str, list[str]] = {}
+    for node, switch in switch_of.items():
+        by_switch.setdefault(switch, []).append(node)
+    run.switches.write_text(json.dumps(by_switch, indent=1))
     print(f"Submitted {len(jobs)}/{len(groups)} jobs; run dir {Ansi.PURPLE}{run.root}{Ansi.RESET}")
 
     if args.no_wait:
-        print(f"Later: uv run healthcheck.py report {run.root}")
+        print(f"Report when the jobs finish: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
         return 0
     try:
         wait_for([job["job_id"] for job in jobs])
     except KeyboardInterrupt:
-        print(f"\nJobs keep running. Later: uv run healthcheck.py report {run.root}")
+        print(
+            "\nStopped waiting; the jobs still run. Report when they finish: "
+            f"{Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}"
+        )
         return 130
     return cmd_report(run.root, args.exclude_on.split(","))
 
@@ -230,7 +237,8 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
                 job["nodes"] = sacct["nodes"]
     run.jobs.write_text(json.dumps(jobs, indent=1))
     # switches.json was written at submit, so look up the switches of nodes learned from sacct here
-    switch_of = read_json(run.switches) or {}
+    by_switch = read_json(run.switches) or {}
+    switch_of = {node: switch for switch, nodes in by_switch.items() for node in nodes}
     if missing := [node for job in jobs for node in job["nodes"] if node not in switch_of]:
         topo = node_switches()
         switch_of |= {node: topo.get(node, "unknown") for node in missing}
