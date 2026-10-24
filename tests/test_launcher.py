@@ -99,9 +99,9 @@ def test_filter_and_group_nodes():
     assert selection.filter_nodes("abc", switch_of, None, None) == (("a", "b", "c"), ())
     assert selection.filter_nodes("abc", switch_of, ["a", "c", "z"], None) == (("a", "c"), ("z",))
     assert selection.filter_nodes("abc", switch_of, None, ["sw1"]) == (("a", "b"), ())
-    assert selection.group_nodes("abc", switch_of, "switch") == {"sw1": ("a", "b"), "sw2": ("c",)}
-    assert selection.group_nodes("abc", switch_of, "cluster") == {"cluster": ("a", "b", "c")}
-    assert selection.group_nodes("ab", switch_of, "node") == {"a": ("a",), "b": ("b",)}
+    assert selection.group_nodes("abc", switch_of, selection.JobPer.SWITCH) == {"sw1": ("a", "b"), "sw2": ("c",)}
+    assert selection.group_nodes("abc", switch_of, selection.JobPer.CLUSTER) == {"cluster": ("a", "b", "c")}
+    assert selection.group_nodes("ab", switch_of, selection.JobPer.NODE) == {"a": ("a",), "b": ("b",)}
 
 
 def test_with_dependency():

@@ -1,7 +1,7 @@
 """The checks' settings and failure thresholds, and where a run's files live: results/<run id>/.
 
 Bandwidths are GB/s, sizes GiB, durations seconds. Starting values are placeholders:
-calibrate them from the medians in report.txt after a first `--mode switch` run.
+calibrate them from the medians in report.txt after a first `--job-per switch` run.
 """
 
 import os
@@ -36,7 +36,7 @@ class Nic(Section):
 class ScratchRead(Section):
     max_s: float = 5  # loops over the file for max_s
     block_mib: int = 16
-    min_GBps: float = 0.5
+    min_GBps: float = 0.2
     min_frac_of_median: float = 0.5
     severity: Literal["fail", "warn"] = "warn"
 
@@ -94,12 +94,13 @@ class Dcgm(Section):
 
 class Nccl(Section):
     binary: str = "all_reduce_perf"
+    alltoall_binary: str = "alltoall_perf"  # the alltoall tests', built alongside binary
     args: list[str] = ["--minbytes=128M", "--maxbytes=1G", "--stepfactor=2", "--warmup_iters=5", "--iters=20"]
     debug: str = "WARN"
     # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip
-    # phase C. About 3x the healthy times on Rorqual (intra 11 s, loopback 35 s, pair 15 s, 3-node group 20 s);
-    # a node failing its socket connections took ~140 s per pair.
-    timeout_s: dict[str, float] = {"intra": 45, "loopback": 90, "pair": 45, "group": 90}
+    # phase C. About 3x the healthy times on Rorqual (intra 11 s, loopback 35 s, pair 15 s, 21-node group 24 s and
+    # alltoall 58 s; the last two grow with the job); a node failing its socket connections took ~140 s per pair.
+    timeout_s: dict[str, float] = {"intra": 45, "loopback": 90, "pair": 45, "group": 120, "alltoall": 180}
     # The loopback round: no NVLink or shared memory, so traffic goes through the NICs
     loopback_env: dict[str, str] = {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1", "NCCL_NVLS_ENABLE": "0"}
     intra_min_busbw_GBps: float = 300
@@ -108,6 +109,9 @@ class Nccl(Section):
     pair_min_frac_of_median: float = 0.7
     group_min_busbw_GBps: float = 20
     group_min_frac_of_median: float = 0.8
+    # alltoall_perf's busbw is algbw * (n-1)/n, all_reduce_perf's 2 * algbw * (n-1)/n, so the two don't compare
+    alltoall_min_busbw_GBps: float = 5  # Rorqual: ~6.8 within a leaf switch, ~3.0 across three
+    alltoall_min_frac_of_median: float = 0.8
 
 
 class Logs(Section):

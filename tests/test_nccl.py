@@ -1,5 +1,6 @@
 import sys
 import time
+from pathlib import Path
 
 from healthcheck import nccl
 
@@ -50,15 +51,26 @@ def test_pair_rounds_cover_ring_once_per_round():
 
 
 def test_plan_single_node_has_no_pairs_or_group():
-    kinds = [test.kind for tests in nccl.plan(["a"], {}, {}) for test in tests]
+    kinds = [test.kind for tests in nccl.plan(["a"], {}) for test in tests]
     assert kinds == ["intra", "loopback"]
-    kinds = {test.kind for tests in nccl.plan(["a", "b", "c"], {}, dict.fromkeys("abc", "s1")) for test in tests}
-    assert kinds == {"intra", "loopback", "pair", "group"}
+    rounds = nccl.plan(["a", "b", "c"], {})
+    assert {test.kind for tests in rounds for test in tests} == {"intra", "loopback", "pair", "group", "alltoall"}
 
 
-def test_plan_without_topology_has_no_group():
-    kinds = {test.kind for tests in nccl.plan(["a", "b", "c"], {}, {}) for test in tests}
-    assert kinds == {"intra", "loopback", "pair"}
+def test_plan_collectives_span_the_whole_job():
+    # --job-per picks the job's nodes: a leaf switch's or the cluster's
+    nodes = [f"n{index}" for index in range(21)]
+    rounds = nccl.plan(nodes, {})
+    assert [test.nodes for test in rounds[-2]] == [tuple(nodes)]  # group
+    assert [test.nodes for test in rounds[-1]] == [tuple(nodes)]  # alltoall
+
+
+def test_alltoall_runs_its_binary_from_the_same_build():
+    launch = nccl.Launch("pmix", Path("/opt/build/all_reduce_perf"), ["--iters=20"], 4)
+    group = nccl.Run("group", ("a", "b", "c"))
+    alltoall = nccl.Run("alltoall", ("a", "b", "c"))
+    assert launch.command(group)[-2:] == ["/opt/build/all_reduce_perf", "--iters=20"]
+    assert launch.command(alltoall)[-2:] == ["/opt/build/alltoall_perf", "--iters=20"]
 
 
 def test_run_round_terminates_stragglers(tmp_path):
