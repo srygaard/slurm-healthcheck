@@ -3,17 +3,16 @@
 import json
 import os
 import socket
-import subprocess
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TypedDict, cast, get_args
+from typing import Any, Literal, NamedTuple, TypedDict, cast
 
+from healthcheck.util.cmd import run
 from healthcheck.util.hostlist import Hostlist
 
-type Cluster = Literal["mila", "fir", "narval", "nibi", "rorqual", "tamia", "trillium", "unknown"]
 # The JOB STATE CODES of `man squeue` (Slurm 25.11); sacct reports the same names
 type JobState = Literal[
     "BOOT_FAIL",
@@ -62,24 +61,23 @@ class SacctJob(TypedDict):
     nodes: Hostlist  # empty if the job never started
 
 
-def detect_cluster() -> Cluster:
-    cluster = os.environ.get("CC_CLUSTER", "").strip().lower()
-    if cluster in get_args(Cluster.__value__):
-        return cast(Cluster, cluster)
+def detect_cluster() -> str | None:
+    """$CC_CLUSTER on the Alliance clusters, "mila" in the mila.quebec domain, None elsewhere."""
+    if cluster := os.environ.get("CC_CLUSTER", "").strip().lower():
+        return cluster
     if socket.getfqdn().lower().endswith("mila.quebec"):
         return "mila"
-    return "unknown"
+    return None
 
 
-def sbatch(script: str, options: Sequence[str], cwd: Path) -> SbatchResult:
-    """Submit a job script to SLURM; options override the script's #SBATCH directives."""
-    try:
-        # cwd: job_submit.lua may refuse jobs submitted from /home
-        result = subprocess.run(
-            ["sbatch", "--parsable", *options], input=script, capture_output=True, text=True, cwd=cwd
-        )
-    except FileNotFoundError as error:  # also raised for a missing cwd
-        result = subprocess.CompletedProcess([], 127, "", f"Must be run on Slurm ({error.filename} not found).")
+def sbatch(script: str, options: Sequence[str], cwd: Path, env: Mapping[str, str]) -> SbatchResult:
+    """
+    Submit a job script to SLURM; options override the script's #SBATCH directives. The job starts with this
+    environment plus env, before the script's first line: --export=ALL, unlike --export=NAME=value, takes any value.
+    """
+    # cwd: job_submit.lua may refuse jobs submitted from /home; a missing cwd also gives 127
+    command = ["sbatch", "--parsable", "--export=ALL", *options]
+    result = run(command, timeout=None, input=script, cwd=cwd, env=os.environ | env)
     try:
         job_id = int(result.stdout.split(";")[0])
     except ValueError:
@@ -104,10 +102,7 @@ def _state(value: list[str] | str) -> JobState:
 
 def squeue(options: Sequence[str]) -> SqueueResult:
     """The queued jobs that options (-j, --me, -n ...) select, with their states."""
-    try:
-        result = subprocess.run(["squeue", "--json", *options], capture_output=True, text=True)
-    except FileNotFoundError as error:
-        result = subprocess.CompletedProcess([], 127, "", f"Must be run on Slurm ({error.filename} not found).")
+    result = run(["squeue", "--json", *options], timeout=None)
     jobs = {job["job_id"]: _state(job["job_state"]) for job in _jobs(result.stdout)}
     return SqueueResult(jobs, result.returncode, result.stderr)
 
@@ -155,9 +150,7 @@ def sacct_states(job_ids: Sequence[int]) -> dict[int, SacctJob]:
     """Each job's state, elapsed time and nodes, from `sacct -X --json`."""
     if not job_ids:
         return {}
-    out = subprocess.run(
-        ["sacct", "-X", "--json", "-j", ",".join(map(str, job_ids))], capture_output=True, text=True
-    )
+    out = run(["sacct", "-X", "--json", "-j", ",".join(map(str, job_ids))], timeout=None)
     return {
         job["job_id"]: {
             "state": _state(job["state"]["current"]),

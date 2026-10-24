@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from healthcheck.config import cfg
-from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, read_json, write_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status
@@ -231,7 +230,7 @@ def main() -> int:
     os.environ["NCCL_DEBUG"] = cfg.nccl.debug
     env = read_json(cfg.paths.env) or {}
     job_id = os.environ["SLURM_JOB_ID"]
-    nodes = run(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]], timeout=30).stdout.split()
+    nodes = list(Hostlist.expand(os.environ["SLURM_JOB_NODELIST"]))
     # One rank per GPU
     launch = Launch(env.get("mpi", "pmix"), Path(env["nccl_tests"]) / cfg.nccl.binary, cfg.nccl.args, cfg.gpu.count)
     start = time.monotonic()

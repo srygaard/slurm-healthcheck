@@ -18,7 +18,7 @@ from healthcheck.config import Paths, cfg
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import node_switches
-from launcher import report, topology
+from launcher import report, selection
 from launcher.slurm import detect_cluster, my_queued, sacct_states, sbatch, wait_for, with_dependency
 
 REPO = Path(__file__).parent
@@ -49,15 +49,13 @@ def venv_dir(base: Path) -> Path:
     return base / ".venv" / digest.hexdigest()[:16]
 
 
-def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None) -> dict[str, object]:
+def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None = None) -> dict[str, str]:
     """Variables every job gets, plus extra; the templates and healthcheck read them."""
     env: dict[str, object] = {"HC_BASE": base, "HC_VENV": venv_dir(base), "HC_CODE": REPO, "PYTHONPATH": REPO}
     if run_id:
         env["HC_RUN_ID"] = run_id
     env.update(extra or {})
-    if with_comma := [name for name, value in env.items() if "," in str(value)]:
-        raise SystemExit(f"{Ansi.RED}sbatch --export can't pass a value with a comma: {with_comma}{Ansi.RESET}")
-    return env
+    return {name: str(value) for name, value in env.items()}
 
 
 def jobs_dir(base: Path, run_id: int | str) -> Path:
@@ -65,50 +63,48 @@ def jobs_dir(base: Path, run_id: int | str) -> Path:
     return base / "results" / str(run_id) / "jobs"
 
 
-def sbatch_options(base: Path, label: str, run_id: int | None, env: Mapping[str, object]) -> list[str]:
-    """Per-job options; they override the template's #SBATCH directives. --export sets the environment before
-    the template's first line, which sources slurm/scripts/.env."""
+def sbatch_options(base: Path, label: str, run_id: int | None) -> list[str]:
+    """Per-job options; they override the template's #SBATCH directives."""
     logs = jobs_dir(base, run_id or "%j")  # sbatch fills in %j
-    exports = ",".join(["ALL", *(f"{name}={value}" for name, value in env.items())])
-    return [
-        f"--job-name=hc-{label}",
-        f"--output={logs}/%j-stdout.txt",
-        f"--error={logs}/%j-stderr.txt",
-        f"--export={exports}",
-    ]
+    return [f"--job-name=hc-{label}", f"--output={logs}/%j-stdout.txt", f"--error={logs}/%j-stderr.txt"]
 
 
-def template(name: str) -> str:
-    return (REPO / "slurm" / "templates" / f"{name}.{detect_cluster()}.sh").read_text()
+def template() -> str:
+    """slurm/templates/<cluster>.sh: the resources of every job on this cluster, the probe's and the healthcheck's."""
+    cluster = detect_cluster()
+    templates = REPO / "slurm" / "templates"
+    path = templates / f"{cluster}.sh"
+    if not cluster or not path.is_file():
+        known = ", ".join(sorted(found.stem for found in templates.glob("*.sh")))
+        raise SystemExit(
+            f"{Ansi.RED}No job template for cluster {cluster or '?'}: set $CC_CLUSTER to one of {known}{Ansi.RESET}"
+        )
+    return path.read_text()
 
 
-def job_script(name: str, command: str) -> str:
-    """slurm/templates/<name>.<cluster>.sh followed by command."""
-    return f"{template(name).rstrip()}\n\n{command}\n"
+def job_script(command: str) -> str:
+    """The cluster's template followed by command."""
+    return f"{template().rstrip()}\n\n{command}\n"
 
 
-def sbatch_directives(name: str) -> dict[str, str]:
+def sbatch_directives() -> dict[str, str]:
     """The template's `#SBATCH --option=value` lines as {option: value}."""
-    return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(name), re.MULTILINE))
+    return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(), re.MULTILINE))
 
 
 def submit(
-    name: str,
     command: str,
     base: Path,
     label: str,
-    exports: Mapping[str, object] | None = None,
     options: Sequence[str] = (),
     run_id: int | None = None,
 ) -> int | None:
-    """sbatch the <name> template followed by command, printing why a submission failed.
+    """sbatch the cluster's template followed by command, printing why a submission failed.
 
     The job logs to results/<run_id or its own job id>/jobs/.
     """
-    env = job_env(base, run_id, exports)
-    options = [*sbatch_options(base, label, run_id, env), *options]
-    script = job_script(name, command)
-    result = sbatch(script, options, cwd=base)
+    options = [*sbatch_options(base, label, run_id), *options]
+    result = sbatch(job_script(command), options, cwd=base, env=job_env(base, run_id))
     if not result.job_id:
         print(f"{Ansi.RED}{result.stderr or result.stdout}{Ansi.RESET}")
         return None
@@ -123,11 +119,11 @@ def cmd_setup() -> int:
     uv = shutil.which("uv")
     if not uv:
         raise SystemExit(f"{Ansi.RED}uv not found on PATH{Ansi.RESET}")
-    env = {name: str(value) for name, value in job_env(base, None, {"HC_UV": uv}).items()}
+    env = job_env(base, None, {"HC_UV": uv})
     if subprocess.run(["bash", REPO / "slurm" / "scripts" / "build.sh"], env=os.environ | env).returncode:
         print(f"{Ansi.RED}Build failed{Ansi.RESET}")
         return 1
-    job_id = submit("probe", 'exec "$HC_VENV/bin/python" -m healthcheck.probe', base, "probe")
+    job_id = submit('exec "$HC_VENV/bin/python" -m healthcheck.probe', base, "probe", options=["--nodes=1"])
     if not job_id:
         return 1
     print(f"probe job {Ansi.PURPLE}{job_id}{Ansi.RESET}: log {base}/results/{job_id}/jobs/{job_id}-stdout.txt")
@@ -155,16 +151,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         groups = {f"any{args.any}": Hostlist()}
         print(f"1 job on any {args.any} free node(s)")
     else:
-        # The nodes the healthcheck template's jobs can run on
-        directives = sbatch_directives("healthcheck")
+        # The nodes the template's jobs can run on
+        directives = sbatch_directives()
         constraint = directives.get("constraint", "")
         if re.search(r"[|\[\]*()]", constraint):
             raise SystemExit(f"{Ansi.RED}Only AND constraints (a&b) can select nodes, not {constraint}{Ansi.RESET}")
-        selected, skipped = topology.select_nodes(
-            topology.sinfo_nodes(directives.get("partition")),
+        selected, skipped = selection.select_nodes(
+            selection.sinfo_nodes(directives.get("partition")),
             f"gpu:{directives['gpus-per-node']}",
             constraint.split("&") if constraint else [],
-            topology.USABLE_STATES,
+            selection.USABLE_STATES,
         )
         if skipped:
             states = Counter(node.state for node in skipped)
@@ -177,7 +173,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # topology/flat, e.g. Trillium's non-blocking fabric: every node is under the same switch
             print("No switch topology: one job across all nodes, as --mode cluster")
             args.mode = "cluster"
-        nodes, missing = topology.filter_nodes(
+        nodes, missing = selection.filter_nodes(
             (node.name for node in selected),
             all_switches,
             args.nodes,
@@ -188,7 +184,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not nodes:
             raise SystemExit(f"{Ansi.RED}No eligible nodes{Ansi.RESET}")
         switch_of = {node: all_switches.get(node, "unknown") for node in nodes}
-        groups = topology.group_nodes(nodes, switch_of, args.mode)
+        groups = selection.group_nodes(nodes, switch_of, args.mode)
         print(f"{len(nodes)} nodes in {len(groups)} {args.mode} job(s):")
         for label, members in groups.items():
             print(f"  {label:<14} {len(members):>3}  {members}")
@@ -199,14 +195,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         options = [f"--nodes={len(members) or args.any}"]
         options += [f"--nodelist={members}"] if members else []
         options += [f"--dependency={dependency}"] if dependency else []
-        if job_id := submit(
-            "healthcheck",
-            'exec "$HC_VENV/bin/python" -m healthcheck.batch',
-            base,
-            label,
-            options=options,
-            run_id=run_id,
-        ):
+        if job_id := submit('exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
             jobs.append({"job_id": job_id, "label": label, "nodes": members})
     if not jobs:
         print(f"Submitted 0/{len(groups)} jobs")

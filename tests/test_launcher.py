@@ -1,11 +1,11 @@
 import json
-import subprocess
 
 import pytest
 
+from healthcheck.util.cmd import Cmd
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import parse_topology
-from launcher import slurm, topology
+from launcher import selection, slurm
 
 # slurm.conf topology.conf: nodes only under leaves; spines list switches, and some are commented out
 TOPOLOGY_CONF = r"""
@@ -76,32 +76,32 @@ def test_parse_scontrol_topology():
 
 
 def test_select_nodes_full_h100_only():
-    nodes = topology.parse_sinfo(SINFO)
-    usable, skipped = topology.select_nodes(nodes, "gpu:h100:4", [], topology.USABLE_STATES)
+    nodes = selection.parse_sinfo(SINFO)
+    usable, skipped = selection.select_nodes(nodes, "gpu:h100:4", [], selection.USABLE_STATES)
     names = [node.name for node in usable]
     assert "rg12501" not in names  # MIG
     assert "rg31601" in names and "rg21701" in names
     assert [node.name for node in skipped] == ["rg31604"]  # "drain*" -> "drain"
     assert all(node.state == "mix" for node in usable)  # "mix-" suffix stripped
-    assert topology.select_nodes(nodes, "gpu:h100:4", ["nvlink"], topology.USABLE_STATES) == (usable, skipped)
+    assert selection.select_nodes(nodes, "gpu:h100:4", ["nvlink"], selection.USABLE_STATES) == (usable, skipped)
 
 
 def test_select_nodes_by_gres_without_features():
-    nodes = topology.parse_sinfo(SINFO_TRILLIUM)
+    nodes = selection.parse_sinfo(SINFO_TRILLIUM)
     assert next(node for node in nodes if node.name == "trig0063").gres == {"gpu:h200:4"}
-    usable, skipped = topology.select_nodes(nodes, "gpu:h100:4", [], topology.USABLE_STATES)
+    usable, skipped = selection.select_nodes(nodes, "gpu:h100:4", [], selection.USABLE_STATES)
     assert [node.name for node in usable] == ["trig0001", "trig0002"]  # not the 1-GPU VM, H200 or B200
     assert skipped == []
 
 
 def test_filter_and_group_nodes():
     switch_of = {"a": "sw1", "b": "sw1", "c": "sw2"}
-    assert topology.filter_nodes("abc", switch_of, None, None) == (("a", "b", "c"), ())
-    assert topology.filter_nodes("abc", switch_of, ["a", "c", "z"], None) == (("a", "c"), ("z",))
-    assert topology.filter_nodes("abc", switch_of, None, ["sw1"]) == (("a", "b"), ())
-    assert topology.group_nodes("abc", switch_of, "switch") == {"sw1": ("a", "b"), "sw2": ("c",)}
-    assert topology.group_nodes("abc", switch_of, "cluster") == {"cluster": ("a", "b", "c")}
-    assert topology.group_nodes("ab", switch_of, "node") == {"a": ("a",), "b": ("b",)}
+    assert selection.filter_nodes("abc", switch_of, None, None) == (("a", "b", "c"), ())
+    assert selection.filter_nodes("abc", switch_of, ["a", "c", "z"], None) == (("a", "c"), ("z",))
+    assert selection.filter_nodes("abc", switch_of, None, ["sw1"]) == (("a", "b"), ())
+    assert selection.group_nodes("abc", switch_of, "switch") == {"sw1": ("a", "b"), "sw2": ("c",)}
+    assert selection.group_nodes("abc", switch_of, "cluster") == {"cluster": ("a", "b", "c")}
+    assert selection.group_nodes("ab", switch_of, "node") == {"a": ("a",), "b": ("b",)}
 
 
 def test_with_dependency():
@@ -132,9 +132,7 @@ SACCT_JSON = r"""
 
 def test_squeue(monkeypatch):
     def run(stdout, returncode=0, stderr=""):
-        monkeypatch.setattr(
-            slurm.subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, returncode, stdout, stderr)
-        )
+        monkeypatch.setattr(slurm, "run", lambda args, **_: Cmd(returncode, stdout, stderr))
 
     run(SQUEUE_JSON)
     assert slurm.squeue(["--me"]).jobs == {25034106: "PENDING", 25035268: "PENDING"}
@@ -144,7 +142,7 @@ def test_squeue(monkeypatch):
 
 def test_sacct_states(monkeypatch):
     def run(stdout):
-        monkeypatch.setattr(slurm.subprocess, "run", lambda args, **_: subprocess.CompletedProcess(args, 0, stdout, ""))
+        monkeypatch.setattr(slurm, "run", lambda args, **_: Cmd(0, stdout, ""))
 
     run(SACCT_JSON)
     jobs = slurm.sacct_states([24798900, 25034938, 25035269])
@@ -154,3 +152,18 @@ def test_sacct_states(monkeypatch):
     run("")
     assert slurm.sacct_states([1]) == {}
     assert slurm.sacct_states([]) == {}  # no sacct call
+
+
+def test_sbatch_passes_env(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(slurm, "run", lambda args, **kwargs: calls.append((args, kwargs)) or Cmd(0, "25035268\n", ""))
+    assert slurm.sbatch("#!/bin/bash\n", ["--nodes=1"], tmp_path, {"HC_NODES": "rg[31601,31603]"}).job_id == 25035268
+    [(args, kwargs)] = calls
+    assert args == ["sbatch", "--parsable", "--export=ALL", "--nodes=1"]
+    assert kwargs["env"]["HC_NODES"] == "rg[31601,31603]"  # a comma, which --export=NAME=value would split on
+
+
+def test_sbatch_without_slurm(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    result = slurm.sbatch("#!/bin/bash\n", [], tmp_path, {})
+    assert (result.job_id, result.returncode) == (None, 127)

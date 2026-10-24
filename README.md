@@ -35,13 +35,13 @@ uv run healthcheck.py run --dependency afterok:12345           # sbatch --depend
 uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>                         # re-evaluate a run
 uv run healthcheck.py report --exclude-on fail,warn $SCRATCH/slurm-healthcheck/results/<job_id>  # also exclude nodes that only warn
 ```
-The healthcheck template's `#SBATCH` lines also decide the eligible nodes: exactly `gpu:<--gpus-per-node>` in
+The job template's `#SBATCH` lines also decide the eligible nodes: exactly `gpu:<--gpus-per-node>` in
 `sinfo %G` (so no MIG or partial-GPU nodes), all the `--constraint` features, in the `--partition` if set, and in
-`USABLE_STATES` (launcher/topology.py). Trillium's fabric is non-blocking and Slurm has no switch topology there,
+`USABLE_STATES` (launcher/selection.py). Trillium's fabric is non-blocking and Slurm has no switch topology there,
 so `--mode switch` runs as `--mode cluster`.
-The cluster is detected from `$CC_CLUSTER` (or the `mila.quebec` domain), and each cluster needs its own job templates,
-`slurm/templates/{probe,healthcheck}.<cluster>.sh`. Templates hold only the resources;
-healthcheck.py passes the per-job name, logs, nodes and `--dependency` as sbatch options.
+The cluster is detected from `$CC_CLUSTER` (or the `mila.quebec` domain), and each cluster needs its own job template,
+`slurm/templates/<cluster>.sh`, which the probe and healthcheck jobs share. A template holds only the resources;
+healthcheck.py passes the per-job name, logs, nodes, `--dependency` and the probe's `--nodes=1` as sbatch options.
 
 The report is printed and written to the run directory. Paste one of its headers into the training job:
 `exclude.sbatch` (`#SBATCH --exclude=rg[21703,31605]`) keeps the job off the failed nodes, and `include.sbatch`
