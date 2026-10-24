@@ -2,12 +2,20 @@
 
 import re
 from collections.abc import Iterable, Mapping
-from typing import Literal, NamedTuple
+from enum import StrEnum
+from typing import NamedTuple
 
 from healthcheck.util.cmd import run
 from healthcheck.util.hostlist import Hostlist
 
-type Mode = Literal["cluster", "switch", "node"]
+
+class JobPer(StrEnum):
+    """How healthcheck.py run --job-per splits the nodes into jobs."""
+
+    CLUSTER = "cluster"
+    SWITCH = "switch"
+    NODE = "node"
+
 
 STATE_SUFFIXES = "*~#!%$@^-+"
 
@@ -72,10 +80,14 @@ def filter_nodes(
     return kept, Hostlist(wanted - set(nodes))
 
 
-def group_nodes(nodes: Iterable[str], switch_of: Mapping[str, str], mode: Mode) -> dict[str, Hostlist]:
+def group_nodes(nodes: Iterable[str], switch_of: Mapping[str, str], job_per: JobPer) -> dict[str, Hostlist]:
     """Nodes per job label: one job for the cluster, one per leaf switch, or one per node."""
     groups: dict[str, list[str]] = {}
     for node in nodes:
-        label = {"cluster": "cluster", "switch": switch_of.get(node, "unknown"), "node": node}[mode]
+        label = {
+            JobPer.CLUSTER: "cluster",
+            JobPer.SWITCH: switch_of.get(node, "unknown"),
+            JobPer.NODE: node,
+        }[job_per]
         groups.setdefault(label, []).append(node)
     return {label: Hostlist(members) for label, members in groups.items()}

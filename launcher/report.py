@@ -274,21 +274,25 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
             )
         )
 
-    group_floor = max(cfg.group_min_busbw_GBps, (medians.get("group") or 0) * cfg.group_min_frac_of_median)
-    for test in by_kind["group"]:
-        if not ok(test) or test["peak_busbw"] < group_floor:
-            # A hung group with no node already failing for it can't be blamed on one, so every node in it fails
-            blamed = any(finding.severity == "fail" for node in test["nodes"] for finding in out.get(node, []))
-            severity = "fail" if test["status"] == Status.TIMEOUT and not blamed else "warn"
-            for node in test["nodes"]:
-                out[node].append(
-                    Finding(
-                        severity,
-                        "nccl.group",
-                        f"{len(test['nodes'])}-node all_reduce {test['status']} "
-                        f"busbw {test['peak_busbw']} (floor {group_floor:.1f})",
+    for kind, op, minimum, frac in (
+        ("group", "all_reduce", cfg.group_min_busbw_GBps, cfg.group_min_frac_of_median),
+        ("alltoall", "alltoall", cfg.alltoall_min_busbw_GBps, cfg.alltoall_min_frac_of_median),
+    ):
+        floor = max(minimum, (medians.get(kind) or 0) * frac)
+        for test in by_kind[kind]:
+            if not ok(test) or test["peak_busbw"] < floor:
+                # A hung test with no node already failing for it can't be blamed on one, so every node in it fails
+                blamed = any(finding.severity == "fail" for node in test["nodes"] for finding in out.get(node, []))
+                severity = "fail" if test["status"] == Status.TIMEOUT and not blamed else "warn"
+                for node in test["nodes"]:
+                    out[node].append(
+                        Finding(
+                            severity,
+                            f"nccl.{kind}",
+                            f"{len(test['nodes'])}-node {op} {test['status']} "
+                            f"busbw {test['peak_busbw']} (floor {floor:.1f})",
+                        )
                     )
-                )
     return out, medians
 
 

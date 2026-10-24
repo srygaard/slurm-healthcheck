@@ -96,6 +96,7 @@ def run(tmp_path):
     tests += [nccl_test("loopback", [host], 40) for host in hosts]
     tests += [nccl_test("pair", [first, second], 45) for first, second in zip(hosts, hosts[1:] + hosts[:1])]
     tests.append(nccl_test("group", hosts, 40))
+    tests.append(nccl_test("alltoall", hosts, 20))
     (tmp_path / "groups" / "1.json").write_text(json.dumps({"job_id": "1", "tests": tests}))
     return tmp_path
 
@@ -170,7 +171,7 @@ def test_homogeneity_without_majority_flags_every_node(run):
 
 
 def test_scratch_relative_to_median(run):
-    edit(run, "rg5", lambda node: node["scratch"]["data"].update(gbps=0.8))  # above min_GBps 0.5
+    edit(run, "rg5", lambda node: node["scratch"]["data"].update(gbps=0.8))  # above min_GBps 0.2
     assert statuses(run)["rg5"] == "warn"  # severity: warn
     assert statuses(run, Config(scratch=Scratch(read=ScratchRead(severity="fail"))))["rg5"] == "fail"
 
@@ -298,6 +299,17 @@ def test_group_timeout_blames_the_pair_culprit_only(run):
     by_host = statuses(run)
     assert by_host["rg3"] == "fail"
     assert by_host["rg1"] == by_host["rg2"] == by_host["rg4"] == "warn"
+
+
+def test_slow_alltoall_warns_every_node(run):
+    set_tests(run, lambda test: True, lambda test: test.update(peak_busbw=2) if test["kind"] == "alltoall" else None)
+    assert set(statuses(run).values()) == {"warn"}  # below alltoall_min_busbw_GBps 5
+    assert evaluate(run)["medians"]["nccl_alltoall_busbw_GBps"] == 2
+
+
+def test_alltoall_timeout_without_culprit_excludes_the_group(run):
+    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "alltoall" else None)
+    assert set(statuses(run).values()) == {"fail"}
 
 
 def test_group_timeout_without_culprit_excludes_the_group(run):

@@ -4,7 +4,8 @@ Rounds, each a set of concurrent steps on disjoint nodes:
   intra     every node alone: NVLink/NVSwitch
   loopback  every node alone with P2P/SHM off, so traffic goes through its NICs
   pairs     ring neighbours (i, i+1): a bad NIC shows up in both of a node's pairs
-  group     all nodes at once
+  group     all the job's nodes together: a leaf switch's with --job-per switch, every node with --job-per cluster
+  alltoall  all the job's nodes with alltoall_perf, every rank sending to every other
 """
 
 import os
@@ -12,7 +13,6 @@ import re
 import signal
 import subprocess
 import time
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -20,7 +20,6 @@ from healthcheck.config import cfg
 from healthcheck.util.file import Json, read_json, write_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status
-from healthcheck.util.switches import node_switches
 
 
 class Run(NamedTuple):
@@ -111,7 +110,8 @@ class Launch(NamedTuple):
             f"--ntasks-per-node={self.ranks_per_node}",
             f"--cpus-per-task={self.cpus_per_task}",
             f"--nodelist={Hostlist(test.nodes)}",
-            str(self.binary),
+            # except the alltoall tests, which run alltoall_perf from the same build
+            str(self.binary.with_name(cfg.nccl.alltoall_binary) if test.kind == "alltoall" else self.binary),
             *self.args,
         ]
 
@@ -193,33 +193,21 @@ def run_round(
     return results
 
 
-def plan(
-    nodes: list[str],
-    loopback_env: dict[str, str],
-    switch_of: Mapping[str, str],
-) -> list[list[Run]]:
+def plan(nodes: list[str], loopback_env: dict[str, str]) -> list[list[Run]]:
     """
-    Rounds of concurrent tests; each kind takes about the same time at any node count.
+    Rounds of concurrent tests. The per-node and pair rounds take about the same time at any node count; the group
+    and alltoall tests span the whole job, when it has more than two nodes, so they slow down as it grows.
 
-    The group test runs once per leaf switch with more than two of the nodes, all at once: a group across the whole
-    job would slow down with its size, and the pairs already name a bad node. Nodes with no known switch (a cluster
-    with topology/flat, like Trillium's non-blocking fabric) get no group test, since it would span the whole job.
-
-    >>> [[test.label for test in tests] for tests in plan(["a", "b", "c", "d"], {}, {"a": "s1", "b": "s1"})][2:]
-    [['pair-a-b', 'pair-c-d'], ['pair-b-c', 'pair-d-a']]
-    >>> plan(list("abcdef"), {}, dict.fromkeys("abc", "s1") | dict.fromkeys("def", "s2"))[-1]
-    [Run(kind='group', nodes=('a', 'b', 'c'), env={}), Run(kind='group', nodes=('d', 'e', 'f'), env={})]
-    >>> [test.kind for test in plan(list("abcdef"), {}, {})[-1]]
-    ['pair', 'pair', 'pair']
+    >>> [[test.label for test in tests] for tests in plan(["a", "b", "c", "d"], {})][2:]
+    [['pair-a-b', 'pair-c-d'], ['pair-b-c', 'pair-d-a'], ['group-a-d'], ['alltoall-a-d']]
+    >>> [test.kind for tests in plan(["a", "b"], {}) for test in tests]
+    ['intra', 'intra', 'loopback', 'loopback', 'pair']
     """
     rounds = [[Run("intra", (node,)) for node in nodes], [Run("loopback", (node,), loopback_env) for node in nodes]]
     rounds += [[Run("pair", pair) for pair in pairs] for pairs in pair_rounds(nodes)]
-    leaves: dict[str, list[str]] = {}
-    for node in nodes:
-        if node in switch_of:
-            leaves.setdefault(switch_of[node], []).append(node)
-    if groups := [Run("group", tuple(members)) for members in leaves.values() if len(members) > 2]:
-        rounds.append(groups)
+    if len(nodes) > 2:
+        rounds.append([Run("group", tuple(nodes))])
+        rounds.append([Run("alltoall", tuple(nodes))])
     return rounds
 
 
@@ -236,7 +224,7 @@ def main() -> int:
     start = time.monotonic()
     finished: list[dict[str, Any]] = []
     out: dict[str, Json] = {"job_id": job_id, "nodes": nodes, "mpi": launch.mpi, "tests": finished}
-    for tests in plan(nodes, cfg.nccl.loopback_env, node_switches()):
+    for tests in plan(nodes, cfg.nccl.loopback_env):
         timeout = cfg.nccl.timeout_s[tests[0].kind]
         finished += run_round(tests, launch, results.group_logs(job_id), timeout, results.nccl_logs)
         out["elapsed_s"] = round(time.monotonic() - start, 1)  # the phase's wall time; a round's tests overlap

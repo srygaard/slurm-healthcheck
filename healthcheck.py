@@ -19,7 +19,7 @@ from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
-from launcher.slurm import detect_cluster, my_queued, sacct_states, sbatch, wait_for, with_dependency
+from launcher.slurm import detect_cluster, my_queued, sacct_states, sbatch, squeue, wait_for, with_dependency
 
 REPO = Path(__file__).parent
 
@@ -170,10 +170,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         all_switches = node_switches()
         if not all_switches and args.switches:
             raise SystemExit(f"{Ansi.RED}Slurm has no switch topology here, so --switches matches no node{Ansi.RESET}")
-        if not all_switches and args.mode == "switch":
+        if not all_switches and args.job_per == selection.JobPer.SWITCH:
             # topology/flat, e.g. Trillium's non-blocking fabric: every node is under the same switch
-            print("No switch topology: one job across all nodes, as --mode cluster")
-            args.mode = "cluster"
+            print("No switch topology: one job across all nodes, as --job-per cluster")
+            args.job_per = selection.JobPer.CLUSTER
         nodes, missing = selection.filter_nodes(
             (node.name for node in selected),
             all_switches,
@@ -185,8 +185,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not nodes:
             raise SystemExit(f"{Ansi.RED}No eligible nodes{Ansi.RESET}")
         switch_of = {node: all_switches.get(node, "unknown") for node in nodes}
-        groups = selection.group_nodes(nodes, switch_of, args.mode)
-        print(f"{len(nodes)} nodes in {len(groups)} {args.mode} job(s):")
+        groups = selection.group_nodes(nodes, switch_of, args.job_per)
+        print(f"{len(nodes)} nodes in {len(groups)} {args.job_per} job(s):")
         for label, members in groups.items():
             print(f"  {label:<14} {len(members):>3}  {members}")
 
@@ -228,6 +228,13 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
     run = Paths(root=run_dir.resolve())
 
     jobs = read_json(run.jobs) or []
+    # A job still in the queue hasn't written all its results: its nodes would show as failed in exclude.sbatch
+    job_ids = ",".join(str(job["job_id"]) for job in jobs)
+    if job_ids and (queued := squeue(["-j", job_ids]).jobs):
+        states = ", ".join(f"{job_id} {state}" for job_id, state in sorted(queued.items()))
+        print(f"{Ansi.YELLOW}Not finished: job {states}{Ansi.RESET}")
+        print(f"Report when the jobs finish: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
+        return 1
     states = sacct_states([job["job_id"] for job in jobs])
     for job in jobs:
         if sacct := states.get(job["job_id"]):
@@ -265,10 +272,11 @@ def parse_args() -> argparse.Namespace:
 
     run_parser = sub.add_parser("run", formatter_class=defaults, help="Submit health checks, wait, and report")
     run_parser.add_argument(
-        "-m",
-        "--mode",
-        choices=["cluster", "switch", "node"],
-        default="switch",
+        "-j",
+        "--job-per",
+        type=selection.JobPer,
+        choices=list(selection.JobPer),
+        default=selection.JobPer.SWITCH,
         help="One job for all nodes, one per leaf switch, or one per node",
     )
     run_parser.add_argument(
