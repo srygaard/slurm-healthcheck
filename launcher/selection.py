@@ -1,10 +1,10 @@
 """Find the healthcheck candidate nodes and group them into jobs."""
 
 import re
-import subprocess
 from collections.abc import Iterable, Mapping
 from typing import Literal, NamedTuple
 
+from healthcheck.util.cmd import run
 from healthcheck.util.hostlist import Hostlist
 
 type Mode = Literal["cluster", "switch", "node"]
@@ -39,8 +39,10 @@ def parse_sinfo(text: str) -> list[Node]:
 def sinfo_nodes(partition: str | None = None) -> list[Node]:
     """Nodes in partition, or in any partition."""
     command = ["sinfo", "-N", "-h", "-o", "%N|%t|%f|%G", *(["-p", partition] if partition else [])]
-    out = subprocess.run(command, capture_output=True, text=True, check=True).stdout
-    return parse_sinfo(out)
+    out = run(command, timeout=None)
+    if out.returncode:
+        raise SystemExit(f"sinfo exited {out.returncode}: {out.stderr.strip()}")
+    return parse_sinfo(out.stdout)
 
 
 def select_nodes(
