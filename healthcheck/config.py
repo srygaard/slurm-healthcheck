@@ -29,14 +29,14 @@ class Gpu(Section):
 
 class Nic(Section):
     min_active_ib_ports: int = 1
-    min_rate_gbps: float = 200
+    min_rate_Gbps: float = 200
     link_layer: str = "InfiniBand"
 
 
 class ScratchRead(Section):
     max_s: float = 5  # loops over the file for max_s
     block_mib: int = 16
-    min_gbps: float = 0.5
+    min_GBps: float = 0.5
     min_frac_of_median: float = 0.5
     severity: Literal["fail", "warn"] = "warn"
 
@@ -54,8 +54,8 @@ class LocalTmpRw(Section):
     gib: float = 2
     max_s: float = 5  # each of write and read
     block_mib: int = 16
-    min_write_gbps: float = 0.5
-    min_read_gbps: float = 1.0
+    min_write_GBps: float = 0.5
+    min_read_GBps: float = 1.0
 
 
 class LocalTmp(Section):
@@ -102,11 +102,11 @@ class Nccl(Section):
     timeout_s: dict[str, float] = {"intra": 45, "loopback": 90, "pair": 45, "group": 90}
     # The loopback round: no NVLink or shared memory, so traffic goes through the NICs
     loopback_env: dict[str, str] = {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1", "NCCL_NVLS_ENABLE": "0"}
-    intra_min_busbw: float = 300
-    loopback_min_busbw: float = 5  # Rorqual: one 200 Gb/s NIC per node shared by 4 GPUs, ~6.3 at line rate
-    pair_min_busbw: float = 20
+    intra_min_busbw_GBps: float = 300
+    loopback_min_busbw_GBps: float = 5  # Rorqual: one 200 Gb/s NIC per node shared by 4 GPUs, ~6.3 at line rate
+    pair_min_busbw_GBps: float = 20
     pair_min_frac_of_median: float = 0.7
-    group_min_busbw: float = 20
+    group_min_busbw_GBps: float = 20
     group_min_frac_of_median: float = 0.8
 
 
@@ -134,12 +134,12 @@ class Homogeneity(Section):
         "nic.ib[*].ports[*].rate",
     ]
     warn: list[str] = [
-        "gpu.devices[*].vbios",
-        "kernel",
+        # "gpu.devices[*].vbios",
+        # "kernel",
         "os_release",
         "gpu.topo_hash",
         "nic.nvidia_peermem",
-        "nic.net[*].mtu",
+        "nic.net.ib0.mtu",
         "software.ofed",
     ]
 
@@ -169,7 +169,7 @@ class Paths(Section):
 
     @property
     def switches(self) -> Path:
-        """Every node the run targets, mapped to its leaf switch."""
+        """Each leaf switch, mapped to the nodes the run targets under it."""
         return self.root / "switches.json"
 
     @property
