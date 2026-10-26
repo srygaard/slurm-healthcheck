@@ -80,11 +80,11 @@ def placements(root: Path = Path("/sys")) -> list[Placement]:
     return sorted(placement for path in paths if (placement := _placement(path)))
 
 
-def _cpulist(cpus: list[int]) -> str | None:
+def cpulist(cpus: list[int]) -> str | None:
     """
     The kernel's cpulist form; None for no CPUs.
 
-    >>> _cpulist([0, 1, 2, 3, 8, 10, 11])
+    >>> cpulist([0, 1, 2, 3, 8, 10, 11])
     '0-3,8,10-11'
     """
     ranges: list[list[int]] = []
@@ -114,7 +114,7 @@ class Cpu(Device):
             name=model,
             numa_node=numa_nodes[0] if len(numa_nodes) == 1 else None,
             socket=socket,
-            cpus=_cpulist([cpu.cpu for cpu in mine]),
+            cpus=cpulist([cpu.cpu for cpu in mine]),
             cores=len(mine),
             numa_nodes=numa_nodes,
         )
@@ -150,7 +150,7 @@ class NumaNode(Device):
             name=path.name,
             numa_node=numa_node,
             socket=sockets.pop() if len(sockets) == 1 else None,
-            cpus=_cpulist([cpu.cpu for cpu in mine]),
+            cpus=cpulist([cpu.cpu for cpu in mine]),
             mem_gib=mem_gib,
         )
 

@@ -76,6 +76,7 @@ def healthy(host):
         "scratch": ok(scratch),
         "local_tmp": ok(local_tmp),
         "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}, "messages": []}}}),
+        "cpu_load": ok({"status": "skipped"}),
         "logs": ok(logs),
     }
 
@@ -176,6 +177,60 @@ def test_bios_mismatch_warns(run):
     findings = evaluate(run)["nodes"]["rg1"]["findings"]
     assert [(finding["severity"], finding["check"]) for finding in findings] == [("warn", "homogeneity")]
     assert "bios.bios_version" in findings[0]["detail"]
+
+
+def cpu_load(first, last, throttles=0):
+    return ok(
+        {
+            "status": "ok",
+            "first_mhz": first,
+            "last_mhz": last,
+            "drop_frac": round(1 - last / first, 3),
+            "throttle_delta": throttles,
+            "samples": [],
+        }
+    )
+
+
+def test_cpu_load_drop_and_median(run):
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
+        edit(run, host, lambda node: node.update(cpu_load=cpu_load(3700, 3690)))
+    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, throttles=2)))
+    report_ = evaluate(run)
+    checks = {finding["check"] for finding in report_["nodes"]["rg6"]["findings"]}
+    assert checks == {"cpu_load.drop", "cpu_load.median", "cpu_load.throttle"}
+    assert report_["nodes"]["rg6"]["status"] == "warn"
+    assert report_["nodes"]["rg1"]["status"] == "pass"
+    assert report_["medians"]["cpu_load_busy_mhz"] == 3690
+
+
+def test_cpu_load_skipped_or_absent_passes(run):
+    edit(run, "rg1", lambda node: node.pop("cpu_load"))  # a run from before the step existed
+    assert set(statuses(run).values()) == {"pass"}
+    assert "cpu_load_busy_mhz" not in evaluate(run)["medians"]
+
+
+def test_dcgm_tflops_relative_to_median(run):
+    def diagnostic(gflops):
+        messages = [
+            f"GPU {gpu} calculated at approximately {value} gigaflops during this test"
+            for gpu, value in enumerate(gflops)
+        ]
+        return lambda node: node["dcgm"]["data"]["tests"].update(
+            diagnostic={"status": "Pass", "entities": {}, "messages": messages}
+        )
+
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
+        edit(run, host, diagnostic([160231.80, 164944.50, 160231.80, 164944.50]))
+    edit(run, "rg6", diagnostic([160231.80, 150000.0, 140000.0, 160231.80]))
+    result = evaluate(run)
+    assert [(finding["severity"], finding["detail"]) for finding in result["nodes"]["rg6"]["findings"]] == [
+        ("warn", "GPU1 150.0 < 152.2 TFLOPS (frac of median)"),
+        ("fail", "GPU2 140.0 < 144.2 TFLOPS (frac of median)"),
+    ]
+    assert result["nodes"]["rg6"]["status"] == "fail"
+    assert {result["nodes"][host]["status"] for host in ("rg1", "rg2", "rg3", "rg4", "rg5")} == {"pass"}
+    assert result["medians"]["dcgm_diagnostic_tflops"] == 160.23
 
 
 def test_scratch_relative_to_median(run):

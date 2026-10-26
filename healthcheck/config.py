@@ -75,7 +75,9 @@ class Dcgm(Section):
     tests: list[str] = [
         "memory",  # 27 s: allocates ~98% of each GPU's memory and checks it
         "pcie",  # 21 s: host<->GPU bandwidth and PCIe replay errors
-        "diagnostic",  # 53 s: DGEMM stress, checks results and throttling
+        # 53 s: GEMM stress at diagnostic_precision, checks results and throttling. fp16 alone takes as long as DCGM's
+        # default of all three precisions: this dcgm step ran 127 s either way on rg31603.
+        "diagnostic",
         "targeted_stress",  # 38 s at test_duration=30: holds a target SM load
         "targeted_power",  # 39 s at test_duration=30: holds a target power draw (~610 W average, 700 W peak)
         # "nvbandwidth",  # 227 s: GPU copy bandwidth; pcie and the NCCL intra test cover it
@@ -90,6 +92,33 @@ class Dcgm(Section):
     ]
     fail_on: list[str] = ["Fail"]
     warn_on: list[str] = ["Warn"]
+    # diagnostic's GEMM precision (DCGM 4.7 has no BF16 or TF32). On rg31603's H100s: fp16 641-660 TFLOPS, fp32 170,
+    # fp64 52; DCGM's default runs all three and reports a blend (160-165). fp16 is closest to BF16 training: H100 runs
+    # FP16 and BF16 on the same tensor cores at the same peak.
+    diagnostic_precision: Literal["fp64", "fp32", "fp16"] = "fp16"
+    # diagnostic's per-GPU TFLOPS against the run's median GPU. DCGM's estimate is coarse: at fp16, 640.9 or 659.8.
+    diagnostic_min_frac_of_median: float = 0.90  # fail below
+    diagnostic_warn_frac_of_median: float = 0.95  # warn below
+
+    @property
+    def diagnostic_precision_letter(self) -> str:
+        """diagnostic.precision takes one letter per GEMM; it logs anything else as invalid and runs its defaults."""
+        return {"fp64": "d", "fp32": "s", "fp16": "h"}[self.diagnostic_precision]
+
+
+class CpuLoad(Section):
+    """Busy loops on a share of the CPUs while dcgm loads the GPUs; see healthcheck/cpu_load.py.
+
+    It runs alongside every phase A step, holding until dcgm, the longest, returns (~2 min), so it adds no time.
+    """
+
+    enabled: bool = True
+    busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
+    interval_s: float = 5
+    window_s: float = 30  # the first and last window of samples are compared; a load under two is skipped
+    max_drop_frac: float = 0.10  # busy-core clock, last window against first
+    min_frac_of_median: float = 0.9  # last window, against the median of the run's nodes
+    severity: Literal["fail", "warn"] = "warn"
 
 
 class Nccl(Section):
@@ -234,6 +263,7 @@ class Config(Section):
     scratch: Scratch = Scratch()
     local_tmp: LocalTmp = LocalTmp()
     dcgm: Dcgm = Dcgm()
+    cpu_load: CpuLoad = CpuLoad()
     nccl: Nccl = Nccl()
     logs: Logs = Logs()
     homogeneity: Homogeneity = Homogeneity()

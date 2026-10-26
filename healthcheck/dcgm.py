@@ -124,5 +124,15 @@ def collect(cfg: Dcgm, env: dict[str, Any], log_dir: Path) -> JsonDict:
         "status": Status.OK,
         "mode": mode,
         "suite": tests,
-        **diag(mode, tests, cfg.port, None, log_dir, ";".join(cfg.parameters)),
+        **diag(mode, tests, cfg.port, None, log_dir, parameters(cfg)),
     }
+
+
+def parameters(cfg: Dcgm) -> str:
+    """
+    The `dcgmi diag -p` argument: cfg.parameters and diagnostic's precision.
+
+    >>> parameters(Dcgm(parameters=["diagnostic.test_duration=30"], diagnostic_precision="fp16"))
+    'diagnostic.test_duration=30;diagnostic.precision=h'
+    """
+    return ";".join([*cfg.parameters, f"diagnostic.precision={cfg.diagnostic_precision_letter}"])
