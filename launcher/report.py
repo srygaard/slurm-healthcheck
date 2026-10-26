@@ -1,20 +1,21 @@
 """Step 6: apply the thresholds in healthcheck/config.py to a run's node and group JSONs, then write the report and --exclude header."""
 
 import json
+import re
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from healthcheck.config import Config, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, ScratchRead
+from healthcheck.config import Config, CpuLoad, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, ScratchRead
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status, ok
 
 type Severity = Literal["fail", "warn"]
 
-STEPS = ("sysinfo", "scratch", "local_tmp", "dcgm", "logs")  # the node JSON's steps, each with elapsed_s
+STEPS = ("sysinfo", "scratch", "local_tmp", "dcgm", "cpu_load", "logs")  # the node JSON's steps, each with elapsed_s
 
 
 class Finding(NamedTuple):
@@ -165,6 +166,61 @@ def check_dcgm(data: dict[str, Any], cfg: Dcgm) -> list[Finding]:
     return out
 
 
+def diagnostic_tflops(data: dict[str, Any]) -> dict[int, float]:
+    """
+    Each GPU's TFLOPS from the dcgm diagnostic test's messages.
+
+    >>> diagnostic_tflops({"tests": {"diagnostic": {"messages": ["GPU 1 calculated at approximately 160231.80 gigaflops"]}}})
+    {1: 160.23}
+    """
+    messages = data.get("tests", {}).get("diagnostic", {}).get("messages", [])
+    pattern = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops")
+    return {
+        int(gpu): round(float(gflops) / 1000, 2) for message in messages for gpu, gflops in pattern.findall(message)
+    }
+
+
+def check_dcgm_tflops(
+    tflops_of: dict[str, dict[int, float]], cfg: Dcgm
+) -> tuple[dict[str, list[Finding]], float | None]:
+    """Each GPU's diagnostic TFLOPS against the median GPU of the run: fail below one fraction, warn below another."""
+    out: dict[str, list[Finding]] = defaultdict(list)
+    median = _median([tflops for gpus in tflops_of.values() for tflops in gpus.values()])
+    fail_floor = (median or 0) * cfg.diagnostic_min_frac_of_median
+    warn_floor = (median or 0) * cfg.diagnostic_warn_frac_of_median
+    for host, gpus in tflops_of.items():
+        for gpu, tflops in gpus.items():
+            severity: Severity | None = "fail" if tflops < fail_floor else "warn" if tflops < warn_floor else None
+            if severity:
+                floor = fail_floor if severity == "fail" else warn_floor
+                detail = f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)"
+                out[host].append(Finding(severity, "dcgm.tflops", detail))
+    return out, median
+
+
+def check_cpu_load(data: dict[str, Any], cfg: CpuLoad) -> list[Finding]:
+    if data["status"] == Status.SKIPPED:
+        return []
+    out = []
+    if data["drop_frac"] is not None and data["drop_frac"] > cfg.max_drop_frac:
+        detail = f"busy-core clock {data['first_mhz']} -> {data['last_mhz']} MHz (-{data['drop_frac']:.0%})"
+        out.append(Finding(cfg.severity, "cpu_load.drop", detail))
+    if data["throttle_delta"]:
+        out.append(Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events"))
+    return out
+
+
+def check_cpu_load_median(mhz_of: dict[str, float], cfg: CpuLoad) -> tuple[dict[str, list[Finding]], float | None]:
+    """The busy-core clock in the last window, against the other nodes'."""
+    out: dict[str, list[Finding]] = defaultdict(list)
+    median = _median(list(mhz_of.values()))
+    floor = (median or 0) * cfg.min_frac_of_median
+    for host, mhz in mhz_of.items():
+        if mhz < floor:
+            out[host].append(Finding(cfg.severity, "cpu_load.median", f"busy-core clock {mhz} < {floor:.0f} MHz"))
+    return out, median
+
+
 def check_logs(data: dict[str, Any], cfg: Logs) -> list[Finding]:
     out = []
     for event in data["xid"].get("events", []):
@@ -304,6 +360,8 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
     findings: dict[str, list[Finding]] = defaultdict(list)
     sysinfos = {}
     scratch = {}
+    cpu_mhz = {}
+    tflops = {}
     step_seconds: dict[str, dict[str, float]] = {}
 
     hosts = {path.stem for path in layout.nodes.glob("*.json")} | set(switch_of) | set(job_of)
@@ -325,6 +383,12 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
             findings[host] += check_local_tmp(data, cfg.local_tmp)
         if data := _step(node, "dcgm", findings[host]):
             findings[host] += check_dcgm(data, cfg.dcgm)
+            if gpus := diagnostic_tflops(data):
+                tflops[host] = gpus
+        if node.get("cpu_load") is not None and (data := _step(node, "cpu_load", findings[host])):  # runs before it
+            findings[host] += check_cpu_load(data, cfg.cpu_load)
+            if data.get("last_mhz"):
+                cpu_mhz[host] = data["last_mhz"]
         if node.get("logs") is None:
             findings[host].append(Finding("warn", "logs", "finalize did not run"))
         elif data := _step(node, "logs", findings[host]):
@@ -332,14 +396,18 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
 
     # Checks across nodes
     scratch_findings, scratch_median = check_scratch_median(scratch, cfg.scratch.read)
+    cpu_findings, cpu_median = check_cpu_load_median(cpu_mhz, cfg.cpu_load)
+    tflops_findings, tflops_median = check_dcgm_tflops(tflops, cfg.dcgm)
     groups = [group for path in sorted(layout.groups.glob("*.json")) if (group := read_json(path))]
     nccl_findings, nccl_medians = check_nccl(groups, cfg.nccl)
     homogeneity_findings = check_homogeneity(sysinfos, fail_keys=cfg.homogeneity.fail, warn_keys=cfg.homogeneity.warn)
-    for by_host in (scratch_findings, homogeneity_findings, nccl_findings):
+    for by_host in (scratch_findings, tflops_findings, cpu_findings, homogeneity_findings, nccl_findings):
         for host, fs in by_host.items():
             findings[host] += fs
     # GBps: gigabytes per second, as nccl-tests reports busbw
     medians = {"scratch_read_GBps": scratch_median}
+    medians |= {"dcgm_diagnostic_tflops": tflops_median} if tflops else {}
+    medians |= {"cpu_load_busy_mhz": cpu_median} if cpu_mhz else {}
     medians |= {f"nccl_{kind}_busbw_GBps": median for kind, median in nccl_medians.items()}
 
     nodes = {}
