@@ -192,6 +192,16 @@ def cpu_load(top, full_power, low_share=0.0, throttles=0):
     )
 
 
+def test_cpu_load_low_share_warns_then_fails(run):
+    for host, share in (("rg1", 0.05), ("rg2", 0.125), ("rg3", 0.3)):
+        edit(run, host, lambda node, share=share: node.update(cpu_load=cpu_load(3000, 2990, low_share=share)))
+    assert {host: status for host, status in statuses(run).items() if host in ("rg1", "rg2", "rg3")} == {
+        "rg1": "pass",
+        "rg2": "warn",
+        "rg3": "fail",
+    }
+
+
 def test_cpu_load_low_share_and_median(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
         edit(run, host, lambda node: node.update(cpu_load=cpu_load(3700, 3690)))
@@ -199,7 +209,9 @@ def test_cpu_load_low_share_and_median(run):
     report_ = evaluate(run)
     checks = {finding["check"] for finding in report_["nodes"]["rg6"]["findings"]}
     assert checks == {"cpu_load.low", "cpu_load.median", "cpu_load.throttle"}
-    assert report_["nodes"]["rg6"]["status"] == "warn"
+    severities = {finding["check"]: finding["severity"] for finding in report_["nodes"]["rg6"]["findings"]}
+    assert severities == {"cpu_load.low": "fail", "cpu_load.median": "warn", "cpu_load.throttle": "warn"}
+    assert report_["nodes"]["rg6"]["status"] == "fail"
     assert report_["nodes"]["rg1"]["status"] == "pass"
     assert report_["medians"]["cpu_load_busy_mhz"] == 3690
 

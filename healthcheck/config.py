@@ -116,11 +116,11 @@ class CpuLoad(Section):
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
     interval_s: float = 5
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
-    min_full_power_s: float = 60  # ignores failures on (noisy) short 60s tests
+    min_full_power_s: float = 240  # bare minimum amount of time needed to detect power throttle
     low_frac: float = 0.10  # a busy-core reading at full GPU power this far below the run's highest counts as low
-    max_low_share: float = 0.2  # of those readings; soaks: rg21701 31-48% low, healthy nodes 0-8%
+    fail_low_share: float = 0.2  # fail above
+    warn_low_share: float = 0.05  # warn above
     min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
-    severity: Literal["fail", "warn"] = "warn"
 
 
 class Nccl(Section):

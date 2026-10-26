@@ -154,13 +154,15 @@ def check_dcgm(data: dict[str, Any], cfg: Dcgm) -> list[Finding]:
         return [Finding("warn", "dcgm", f"not run (dcgm={data['mode']})")] if cfg.enabled else []
     out = []
     for name, test in data["tests"].items():
-        severity: Severity | None = (
-            "fail" if test["status"] in cfg.fail_on else "warn" if test["status"] in cfg.warn_on else None
-        )
-        if severity:
-            bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
-            detail = f"{name} {test['status']} on {','.join(bad)}"
-            out.append(Finding(severity, "dcgm", f"{detail}: {test['messages'][0]}" if test["messages"] else detail))
+        if test["status"] in cfg.fail_on:
+            severity: Severity = "fail"
+        elif test["status"] in cfg.warn_on:
+            severity = "warn"
+        else:
+            continue
+        bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
+        detail = f"{name} {test['status']} on {','.join(bad)}"
+        out.append(Finding(severity, "dcgm", f"{detail}: {test['messages'][0]}" if test["messages"] else detail))
     if not out and data.get("returncode"):
         out.append(Finding("fail", "dcgm", f"dcgmi diag exited {data['returncode']} with no failed test"))
     return out
@@ -190,11 +192,17 @@ def check_dcgm_tflops(
     warn_floor = (median or 0) * cfg.diagnostic_warn_frac_of_median
     for host, gpus in tflops_of.items():
         for gpu, tflops in gpus.items():
-            severity: Severity | None = "fail" if tflops < fail_floor else "warn" if tflops < warn_floor else None
-            if severity:
-                floor = fail_floor if severity == "fail" else warn_floor
-                detail = f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)"
-                out[host].append(Finding(severity, "dcgm.tflops", detail))
+            if tflops < fail_floor:
+                severity: Severity = "fail"
+                floor = fail_floor
+            elif tflops < warn_floor:
+                severity = "warn"
+                floor = warn_floor
+            else:
+                continue
+            out[host].append(
+                Finding(severity, "dcgm.tflops", f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)")
+            )
     return out, median
 
 
@@ -202,12 +210,19 @@ def check_cpu_load(data: dict[str, Any], cfg: CpuLoad) -> list[Finding]:
     if data["status"] == Status.SKIPPED:
         return []
     out = []
-    if (data.get("low_share") or 0) > cfg.max_low_share:
+    low_share = data.get("low_share") or 0
+    if low_share > cfg.fail_low_share:
+        severity: Severity | None = "fail"
+    elif low_share > cfg.warn_low_share:
+        severity = "warn"
+    else:
+        severity = None
+    if severity:
         detail = (
-            f"{data['low_share']:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
+            f"{low_share:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
             f"{data['max_mhz']} MHz (mean {data['full_power_mhz']})"
         )
-        out.append(Finding(cfg.severity, "cpu_load.low", detail))
+        out.append(Finding(severity, "cpu_load.low", detail))
     if data["throttle_delta"]:
         out.append(Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events"))
     return out
@@ -220,7 +235,7 @@ def check_cpu_load_median(mhz_of: dict[str, float], cfg: CpuLoad) -> tuple[dict[
     floor = (median or 0) * cfg.min_frac_of_median
     for host, mhz in mhz_of.items():
         if mhz < floor:
-            out[host].append(Finding(cfg.severity, "cpu_load.median", f"busy-core clock {mhz} < {floor:.0f} MHz"))
+            out[host].append(Finding("warn", "cpu_load.median", f"busy-core clock {mhz} < {floor:.0f} MHz"))
     return out, median
 
 

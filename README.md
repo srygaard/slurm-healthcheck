@@ -70,8 +70,8 @@ Each node runs three phases:
      through the node's hostengine, or one the job starts if the probe found none (`dcgm: host-self` in
      `env.json`). A GPU fails below 90% of the run's median `diagnostic` TFLOPS and warns below 95%.
    - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns (~2 min), without slowing the
-     other steps. Given a minute or more at full GPU power ([Heat Soak](#heat-soak)), it flags a sagging CPU clock:
-     over 20% of busy-core readings more than 10% below its highest, or a mean below 90% of the median node.
+     other steps. Given 4 min or more at full GPU power ([Heat Soak](#heat-soak)), it fails a node with over 20%
+     of busy-core readings more than 10% below its highest (warns over 5%), and warns on a mean below 90% of the median node.
 2. **Phase B**, `all_reduce_perf` with 4 ranks per node, then `alltoall_perf`:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
