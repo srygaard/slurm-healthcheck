@@ -2,7 +2,7 @@
 
 import platform
 
-from healthcheck.sysinfo import gpu, job, nic, software, topology
+from healthcheck.sysinfo import bios, cpu_power, gpu, job, nic, software, topology
 from healthcheck.util.file import JsonDict, read_sys
 from healthcheck.util.nvml import session
 
@@ -25,7 +25,9 @@ def collect(host: str, link_layer: str) -> JsonDict:
         "kernel": platform.release(),
         "os_release": software.os_release(),
         "cmdline": read_sys("/proc/cmdline"),
+        "bios": bios.collect(),
         "cpu": [socket.to_json() for socket in topology.sockets(placements)],
+        "cpu_power": cpu_power.collect(),
         "ram_gib": round(total / 2**30, 1) if total else None,
         "allocation": job.allocation()._asdict(),
         "numa_nodes": [node.to_json() for node in nodes],

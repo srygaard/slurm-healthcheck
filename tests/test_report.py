@@ -40,6 +40,7 @@ def healthy(host):
     sysinfo = {
         "kernel": "5.14.0",
         "os_release": "AlmaLinux 9",
+        "bios": {"bios_version": "2.11.2"},
         "gpu": {
             "count": 4,
             "driver_version": "580.1",
@@ -168,6 +169,13 @@ def test_homogeneity_without_majority_flags_every_node(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
         assert nodes[host]["status"] == "fail"
         assert "(no majority)" in nodes[host]["findings"][0]["detail"]
+
+
+def test_bios_mismatch_warns(run):
+    edit(run, "rg1", lambda node: node["sysinfo"]["data"]["bios"].update(bios_version="2.11.4"))
+    findings = evaluate(run)["nodes"]["rg1"]["findings"]
+    assert [(finding["severity"], finding["check"]) for finding in findings] == [("warn", "homogeneity")]
+    assert "bios.bios_version" in findings[0]["detail"]
 
 
 def test_scratch_relative_to_median(run):

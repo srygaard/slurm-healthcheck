@@ -145,6 +145,15 @@ class Homogeneity(Section):
         "nic.nvidia_peermem",
         "nic.net.ib0.mtu",
         "software.ofed",
+        # rg21701 lost ~30% of its CPU clock under training load yet passed every check; only its BIOS differed
+        "bios.bios_version",
+        "cpu_power.governor",
+        "cpu_power.max_mhz",
+        "cpu_power.scaling_max_mhz",
+        "cpu_power.epp",
+        "cpu_power.no_turbo",
+        "cpu_power.boost",
+        "cpu_power.rapl",
     ]
 
 

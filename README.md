@@ -61,7 +61,8 @@ Each node runs three phases:
    - **sysinfo**: GPU driver, CUDA, ECC, remapped rows, PCIe, NVLink; IB firmware, port state and rate; MTU;
      NUMA nodes and each GPU's and HCA's PCI address, ids, NUMA node and PCIe root port, from which each node
      writes its NUMA layout table to `<run>/numa/<host>.json`;
-     kernel, OS and OFED.
+     kernel, OS and OFED; system BIOS version (DMI), and the CPU clock and power settings a user can read
+     (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
    - **scratch**: `$SCRATCH` read.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with the tests in `dcgm.tests` (software, memory, pcie, and the diagnostic,
