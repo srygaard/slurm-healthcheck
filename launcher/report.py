@@ -202,16 +202,19 @@ def check_cpu_load(data: dict[str, Any], cfg: CpuLoad) -> list[Finding]:
     if data["status"] == Status.SKIPPED:
         return []
     out = []
-    if data["drop_frac"] is not None and data["drop_frac"] > cfg.max_drop_frac:
-        detail = f"busy-core clock {data['first_mhz']} -> {data['last_mhz']} MHz (-{data['drop_frac']:.0%})"
-        out.append(Finding(cfg.severity, "cpu_load.drop", detail))
+    if (data.get("low_share") or 0) > cfg.max_low_share:
+        detail = (
+            f"{data['low_share']:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
+            f"{data['max_mhz']} MHz (mean {data['full_power_mhz']})"
+        )
+        out.append(Finding(cfg.severity, "cpu_load.low", detail))
     if data["throttle_delta"]:
         out.append(Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events"))
     return out
 
 
 def check_cpu_load_median(mhz_of: dict[str, float], cfg: CpuLoad) -> tuple[dict[str, list[Finding]], float | None]:
-    """The busy-core clock in the last window, against the other nodes'."""
+    """The busy-core clock at full GPU power, against the other nodes'."""
     out: dict[str, list[Finding]] = defaultdict(list)
     median = _median(list(mhz_of.values()))
     floor = (median or 0) * cfg.min_frac_of_median
@@ -387,8 +390,8 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
                 tflops[host] = gpus
         if node.get("cpu_load") is not None and (data := _step(node, "cpu_load", findings[host])):  # runs before it
             findings[host] += check_cpu_load(data, cfg.cpu_load)
-            if data.get("last_mhz"):
-                cpu_mhz[host] = data["last_mhz"]
+            if data.get("full_power_mhz"):
+                cpu_mhz[host] = data["full_power_mhz"]
         if node.get("logs") is None:
             findings[host].append(Finding("warn", "logs", "finalize did not run"))
         elif data := _step(node, "logs", findings[host]):

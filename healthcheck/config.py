@@ -115,9 +115,11 @@ class CpuLoad(Section):
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
     interval_s: float = 5
-    window_s: float = 30  # the first and last window of samples are compared; a load under two is skipped
-    max_drop_frac: float = 0.10  # busy-core clock, last window against first
-    min_frac_of_median: float = 0.9  # last window, against the median of the run's nodes
+    full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
+    min_full_power_s: float = 60  # ignores failures on (noisy) short 60s tests
+    low_frac: float = 0.10  # a busy-core reading at full GPU power this far below the run's highest counts as low
+    max_low_share: float = 0.2  # of those readings; soaks: rg21701 31-48% low, healthy nodes 0-8%
+    min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
     severity: Literal["fail", "warn"] = "warn"
 
 
