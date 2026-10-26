@@ -85,21 +85,34 @@ def _mean(values: list[float]) -> float | None:
     return round(statistics.mean(values)) if values else None
 
 
-def summarize(samples: list[JsonDict], window_s: float) -> JsonDict:
+def summarize(samples: list[JsonDict], cfg: CpuLoad) -> JsonDict:
     """
-    The busy CPUs' mean clock in the first and last window_s of samples, and the drop between them. The first sample
-    is left out: it is taken as the burners start, so it can still read idle clocks.
+    The busy CPUs' highest clock, and at full GPU power (the samples drawing at least full_power_frac of the run's peak
+    GPU power, if they span min_full_power_s) their mean clock and the share of readings more than low_frac below
+    the highest. rg21701 swung between normal and low clocks, which a share tells apart from a healthy node's one-off
+    dips better than a mean. The first sample is left out: it is taken as the burners start, so it can still read idle
+    clocks, which run above the busy cores' all-core turbo.
 
-    >>> samples = [{"t_s": t, "busy_mhz": mhz} for t, mhz in ((0, 3900), (5, 3700), (240, 2800), (270, 2600))]
-    >>> summarize(samples, 60)
-    {'first_mhz': 3700, 'last_mhz': 2700, 'drop_frac': 0.27}
+    >>> rows = ((0, 3900, 300), (5, 3000, 300), (60, 3000, 2800), (120, 2400, 2800), (180, 2400, 2800), (200, 3000, 700))
+    >>> samples = [{"t_s": t, "busy_mhz": mhz, "gpu_w": w} for t, mhz, w in rows]
+    >>> summarize(samples, CpuLoad(min_full_power_s=15))
+    {'max_mhz': 3000, 'full_power_samples': 3, 'full_power_mhz': 2600, 'low_share': 0.667}
+    >>> summarize(samples, CpuLoad(min_full_power_s=20))
+    {'max_mhz': 3000, 'full_power_samples': 3, 'full_power_mhz': None, 'low_share': None}
     """
     samples = samples[1:]
-    end = samples[-1]["t_s"] if samples else 0
-    first = _mean([sample["busy_mhz"] for sample in samples if sample["t_s"] < window_s])
-    last = _mean([sample["busy_mhz"] for sample in samples if sample["t_s"] > end - window_s])
-    drop = round(1 - last / first, 3) if first and last else None
-    return {"first_mhz": first, "last_mhz": last, "drop_frac": drop}
+    top = max((sample["busy_mhz"] or 0 for sample in samples), default=0)
+    peak = max((sample["gpu_w"] or 0 for sample in samples), default=0)
+    loaded = [sample for sample in samples if peak and (sample["gpu_w"] or 0) >= cfg.full_power_frac * peak]
+    if not top or len(loaded) * cfg.interval_s < cfg.min_full_power_s:
+        return {"max_mhz": top, "full_power_samples": len(loaded), "full_power_mhz": None, "low_share": None}
+    low = [sample for sample in loaded if sample["busy_mhz"] < (1 - cfg.low_frac) * top]
+    return {
+        "max_mhz": top,
+        "full_power_samples": len(loaded),
+        "full_power_mhz": _mean([sample["busy_mhz"] for sample in loaded]),
+        "low_share": round(len(low) / len(loaded), 3),
+    }
 
 
 def collect(cfg: CpuLoad, gpus_done: threading.Event, cpus: list[int]) -> JsonDict:
@@ -138,13 +151,13 @@ def collect(cfg: CpuLoad, gpus_done: threading.Event, cpus: list[int]) -> JsonDi
         for burner in burners:
             burner.wait()
     held_s = round(time.monotonic() - start, 1)
-    if held_s < 2 * cfg.window_s:  # dcgm skipped or failed early: too short to compare a first and last window
+    if held_s < cfg.min_full_power_s:  # dcgm skipped or failed early: too short to judge
         return {"status": Status.SKIPPED, "held_s": held_s, "reason": f"dcgm returned after {held_s} s"}
     return {
         "status": Status.OK,
         "busy_cpus": cpulist(busy),
         "held_s": held_s,
-        **summarize(samples, cfg.window_s),
+        **summarize(samples, cfg),
         "throttle_delta": throttle_count() - throttles_before,
         "samples": samples,
     }

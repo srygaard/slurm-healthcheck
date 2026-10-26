@@ -179,26 +179,26 @@ def test_bios_mismatch_warns(run):
     assert "bios.bios_version" in findings[0]["detail"]
 
 
-def cpu_load(first, last, throttles=0):
+def cpu_load(top, full_power, low_share=0.0, throttles=0):
     return ok(
         {
             "status": "ok",
-            "first_mhz": first,
-            "last_mhz": last,
-            "drop_frac": round(1 - last / first, 3),
+            "max_mhz": top,
+            "full_power_mhz": full_power,
+            "low_share": low_share,
             "throttle_delta": throttles,
             "samples": [],
         }
     )
 
 
-def test_cpu_load_drop_and_median(run):
+def test_cpu_load_low_share_and_median(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
         edit(run, host, lambda node: node.update(cpu_load=cpu_load(3700, 3690)))
-    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, throttles=2)))
+    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, low_share=0.48, throttles=2)))
     report_ = evaluate(run)
     checks = {finding["check"] for finding in report_["nodes"]["rg6"]["findings"]}
-    assert checks == {"cpu_load.drop", "cpu_load.median", "cpu_load.throttle"}
+    assert checks == {"cpu_load.low", "cpu_load.median", "cpu_load.throttle"}
     assert report_["nodes"]["rg6"]["status"] == "warn"
     assert report_["nodes"]["rg1"]["status"] == "pass"
     assert report_["medians"]["cpu_load_busy_mhz"] == 3690

@@ -11,7 +11,7 @@ def test_skipped_when_dcgm_returns_early():
     out = cpu_load.collect(CpuLoad(enabled=True), gpus_done, [0])
     assert out["status"] == "skipped"
     assert out["reason"].startswith("dcgm returned after")
-    assert "last_mhz" not in out  # nothing for the report's median
+    assert "full_power_mhz" not in out  # nothing for the report's median
 
 
 def test_burner_is_pinned_and_idle_priority():

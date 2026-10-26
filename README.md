@@ -70,8 +70,8 @@ Each node runs three phases:
      through the node's hostengine, or one the job starts if the probe found none (`dcgm: host-self` in
      `env.json`). A GPU fails below 90% of the run's median `diagnostic` TFLOPS and warns below 95%.
    - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns (~2 min), without slowing the
-     other steps. It flags a busy-core clock that drops more than 10% between the first and last 30 s or sits
-     below 90% of the median node, and any CPU thermal throttling.
+     other steps. Given a minute or more at full GPU power ([Heat Soak](#heat-soak)), it flags a sagging CPU clock:
+     over 20% of busy-core readings more than 10% below its highest, or a mean below 90% of the median node.
 2. **Phase B**, `all_reduce_perf` with 4 ranks per node, then `alltoall_perf`:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
@@ -156,9 +156,12 @@ their power cap), lengthens the combined load:
 |---|---|---|
 | `targeted_power.test_duration` in `dcgm.parameters` | 15 | 600 |
 | `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:10:00 | 00:20:00 |
-| `cpu_load.window_s`, optional, for steadier windows | 30 | 60 |
 
 A one-node soak takes ~13 minutes, plus ~2 for phase B across nodes.
+
+CPU clocks can drop without any thermal throttling: under a soak, rg21701's busy cores sagged to ~2,600 MHz while
+its CPU throttle counters stayed at 0 and its CPUs at ~65 °C, so `cpu_load.throttle` stays silent and only the
+clock check flags it.
 
 ## Tools Used
 
