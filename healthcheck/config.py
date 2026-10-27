@@ -88,7 +88,7 @@ class Dcgm(Section):
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
         "targeted_stress.test_duration=15",
-        "targeted_power.test_duration=15",
+        "targeted_power.test_duration=260",  # ~280 s at full GPU power with diagnostic: over cpu_load.min_full_power_s
     ]
     fail_on: list[str] = ["Fail"]
     warn_on: list[str] = ["Warn"]
@@ -109,7 +109,7 @@ class Dcgm(Section):
 class CpuLoad(Section):
     """Busy loops on a share of the CPUs while dcgm loads the GPUs; see healthcheck/cpu_load.py.
 
-    It runs alongside every phase A step, holding until dcgm, the longest, returns (~2 min), so it adds no time.
+    It runs alongside every phase A step, holding until dcgm, the longest, returns (~6 min), so it adds no time.
     """
 
     enabled: bool = True

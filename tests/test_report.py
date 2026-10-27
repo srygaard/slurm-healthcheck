@@ -192,27 +192,19 @@ def cpu_load(top, full_power, low_share=0.0, throttles=0):
     )
 
 
-def test_cpu_load_low_share_warns_then_fails(run):
-    for host, share in (("rg1", 0.05), ("rg2", 0.125), ("rg3", 0.3)):
-        edit(run, host, lambda node, share=share: node.update(cpu_load=cpu_load(3000, 2990, low_share=share)))
-    assert {host: status for host, status in statuses(run).items() if host in ("rg1", "rg2", "rg3")} == {
+def test_cpu_load_low_clocks_median_and_throttle(run):
+    for host, share in (("rg1", 0.05), ("rg2", 0.125), ("rg3", 0.3), ("rg4", 0.0), ("rg5", 0.0)):
+        edit(run, host, lambda node, share=share: node.update(cpu_load=cpu_load(3700, 3690, low_share=share)))
+    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, low_share=0.48, throttles=2)))
+    report_ = evaluate(run)
+    assert {host: report_["nodes"][host]["status"] for host in ("rg1", "rg2", "rg3")} == {
         "rg1": "pass",
         "rg2": "warn",
         "rg3": "fail",
     }
-
-
-def test_cpu_load_low_share_and_median(run):
-    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
-        edit(run, host, lambda node: node.update(cpu_load=cpu_load(3700, 3690)))
-    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, low_share=0.48, throttles=2)))
-    report_ = evaluate(run)
-    checks = {finding["check"] for finding in report_["nodes"]["rg6"]["findings"]}
-    assert checks == {"cpu_load.low", "cpu_load.median", "cpu_load.throttle"}
     severities = {finding["check"]: finding["severity"] for finding in report_["nodes"]["rg6"]["findings"]}
-    assert severities == {"cpu_load.low": "fail", "cpu_load.median": "warn", "cpu_load.throttle": "warn"}
+    assert severities == {"cpu_load.low_clocks": "fail", "cpu_load.median": "warn", "cpu_load.throttle": "warn"}
     assert report_["nodes"]["rg6"]["status"] == "fail"
-    assert report_["nodes"]["rg1"]["status"] == "pass"
     assert report_["medians"]["cpu_load_busy_mhz"] == 3690
 
 
@@ -276,11 +268,18 @@ def test_bad_pair_node_fails_neighbours_warn(run):
     assert (run / "include.sbatch").read_text() == include
 
 
-def test_xid_and_dcgm_failures(run):
-    edit(run, "rg1", lambda node: node["logs"]["data"]["xid"]["events"].append({"gpu": 1, "xid": 79, "time": "t"}))
-    edit(run, "rg6", lambda node: node["dcgm"]["data"]["tests"]["memory"].update(status="Fail", entities={"2": "Fail"}))
-    by_host = statuses(run)
-    assert by_host["rg1"] == by_host["rg6"] == "fail"
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda node: node["logs"]["data"]["xid"]["events"].append({"gpu": 1, "xid": 79, "time": "t"}),
+        lambda node: node["dcgm"]["data"]["tests"]["memory"].update(status="Fail", entities={"2": "Fail"}),
+        lambda node: node["dcgm"]["data"].update(returncode=226),  # nonzero exit without a failed test
+    ],
+    ids=["xid", "dcgm_test_failed", "dcgm_nonzero_exit"],
+)
+def test_node_fails(run, change):
+    edit(run, "rg1", change)
+    assert statuses(run)["rg1"] == "fail"
 
 
 def test_resolve_spread_over_dict():
@@ -314,11 +313,6 @@ def test_dcgm_parse_v4_layout():
     assert tests["memory"]["status"] == "Fail"
     assert tests["memory"]["messages"] == ["DBE detected"]
     assert tests["software"]["status"] == "Pass"
-
-
-def test_dcgm_nonzero_exit_without_failed_test(run):
-    edit(run, "rg2", lambda node: node["dcgm"]["data"].update(returncode=226))
-    assert statuses(run)["rg2"] == "fail"
 
 
 def test_ecc_increase_reported_once(run):
@@ -382,13 +376,9 @@ def test_slow_alltoall_warns_every_node(run):
     assert evaluate(run)["medians"]["nccl_alltoall_busbw_GBps"] == 2
 
 
-def test_alltoall_timeout_without_culprit_excludes_the_group(run):
-    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "alltoall" else None)
-    assert set(statuses(run).values()) == {"fail"}
-
-
-def test_group_timeout_without_culprit_excludes_the_group(run):
-    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "group" else None)
+@pytest.mark.parametrize("kind", ["group", "alltoall"])
+def test_group_timeout_without_culprit_excludes_the_group(run, kind):
+    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == kind else None)
     assert set(statuses(run).values()) == {"fail"}
     _, exclude, include = report.write(run, Config(), switches(run), ["fail"])
     assert exclude == "#SBATCH --exclude=rg[1-6]\n"

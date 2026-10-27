@@ -222,7 +222,7 @@ def check_cpu_load(data: dict[str, Any], cfg: CpuLoad) -> list[Finding]:
             f"{low_share:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
             f"{data['max_mhz']} MHz (mean {data['full_power_mhz']})"
         )
-        out.append(Finding(severity, "cpu_load.low", detail))
+        out.append(Finding(severity, "cpu_load.low_clocks", detail))
     if data["throttle_delta"]:
         out.append(Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events"))
     return out
