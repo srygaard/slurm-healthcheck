@@ -65,13 +65,12 @@ Each node runs three phases:
      (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
    - **scratch**: `$SCRATCH` read.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
-   - **dcgm**: `dcgmi diag` with the tests in `dcgm.tests` (software, memory, pcie, diagnostic, targeted_stress,
-     targeted_power; stress tests cut to 15–30 s, diagnostic at `dcgm.diagnostic_precision`) or a `dcgm.level`,
-     through the node's hostengine, or one the job starts if the probe found none (`dcgm: host-self` in
-     `env.json`). A GPU fails below 90% of the run's median `diagnostic` TFLOPS and warns below 95%.
-   - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns (~2 min), without slowing the
-     other steps. Given a minute or more at full GPU power ([Heat Soak](#heat-soak)), it flags a sagging CPU clock:
-     over 20% of busy-core readings more than 10% below its highest, or a mean below 90% of the median node.
+   - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
+     node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
+     (`dcgm.diagnostic_precision`) and warns below 95%.
+   - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns. Over 4 min or more at full
+     GPU power ([Heat Soak](#heat-soak)), it fails a node with over 20% of busy-core readings more than 10% below
+     its highest and warns over 5%.
 2. **Phase B**, `all_reduce_perf` with 4 ranks per node, then `alltoall_perf`:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
@@ -149,19 +148,18 @@ tell which one is slow:
    `WARN` naming the failing connection.
 
 ## Heat Soak
-A default job loads CPUs and GPUs together for only ~2 minutes. cpu_load runs until dcgm returns, so lengthening dcgm's last test, `targeted_power` (GPUs at
-their power cap), lengthens the combined load:
+cpu_load judges the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
+default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). A soak gives a slow node longer to show:
+rg21701 read 21–31% low after 4 minutes at full power and 31–48% after 10, against the 20% limit.
 
 | setting | default | soak |
 |---|---|---|
-| `targeted_power.test_duration` in `dcgm.parameters` | 15 | 600 |
-| `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:10:00 | 00:20:00 |
+| `targeted_power.test_duration` in `dcgm.parameters` | 260 | 600 |
+| `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:15:00 | 00:20:00 |
+| job time, one node / a switch | ~7 / ~8 min | ~13 / ~15 min |
 
-A one-node soak takes ~13 minutes, plus ~2 for phase B across nodes.
-
-CPU clocks can drop without any thermal throttling: under a soak, rg21701's busy cores sagged to ~2,600 MHz while
-its CPU throttle counters stayed at 0 and its CPUs at ~65 °C, so `cpu_load.throttle` stays silent and only the
-clock check flags it.
+The clock can drop without thermal throttling: rg21701's busy cores sagged to ~2,600 MHz with its throttle counters
+at 0 and its CPUs at ~65 °C, so only `cpu_load.low_clocks` flags it, not `cpu_load.throttle`.
 
 ## Tools Used
 

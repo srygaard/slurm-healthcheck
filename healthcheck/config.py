@@ -88,7 +88,7 @@ class Dcgm(Section):
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
         "targeted_stress.test_duration=15",
-        "targeted_power.test_duration=15",
+        "targeted_power.test_duration=260",  # ~280 s at full GPU power with diagnostic: over cpu_load.min_full_power_s
     ]
     fail_on: list[str] = ["Fail"]
     warn_on: list[str] = ["Warn"]
@@ -109,18 +109,18 @@ class Dcgm(Section):
 class CpuLoad(Section):
     """Busy loops on a share of the CPUs while dcgm loads the GPUs; see healthcheck/cpu_load.py.
 
-    It runs alongside every phase A step, holding until dcgm, the longest, returns (~2 min), so it adds no time.
+    It runs alongside every phase A step, holding until dcgm, the longest, returns (~6 min), so it adds no time.
     """
 
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
     interval_s: float = 5
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
-    min_full_power_s: float = 60  # ignores failures on (noisy) short 60s tests
+    min_full_power_s: float = 240  # bare minimum amount of time needed to detect power throttle
     low_frac: float = 0.10  # a busy-core reading at full GPU power this far below the run's highest counts as low
-    max_low_share: float = 0.2  # of those readings; soaks: rg21701 31-48% low, healthy nodes 0-8%
+    fail_low_share: float = 0.2  # fail above
+    warn_low_share: float = 0.05  # warn above
     min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
-    severity: Literal["fail", "warn"] = "warn"
 
 
 class Nccl(Section):

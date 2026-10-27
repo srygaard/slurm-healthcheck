@@ -1,7 +1,6 @@
 """Step 2c: busy loops on a share of the job's CPUs while the dcgm step loads the GPUs, sampling the CPU clock.
 
-rg21701 lost ~30% of its CPU clock after a few minutes of training but passed GPU-only and CPU-only stress tests,
-so this holds both loads at once. The CPUs stay busy until the dcgm step returns, ~2 min with its default tests.
+The CPUs stay busy until the dcgm step completes.
 """
 
 import contextlib
