@@ -43,6 +43,14 @@ def base_dir() -> Path:
     return base
 
 
+def project_dir() -> Path:
+    """Holds diskprobe/ for the $PROJECT read test; jobs get it as $HC_PROJECT."""
+    project = os.environ.get("PROJECT")
+    if not project:
+        raise SystemExit(f"{Ansi.RED}$PROJECT is not set{Ansi.RESET}")
+    return Path(project) / "slurm-healthcheck"
+
+
 def venv_dir(base: Path) -> Path:
     """Shared venv keyed by the lock, as in the slurm-launcher README recipe."""
     digest = hashlib.sha256((REPO / "uv.lock").read_bytes() + (REPO / ".python-version").read_bytes())
@@ -52,6 +60,7 @@ def venv_dir(base: Path) -> Path:
 def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None = None) -> dict[str, str]:
     """Variables every job gets, plus extra; the templates and healthcheck read them."""
     env: dict[str, object] = {"HC_BASE": base, "HC_VENV": venv_dir(base), "HC_CODE": REPO, "PYTHONPATH": REPO}
+    env["HC_PROJECT"] = project_dir()
     if run_id:
         env["HC_RUN_ID"] = run_id
     env.update(extra or {})

@@ -63,7 +63,9 @@ Each node runs three phases:
      writes its NUMA layout table to `<run>/numa/<host>.json`;
      kernel, OS and OFED; system BIOS version (DMI), and the CPU clock and power settings a user can read
      (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
-   - **scratch**: `$SCRATCH` read.
+   - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it (`setup` still writes its files).
+   - **project**: `$PROJECT` read, in parallel with scratch and with its own thresholds; `setup` and `run` need
+     `$PROJECT` set; `project.enabled: false` skips it (`setup` still writes its files).
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
      node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
@@ -117,7 +119,8 @@ The medians at the top of `report.txt` are there to set the thresholds from. Typ
 | `nccl_pair_busbw_GBps`     | ~40      | `nccl.pair_min_busbw_GBps: 20`    |
 | `nccl_group_busbw_GBps`    | ~24.6    | `nccl.group_min_busbw_GBps: 20`   |
 | `nccl_alltoall_busbw_GBps` | ~6.8     | `nccl.alltoall_min_busbw_GBps: 5` |
-| `scratch_read_GBps`        | 0.05–0.3 | `scratch.read.min_GBps: 0.2`, warn only |
+| `scratch_read_GBps`        | 0.05–0.3 | `scratch.min_GBps: 0.2`, warn only |
+| `project_read_GBps`        | not yet measured | `project.min_GBps: 0.2`, warn only |
 
 The group and alltoall values are for one leaf switch (7 nodes, `--job-per switch`). Across switches the traffic
 goes through the spine: 21 nodes on 3 switches with `--job-per cluster` measured ~19.2 and ~3.0, below these

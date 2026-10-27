@@ -33,21 +33,32 @@ class Nic(Section):
     link_layer: str = "InfiniBand"
 
 
-class ScratchRead(Section):
-    max_s: float = 5  # loops over the file for max_s
-    block_mib: int = 16
+class Scratch(Section):
+    """The shared filesystem: load isn't a node fault, so this only warns by default."""
+
+    enabled: bool = True  # setup writes the read-test files either way
+    files: int = 8  # read-test files written by setup; each node reads f<crc32(host) % n>
+    file_gib: float = 1  # small: a busy OST writes at only a few MB/s
+    write_block_mib: int = 16  # Lustre is slow with small writes
+    read_max_s: float = 5  # loops over the file for read_max_s
+    read_block_mib: int = 16
     min_GBps: float = 0.2
     min_frac_of_median: float = 0.5
     severity: Literal["fail", "warn"] = "warn"
 
 
-class Scratch(Section):
-    """The shared filesystem: load isn't a node fault, so this only warns by default."""
+class Project(Section):
+    """$PROJECT, tested like $SCRATCH: load isn't a node fault, so this only warns by default."""
 
+    enabled: bool = True  # setup writes the read-test files either way
     files: int = 8  # read-test files written by setup; each node reads f<crc32(host) % n>
     file_gib: float = 1  # small: a busy OST writes at only a few MB/s
     write_block_mib: int = 16  # Lustre is slow with small writes
-    read: ScratchRead = ScratchRead()
+    read_max_s: float = 5  # loops over the file for read_max_s
+    read_block_mib: int = 16
+    min_GBps: float = 0.2
+    min_frac_of_median: float = 0.5
+    severity: Literal["fail", "warn"] = "warn"
 
 
 class LocalTmpRw(Section):
@@ -205,6 +216,7 @@ class Paths(Section):
         os.environ.get("HC_BASE", ".")
     )  # shared across runs: env.json, .opt/, diskprobe/, results/; healthcheck.py exports it
     root: Path = Field(default_factory=_run_root)
+    project: Path = Path(os.environ.get("HC_PROJECT", "."))  # like base, on $PROJECT; healthcheck.py exports it
 
     @property
     def env(self) -> Path:
@@ -263,6 +275,7 @@ class Config(Section):
     gpu: Gpu = Gpu()
     nic: Nic = Nic()
     scratch: Scratch = Scratch()
+    project: Project = Project()
     local_tmp: LocalTmp = LocalTmp()
     dcgm: Dcgm = Dcgm()
     cpu_load: CpuLoad = CpuLoad()

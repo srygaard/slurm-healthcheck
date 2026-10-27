@@ -1,11 +1,11 @@
-"""Step 2a: $SCRATCH read throughput. `python -m healthcheck.scratch` writes the read-test files (`healthcheck.py setup`)."""
+"""Step 2a: $SCRATCH and $PROJECT read throughput, one step each. `python -m healthcheck.scratch` writes the read-test files (`healthcheck.py setup`)."""
 
 import os
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from healthcheck.config import Scratch, cfg
+from healthcheck.config import Project, Scratch, cfg
 from healthcheck.util.file import JsonDict
 from healthcheck.util.io_throughput import read_throughput
 from healthcheck.util.status import Status
@@ -27,26 +27,33 @@ def write_random(path: Path, size: int, block: int) -> bool:
     return True
 
 
-def collect(base: Path, cfg: Scratch, host: str) -> JsonDict:
+def collect(base: Path, cfg: Scratch | Project, host: str) -> JsonDict:
     """Read one of the files written by setup; spread nodes across files to avoid one hot OST set."""
+    if not cfg.enabled:
+        return {"status": Status.SKIPPED}
     path = file_path(base, zlib.crc32(host.encode()) % cfg.files)
     if not path.is_file():
         return {"status": Status.MISSING, "path": str(path)}
     return {
         "status": Status.OK,
         "path": str(path),
-        **read_throughput(path, float("inf"), cfg.read.max_s, cfg.read.block_mib * 2**20, loop=True),
+        **read_throughput(path, float("inf"), cfg.read_max_s, cfg.read_block_mib * 2**20, loop=True),
     }
 
 
-def main() -> int:
-    size = int(cfg.scratch.file_gib * 2**30)
-    block = cfg.scratch.write_block_mib * 2**20
-    paths = [file_path(cfg.paths.base, index) for index in range(cfg.scratch.files)]
-    print(f"{len(paths)} x {cfg.scratch.file_gib} GiB read-test files in {paths[0].parent}", flush=True)
+def write_files(base: Path, cfg: Scratch | Project) -> None:
+    size = int(cfg.file_gib * 2**30)
+    block = cfg.write_block_mib * 2**20
+    paths = [file_path(base, index) for index in range(cfg.files)]
+    print(f"{len(paths)} x {cfg.file_gib} GiB read-test files in {paths[0].parent}", flush=True)
     with ThreadPoolExecutor(max_workers=len(paths)) as pool:
         written = sum(pool.map(write_random, paths, [size] * len(paths), [block] * len(paths)))
     print(f"wrote {written}, {len(paths) - written} already there")
+
+
+def main() -> int:
+    write_files(cfg.paths.base, cfg.scratch)
+    write_files(cfg.paths.project, cfg.project)
     return 0
 
 

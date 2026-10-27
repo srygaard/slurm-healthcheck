@@ -31,7 +31,7 @@ def main() -> int:
     # It exits at once unless logs.xid_watch is set.
     watcher = subprocess.Popen(node_command("watch", "--overlap", "--cpus-per-task=1"))
 
-    print(f"== {datetime.now():%T} A: sysinfo, scratch, local_tmp, dcgm", flush=True)
+    print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm", flush=True)
     subprocess.run(node_command("local"), check=False)
 
     print(f"== {datetime.now():%T} B: nccl", flush=True)
