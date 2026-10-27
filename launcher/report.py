@@ -8,14 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from healthcheck.config import Config, CpuLoad, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, ScratchRead
+from healthcheck.config import Config, CpuLoad, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, Project, Scratch
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status, ok
 
 type Severity = Literal["fail", "warn"]
 
-STEPS = ("sysinfo", "scratch", "local_tmp", "dcgm", "cpu_load", "logs")  # the node JSON's steps, each with elapsed_s
+# the node JSON's steps, each with elapsed_s
+STEPS = ("sysinfo", "scratch", "project", "local_tmp", "dcgm", "cpu_load", "logs")
 
 
 class Finding(NamedTuple):
@@ -117,11 +118,14 @@ def check_sysinfo(data: dict[str, Any], gpu_cfg: Gpu, nic_cfg: Nic) -> list[Find
     return out
 
 
-def check_scratch_read(data: dict[str, Any], cfg: ScratchRead) -> list[Finding]:
+def check_shared_read(data: dict[str, Any], cfg: Scratch | Project, name: str) -> list[Finding]:
+    """One node's read of a shared filesystem, $SCRATCH or $PROJECT; name labels the findings."""
+    if data["status"] == Status.SKIPPED:
+        return []
     if not ok(data):
-        return [Finding("warn", "scratch.read", f"{data['status']}: {data['path']} (run setup)")]
+        return [Finding("warn", f"{name}.read", f"{data['status']}: {data['path']} (run setup)")]
     if data["gbps"] < cfg.min_GBps:
-        return [Finding(cfg.severity, "scratch.read", f"read {data['gbps']} < {cfg.min_GBps} GB/s")]
+        return [Finding(cfg.severity, f"{name}.read", f"read {data['gbps']} < {cfg.min_GBps} GB/s")]
     return []
 
 
@@ -299,14 +303,16 @@ def check_homogeneity(
     return out
 
 
-def check_scratch_median(gbps_of: dict[str, float], cfg: ScratchRead) -> tuple[dict[str, list[Finding]], float | None]:
+def check_shared_read_median(
+    gbps_of: dict[str, float], cfg: Scratch | Project, name: str
+) -> tuple[dict[str, list[Finding]], float | None]:
     """Shared-filesystem throughput depends on load, so compare nodes against each other too."""
     out: dict[str, list[Finding]] = defaultdict(list)
     median = _median(list(gbps_of.values()))
     floor = (median or 0) * cfg.min_frac_of_median
     for host, gbps in gbps_of.items():
         if gbps < floor:
-            out[host].append(Finding(cfg.severity, "scratch.read", f"read {gbps} < {floor:.2f} GB/s (frac of median)"))
+            out[host].append(Finding(cfg.severity, f"{name}.read", f"read {gbps} < {floor:.2f} GB/s (frac of median)"))
     return out, median
 
 
@@ -378,6 +384,7 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
     findings: dict[str, list[Finding]] = defaultdict(list)
     sysinfos = {}
     scratch = {}
+    project = {}
     cpu_mhz = {}
     tflops = {}
     step_seconds: dict[str, dict[str, float]] = {}
@@ -394,9 +401,13 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
             sysinfos[host] = data
             findings[host] += check_sysinfo(data, cfg.gpu, cfg.nic)
         if data := _step(node, "scratch", findings[host]):
-            findings[host] += check_scratch_read(data, cfg.scratch.read)
+            findings[host] += check_shared_read(data, cfg.scratch, "scratch")
             if ok(data):
                 scratch[host] = data["gbps"]
+        if data := _step(node, "project", findings[host]):
+            findings[host] += check_shared_read(data, cfg.project, "project")
+            if ok(data):
+                project[host] = data["gbps"]
         if data := _step(node, "local_tmp", findings[host]):
             findings[host] += check_local_tmp(data, cfg.local_tmp)
         if data := _step(node, "dcgm", findings[host]):
@@ -413,17 +424,20 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
             findings[host] += check_logs(data, cfg.logs)
 
     # Checks across nodes
-    scratch_findings, scratch_median = check_scratch_median(scratch, cfg.scratch.read)
+    scratch_findings, scratch_median = check_shared_read_median(scratch, cfg.scratch, "scratch")
+    project_findings, project_median = check_shared_read_median(project, cfg.project, "project")
     cpu_findings, cpu_median = check_cpu_load_median(cpu_mhz, cfg.cpu_load)
     tflops_findings, tflops_median = check_dcgm_tflops(tflops, cfg.dcgm)
     groups = [group for path in sorted(layout.groups.glob("*.json")) if (group := read_json(path))]
     nccl_findings, nccl_medians = check_nccl(groups, cfg.nccl)
     homogeneity_findings = check_homogeneity(sysinfos, fail_keys=cfg.homogeneity.fail, warn_keys=cfg.homogeneity.warn)
-    for by_host in (scratch_findings, tflops_findings, cpu_findings, homogeneity_findings, nccl_findings):
+    across = (scratch_findings, project_findings, tflops_findings, cpu_findings, homogeneity_findings, nccl_findings)
+    for by_host in across:
         for host, fs in by_host.items():
             findings[host] += fs
     # GBps: gigabytes per second, as nccl-tests reports busbw
-    medians = {"scratch_read_GBps": scratch_median}
+    medians = {"scratch_read_GBps": scratch_median} if scratch else {}
+    medians |= {"project_read_GBps": project_median} if project else {}
     medians |= {"dcgm_diagnostic_tflops": tflops_median} if tflops else {}
     medians |= {"cpu_load_busy_mhz": cpu_median} if cpu_mhz else {}
     medians |= {f"nccl_{kind}_busbw_GBps": median for kind, median in nccl_medians.items()}

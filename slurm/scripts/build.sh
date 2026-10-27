@@ -1,5 +1,5 @@
 # Run by `healthcheck.py setup` on the login node, since compute nodes may have no internet:
-# nccl-tests, the shared venv and $SCRATCH read-test files.
+# nccl-tests, the shared venv and $SCRATCH and $PROJECT read-test files.
 set -euo pipefail
 
 type module &>/dev/null || source /etc/profile  # Lmod

@@ -48,10 +48,11 @@ def local() -> None:
 
     # cpu_load holds its CPU load until dcgm returns
     gpus_done = threading.Event()
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {
             "sysinfo": pool.submit(step, sysinfo.collect, host, cfg.nic.link_layer),
             "scratch": pool.submit(step, scratch.collect, cfg.paths.base, cfg.scratch, host),
+            "project": pool.submit(step, scratch.collect, cfg.paths.project, cfg.project, host),
             "local_tmp": pool.submit(step, local_tmp.collect, cfg.local_tmp, host),
             "dcgm": pool.submit(step, dcgm.collect, cfg.dcgm, env, cfg.paths.dcgm_logs(host)),
             "cpu_load": pool.submit(step, cpu_load.collect, cfg.cpu_load, gpus_done, sorted(os.sched_getaffinity(0))),

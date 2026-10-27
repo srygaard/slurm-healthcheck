@@ -3,7 +3,7 @@ import json
 import pytest
 
 from healthcheck import dcgm
-from healthcheck.config import Config, Scratch, ScratchRead
+from healthcheck.config import Config, Project, Scratch
 from launcher import report
 
 
@@ -74,6 +74,7 @@ def healthy(host):
         "host": host,
         "sysinfo": ok(sysinfo),
         "scratch": ok(scratch),
+        "project": ok(dict(scratch)),
         "local_tmp": ok(local_tmp),
         "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}, "messages": []}}}),
         "cpu_load": ok({"status": "skipped"}),
@@ -240,7 +241,33 @@ def test_dcgm_tflops_relative_to_median(run):
 def test_scratch_relative_to_median(run):
     edit(run, "rg5", lambda node: node["scratch"]["data"].update(gbps=0.8))  # above min_GBps 0.2
     assert statuses(run)["rg5"] == "warn"  # severity: warn
-    assert statuses(run, Config(scratch=Scratch(read=ScratchRead(severity="fail"))))["rg5"] == "fail"
+    assert statuses(run, Config(scratch=Scratch(severity="fail")))["rg5"] == "fail"
+
+
+def test_project_read_has_its_own_thresholds(run):
+    edit(run, "rg5", lambda node: node["project"]["data"].update(gbps=0.8))  # above min_GBps, below half the median
+    result = evaluate(run)
+    assert [finding["check"] for finding in result["nodes"]["rg5"]["findings"]] == ["project.read"]
+    assert result["medians"]["project_read_GBps"] == 2.0
+    assert statuses(run, Config(project=Project(severity="fail")))["rg5"] == "fail"
+    assert statuses(run, Config(scratch=Scratch(severity="fail")))["rg5"] == "warn"
+
+
+def test_disabled_reads_are_skipped(run):
+    for host in ("rg1", "rg2"):
+        edit(run, host, lambda node: node.update(scratch=ok({"status": "skipped"}), project=ok({"status": "skipped"})))
+    result = evaluate(run)
+    assert result["nodes"]["rg1"]["findings"] == []
+    assert result["medians"]["scratch_read_GBps"] == 2.0  # from the nodes that ran it
+    assert result["medians"]["project_read_GBps"] == 2.0
+
+
+def test_disabled_reads_have_no_median(run):
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
+        edit(run, host, lambda node: node.update(project=ok({"status": "skipped"})))
+    medians = evaluate(run)["medians"]
+    assert "project_read_GBps" not in medians
+    assert medians["scratch_read_GBps"] == 2.0
 
 
 def test_local_tmp_same_device_checks_free_space_only(run):
