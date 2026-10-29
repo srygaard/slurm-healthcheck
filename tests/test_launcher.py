@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 
 import pytest
@@ -113,7 +114,8 @@ def test_with_dependency():
 # Rorqual (Slurm 25.11, data_parser v0.0.44), cut down to the fields the parsers read
 SQUEUE_JSON = r"""
 {"jobs": [
- {"job_id": 25034106, "name": "hc-probe", "job_state": ["PENDING"], "state_reason": "Priority"},
+ {"job_id": 25034106, "name": "hc-probe", "job_state": ["PENDING"], "state_reason": "Priority",
+  "start_time": {"set": true, "infinite": false, "number": 1793318464}},
  {"job_id": 25035268, "name": "hc-any1", "job_state": ["PENDING"], "state_reason": "Dependency"}
 ], "meta": {"plugin": {"data_parser": "data_parser/v0.0.44"}}}
 """
@@ -135,9 +137,20 @@ def test_squeue(monkeypatch):
         monkeypatch.setattr(slurm, "run", lambda args, **_: Cmd(returncode, stdout, stderr))
 
     run(SQUEUE_JSON)
-    assert slurm.squeue(["--me"]).jobs == {25034106: "PENDING", 25035268: "PENDING"}
+    expected_time = datetime.fromtimestamp(1793318464).astimezone()
+    time_str = f"{expected_time:%Y-%m-%dT%H:%M:%S}"
+    assert slurm.squeue(["--me"]).jobs == [
+        slurm.SqueueJob(25034106, "PENDING", expected_time),
+        slurm.SqueueJob(25035268, "PENDING"),
+    ]
+    assert (
+        str(slurm.SqueueJob(25034106, "PENDING", expected_time))
+        == f"25034106 PENDING (estimated start {time_str})"
+    )
+    assert str(slurm.SqueueJob(25035268, "PENDING")) == "25035268 PENDING"
+    assert str(slurm.SqueueJob(25035268, "RUNNING", expected_time)) == f"25035268 RUNNING (started {time_str})"
     run("", 1, "slurm_load_jobs error: Invalid job id specified\n")  # squeue -j with only finished jobs
-    assert slurm.squeue(["-j", "1"]) == ({}, 1, "slurm_load_jobs error: Invalid job id specified\n")
+    assert slurm.squeue(["-j", "1"]) == ([], 1, "slurm_load_jobs error: Invalid job id specified\n")
 
 
 def test_sacct_states(monkeypatch):

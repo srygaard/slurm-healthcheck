@@ -6,6 +6,7 @@ import socket
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict, cast
@@ -49,8 +50,22 @@ class SbatchResult(NamedTuple):
     stderr: str
 
 
+@dataclass(frozen=True)
+class SqueueJob:
+    job_id: int
+    state: JobState
+    start_time: datetime | None = None
+
+    def __str__(self) -> str:
+        time_info = ""
+        if self.start_time:
+            prefix = "estimated start" if self.state == "PENDING" else "started"
+            time_info = f" ({prefix} {self.start_time:%Y-%m-%dT%H:%M:%S})"
+        return f"{self.job_id} {self.state}{time_info}"
+
+
 class SqueueResult(NamedTuple):
-    jobs: dict[int, JobState]
+    jobs: list[SqueueJob]
     returncode: int
     stderr: str
 
@@ -100,10 +115,36 @@ def _state(value: list[str] | str) -> JobState:
     return cast(JobState, value[0] if isinstance(value, list) else value.split()[0])
 
 
+def _start_time(value: Any) -> datetime | None:
+    """Parse start_time from squeue --json into a datetime or None."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, dict):
+        if not value.get("set") or value.get("infinite"):
+            return None
+        value = value.get("number")
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(value).astimezone()
+    if isinstance(value, str) and value and value != "N/A":
+        try:
+            dt = datetime.fromisoformat(value)
+            return dt if dt.tzinfo else dt.astimezone()
+        except ValueError:
+            return None
+    return None
+
+
 def squeue(options: Sequence[str]) -> SqueueResult:
-    """The queued jobs that options (-j, --me, -n ...) select, with their states."""
+    """The queued jobs that options (-j, --me, -n ...) select, with their states and start times."""
     result = run(["squeue", "--json", *options], timeout=None)
-    jobs = {job["job_id"]: _state(job["job_state"]) for job in _jobs(result.stdout)}
+    jobs = [
+        SqueueJob(
+            job_id=job["job_id"],
+            state=_state(job["job_state"]),
+            start_time=_start_time(job.get("start_time")),
+        )
+        for job in _jobs(result.stdout)
+    ]
     return SqueueResult(jobs, result.returncode, result.stderr)
 
 
@@ -115,7 +156,7 @@ def wait_for(job_ids: list[int], interval: float = 15) -> None:
         if result.returncode and "Invalid job id" not in result.stderr:
             time.sleep(interval)  # transient slurmctld error: retry
             continue
-        states = Counter(result.jobs.values())
+        states = Counter(job.state for job in result.jobs)
         done = len(job_ids) - sum(states.values())
         print(
             f"\r[{datetime.now():%H:%M:%S}] {done}/{len(job_ids)} done  "
@@ -132,7 +173,7 @@ def wait_for(job_ids: list[int], interval: float = 15) -> None:
 
 def my_queued(name: str) -> list[int]:
     """My pending or running jobs named name; [] if squeue fails or isn't installed."""
-    return sorted(squeue(["--me", "-n", name]).jobs)
+    return sorted(job.job_id for job in squeue(["--me", "-n", name]).jobs)
 
 
 def with_dependency(dependency: str | None, job_ids: Sequence[int]) -> str | None:
