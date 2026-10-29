@@ -15,6 +15,9 @@ Jobs import the code from this checkout, so an edit to `healthcheck/config.py` a
 queued. `$SCRATCH/slurm-healthcheck/env.json` is written by the probe; run `setup` again rather than editing it.
 
 ## Setup
+
+This starts a quick job to determine what tools are available:
+
 ```bash
 uv run healthcheck.py setup               # build here (nccl-tests, read-test files, venv), then a probe job
 cat $SCRATCH/slurm-healthcheck/env.json   # probe result: how to run DCGM, which srun --mpi plugin works
@@ -23,6 +26,9 @@ Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/
 built is skipped.
 
 ## Running
+
+Running commands _without_ `--no-wait` will wait for ~9 minutes before reporting the results.
+
 ```bash
 uv run healthcheck.py run                                      # one job per leaf switch, wait, then report
 uv run healthcheck.py run --job-per cluster                    # one job across all eligible nodes

@@ -223,8 +223,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.no_wait:
         print(f"Report when the jobs finish: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
         return 0
+    job_ids = [job["job_id"] for job in jobs]
+    waiting_on = f"{len(job_ids)} job(s) ({', '.join(map(str, job_ids))}) to start and finish"
+    if probes:
+        waiting_on += f", after probe job(s) {', '.join(map(str, probes))}"
+    print(f"Waiting for {waiting_on}; a run takes at least 9 minutes. Ctrl+C doesn't cancel anything.")
     try:
-        wait_for([job["job_id"] for job in jobs])
+        wait_for(job_ids)
     except KeyboardInterrupt:
         print(
             "\nStopped waiting; the jobs still run. Report when they finish: "
