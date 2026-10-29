@@ -1,7 +1,8 @@
 #!/bin/bash
 # job_submit.lua appends _cpu/_gpu to the account
-#SBATCH --account=rrg-bengioy-ad
+#SBATCH --account=def-bengioy
 #SBATCH --exclusive
+#SBATCH --reservation=MILABENCH2026
 #SBATCH --gpus-per-node=h100:4
 #SBATCH --constraint=h100&nvlink
 #SBATCH --ntasks-per-node=1
