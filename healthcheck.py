@@ -231,7 +231,7 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
     # A job still in the queue hasn't written all its results: its nodes would show as failed in exclude.sbatch
     job_ids = ",".join(str(job["job_id"]) for job in jobs)
     if job_ids and (queued := squeue(["-j", job_ids]).jobs):
-        states = ", ".join(f"{job_id} {state}" for job_id, state in sorted(queued.items()))
+        states = ", ".join(str(job) for job in sorted(queued, key=lambda j: j.job_id))
         print(f"{Ansi.YELLOW}Not finished: job {states}{Ansi.RESET}")
         print(f"Report when the jobs finish: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
         return 1
