@@ -52,8 +52,10 @@ def write_files(base: Path, cfg: Scratch | Project) -> None:
 
 
 def main() -> int:
-    write_files(cfg.paths.base, cfg.scratch)
-    write_files(cfg.paths.project, cfg.project)
+    if cfg.scratch.enabled:
+        write_files(cfg.paths.base, cfg.scratch)
+    if cfg.project.enabled:
+        write_files(cfg.paths.project, cfg.project)
     return 0
 
 

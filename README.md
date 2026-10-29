@@ -63,9 +63,9 @@ Each node runs three phases:
      writes its NUMA layout table to `<run>/numa/<host>.json`;
      kernel, OS and OFED; system BIOS version (DMI), and the CPU clock and power settings a user can read
      (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
-   - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it (`setup` still writes its files).
+   - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and `setup` skips its files too.
    - **project**: `$PROJECT` read, in parallel with scratch and with its own thresholds; `setup` and `run` need
-     `$PROJECT` set; `project.enabled: false` skips it (`setup` still writes its files).
+     `$PROJECT` set; disabled by default (`project.enabled`), and `setup` then skips its files too.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
      node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
