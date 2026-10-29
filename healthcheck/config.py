@@ -36,7 +36,7 @@ class Nic(Section):
 class Scratch(Section):
     """The shared filesystem: load isn't a node fault, so this only warns by default."""
 
-    enabled: bool = True  # setup writes the read-test files either way
+    enabled: bool = True  # off: setup skips its read-test files too
     files: int = 8  # read-test files written by setup; each node reads f<crc32(host) % n>
     file_gib: float = 1  # small: a busy OST writes at only a few MB/s
     write_block_mib: int = 16  # Lustre is slow with small writes
@@ -50,7 +50,7 @@ class Scratch(Section):
 class Project(Section):
     """$PROJECT, tested like $SCRATCH: load isn't a node fault, so this only warns by default."""
 
-    enabled: bool = True  # setup writes the read-test files either way
+    enabled: bool = False  # off: no $PROJECT needed, and setup skips its files
     files: int = 8  # read-test files written by setup; each node reads f<crc32(host) % n>
     file_gib: float = 1  # small: a busy OST writes at only a few MB/s
     write_block_mib: int = 16  # Lustre is slow with small writes
