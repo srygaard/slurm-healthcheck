@@ -8,7 +8,7 @@ the checks (see [Configuration](#configuration)).
 | file | sets | takes effect |
 |------|------|--------------|
 | [healthcheck/config.py](healthcheck/config.py) | thresholds, `homogeneity` keys, DCGM tests, NCCL timeouts, `/tmp` test size | next job; thresholds also on `report <run>` |
-| [slurm/scripts/.env](slurm/scripts/.env) | modules, nccl-tests version, CUDA arch | after `setup` |
+| [slurm/scripts/.drac.env](slurm/scripts/.drac.env), [.mila.env](slurm/scripts/.mila.env) | modules, nccl-tests version, CUDA arch | after `setup` |
 | `healthcheck.py` options | which nodes, how they're grouped into jobs, `--exclude-on` | per command, see [Running](#running) |
 
 Jobs import the code from this checkout, so an edit to `healthcheck/config.py` also reaches jobs that are still
@@ -22,8 +22,8 @@ This starts a quick job to determine what tools are available:
 uv run healthcheck.py setup               # build here (nccl-tests, read-test files, venv), then a probe job
 cat $SCRATCH/slurm-healthcheck/env.json   # probe result: how to run DCGM, which srun --mpi plugin works
 ```
-Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.env`; anything already
-built is skipped.
+Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.drac.env`/`.mila.env`; anything
+already built is skipped.
 
 ## Running
 
@@ -54,6 +54,8 @@ to `nccl.timeout_s`.
 The cluster is detected from `$CC_CLUSTER` (or the `mila.quebec` domain), and each cluster needs its own job template,
 `slurm/templates/<cluster>.sh`, which the probe and healthcheck jobs share. A template holds only the resources;
 healthcheck.py passes the per-job name, logs, nodes, `--dependency` and the probe's `--nodes=1` as sbatch options.
+Mila's template runs on the `long` partition's A100L nodes; its modules, NCCL, Python and `$PROJECT` come from
+`slurm/scripts/.mila.env`.
 
 The report is printed and written to the run directory. Paste one of its headers into the training job:
 `exclude.sbatch` (`#SBATCH --exclude=rg[21703,31605]`) keeps the job off the failed nodes, and `include.sbatch`
@@ -69,9 +71,10 @@ Each node runs three phases:
      writes its NUMA layout table to `<run>/numa/<host>.json`;
      kernel, OS and OFED; system BIOS version (DMI), and the CPU clock and power settings a user can read
      (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
-   - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and `setup` skips its files too.
-   - **project**: `$PROJECT` read, in parallel with scratch and with its own thresholds; `setup` and `run` need
-     `$PROJECT` set; disabled by default (`project.enabled`), and `setup` then skips its files too.
+   - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and has `setup` skip its files.
+   - **project**: `$PROJECT` read, in parallel with scratch and with its own thresholds; `$PROJECT` is set in
+     `slurm/scripts/.drac.env` and `.mila.env`. Off by default: `project.enabled: true` runs it and has `setup`
+     write its files.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
      node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
@@ -190,7 +193,7 @@ at 0 and its CPUs at ~65 °C, so only `cpu_load.low_clocks` flags it, not `cpu_l
 - [dmesg](https://man7.org/linux/man-pages/man1/dmesg.1.html) and
   [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html) for kernel log matches.
 - [Environment modules](https://docs.alliancecan.ca/wiki/Utiliser_des_modules/en) ([Lmod](https://lmod.readthedocs.io/))
-  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.env`; see the
+  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.drac.env`; see the
   [Rorqual docs](https://docs.alliancecan.ca/wiki/Rorqual/en).
 
 ## Tests
