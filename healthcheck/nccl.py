@@ -180,6 +180,13 @@ def run_round(
                 "elapsed_s": round(ended.get(index, now) - start, 1),
                 "peak_busbw": parsed["peak_busbw"],
                 "avg_busbw": parsed["avg_busbw"],
+                "rows": [
+                    {
+                        "size": row["size"],
+                        "busbw": row["busbw"]
+                    }
+                    for row in parsed["rows"]
+                ],
                 "wrong": parsed["wrong"],
                 "log": str(log),
             }
