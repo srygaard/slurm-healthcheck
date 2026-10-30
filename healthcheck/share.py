@@ -1,4 +1,7 @@
-"""Step 2a: $SCRATCH and $PROJECT read throughput, one step each. `python -m healthcheck.scratch` writes the read-test files (`healthcheck.py setup`)."""
+"""Step 2a: shared filesystem read throughput, $SCRATCH and $PROJECT, one step each.
+
+`python -m healthcheck.share` writes the read-test files of the enabled ones (`healthcheck.py setup`).
+"""
 
 import os
 import zlib

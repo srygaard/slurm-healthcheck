@@ -216,7 +216,7 @@ class Paths(Section):
         os.environ.get("HC_BASE", ".")
     )  # shared across runs: env.json, .opt/, diskprobe/, results/; healthcheck.py exports it
     root: Path = Field(default_factory=_run_root)
-    project: Path = Path(os.environ.get("HC_PROJECT", "."))  # like base, on $PROJECT; healthcheck.py exports it
+    project: Path = Path(os.environ.get("HC_PROJECT", "."))  # like base, on $PROJECT; slurm/scripts/.*.env export it
 
     @property
     def env(self) -> Path:

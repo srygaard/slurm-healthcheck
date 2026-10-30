@@ -1,4 +1,4 @@
-from healthcheck import scratch
+from healthcheck import share
 from healthcheck.util.io_throughput import read_throughput
 
 BLOCK = 16 * 2**20
@@ -25,8 +25,8 @@ def test_empty_file_does_not_spin(tmp_path):
 
 
 def test_write_random_skips_complete_files(tmp_path):
-    path = scratch.file_path(tmp_path, 0)
-    assert scratch.write_random(path, BLOCK + 1, BLOCK)
+    path = share.file_path(tmp_path, 0)
+    assert share.write_random(path, BLOCK + 1, BLOCK)
     assert path.stat().st_size == 2 * BLOCK  # whole blocks
-    assert not scratch.write_random(path, BLOCK, BLOCK)
+    assert not share.write_random(path, BLOCK, BLOCK)
     assert not path.with_name("f0.tmp").exists()

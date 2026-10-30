@@ -16,7 +16,7 @@ from typing import Any
 
 import pynvml
 
-from healthcheck import cpu_load, dcgm, local_tmp, logs, scratch, sysinfo
+from healthcheck import cpu_load, dcgm, local_tmp, logs, share, sysinfo
 from healthcheck.config import cfg
 from healthcheck.util.file import JsonDict, read_json, write_json
 from healthcheck.util.nvml import session
@@ -51,8 +51,8 @@ def local() -> None:
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {
             "sysinfo": pool.submit(step, sysinfo.collect, host, cfg.nic.link_layer),
-            "scratch": pool.submit(step, scratch.collect, cfg.paths.base, cfg.scratch, host),
-            "project": pool.submit(step, scratch.collect, cfg.paths.project, cfg.project, host),
+            "scratch": pool.submit(step, share.collect, cfg.paths.base, cfg.scratch, host),
+            "project": pool.submit(step, share.collect, cfg.paths.project, cfg.project, host),
             "local_tmp": pool.submit(step, local_tmp.collect, cfg.local_tmp, host),
             "dcgm": pool.submit(step, dcgm.collect, cfg.dcgm, env, cfg.paths.dcgm_logs(host)),
             "cpu_load": pool.submit(step, cpu_load.collect, cfg.cpu_load, gpus_done, sorted(os.sched_getaffinity(0))),
