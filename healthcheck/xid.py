@@ -1,15 +1,16 @@
 """NVML Xid events for the whole job, standing in for the root-only kernel log's NVRM lines.
 
-The watcher appends one JSON object per line to <run>/xid/<host>.jsonl. Phase C reads it back.
+A watcher thread appends one JSON object per line to <run>/xid/<host>.jsonl. Phase C reads it back after stop().
 """
 
 import json
-import os
-import signal
-import time
+import threading
+import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import pynvml
 
@@ -19,53 +20,86 @@ from healthcheck.util.nvml import session
 from healthcheck.util.status import Status
 
 
-def watch() -> None:
-    """Record events until the stop file appears.
+@contextmanager
+def _event_set() -> Iterator[Any]:
+    """An NVML event set. Enter it inside session(), so free runs before nvmlShutdown."""
+    events = pynvml.nvmlEventSetCreate()
+    try:
+        yield events
+    finally:
+        pynvml.nvmlEventSetFree(events)
 
-    A stop file rather than a signal: srun answers SIGTERM by killing the step, before "stopped" is written.
+
+class Watcher:
+    """A thread that records Xid events until stop().
+
+    start() returns at once. With logs.xid_watch off, both calls do nothing.
     """
-    if not cfg.logs.xid_watch:
-        return
-    path = cfg.paths.xid(cfg.host.name)
-    stop_file = cfg.paths.xid_stop(os.environ.get("SLURM_JOB_ID", ""))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stop = False
 
-    def on_term(*_: Any) -> None:
-        nonlocal stop
-        stop = True
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._log: TextIO | None = None
 
-    signal.signal(signal.SIGTERM, on_term)
-    signal.signal(signal.SIGINT, on_term)
+    def start(self) -> None:
+        if not cfg.logs.xid_watch or self._thread is not None:
+            return
+        path = cfg.paths.xid(cfg.host.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = open(path, "a", buffering=1)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._watch, name="xid", daemon=True)
+        self._thread.start()
 
-    with open(path, "a", buffering=1) as xid_log:
+    def stop(self) -> None:
+        """Ask the thread to write "stopped" and wait for it. The NVML wait is 1s."""
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop.set()
+        thread.join(timeout=5)
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
-        def emit(**event: Any) -> None:
-            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-            xid_log.write(json.dumps({"time": stamp, **event}) + "\n")
+    def _emit(self, **event: Any) -> None:
+        """Append one event. start() has opened the log; stop() closes it after the thread returns."""
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        if self._log is not None:
+            self._log.write(json.dumps({"time": stamp, **event}) + "\n")
 
-        with session():
-            events = pynvml.nvmlEventSetCreate()
-            for index in range(pynvml.nvmlDeviceGetCount()):
-                try:
-                    pynvml.nvmlDeviceRegisterEvents(
-                        pynvml.nvmlDeviceGetHandleByIndex(index), pynvml.nvmlEventTypeXidCriticalError, events
-                    )
-                except pynvml.NVMLError as error:
-                    emit(event="error", gpu=index, error=str(error))
-            emit(event="started")
-            while not stop and not stop_file.exists():
-                try:
-                    data = pynvml.nvmlEventSetWait_v2(events, 1000)
-                except pynvml.NVMLError_Timeout:
-                    continue
-                except pynvml.NVMLError as error:
-                    emit(event="error", error=str(error))
-                    time.sleep(1)
-                    continue
-                emit(event="xid", gpu=pynvml.nvmlDeviceGetIndex(data.device), xid=int(data.eventData))
-            emit(event="stopped")
-            pynvml.nvmlEventSetFree(events)
+    def _register(self, events: Any) -> None:
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            try:
+                pynvml.nvmlDeviceRegisterEvents(
+                    pynvml.nvmlDeviceGetHandleByIndex(index), pynvml.nvmlEventTypeXidCriticalError, events
+                )
+            except pynvml.NVMLError as error:
+                self._emit(event="error", gpu=index, error=str(error))
+
+    def _poll(self, events: Any) -> None:
+        """One wait. A timeout returns so the caller can check stop; any other NVML error is logged."""
+        try:
+            data = pynvml.nvmlEventSetWait_v2(events, 1000)
+        except pynvml.NVMLError_Timeout:
+            return
+        except pynvml.NVMLError as error:
+            self._emit(event="error", error=str(error))
+            self._stop.wait(1)
+            return
+        self._emit(event="xid", gpu=pynvml.nvmlDeviceGetIndex(data.device), xid=int(data.eventData))
+
+    def _watch(self) -> None:
+        try:
+            with session(), _event_set() as events:
+                self._register(events)
+                self._emit(event="started")
+                while not self._stop.is_set():
+                    self._poll(events)
+                self._emit(event="stopped")
+        except Exception as error:  # noqa: BLE001 - the log keeps it; the node steps keep running
+            self._emit(event="error", error=f"{type(error).__name__}: {error}")
+            traceback.print_exc()
 
 
 def events(path: Path, ignore: list[int]) -> JsonDict:
@@ -81,7 +115,3 @@ def events(path: Path, ignore: list[int]) -> JsonDict:
         "ignored": [xid for xid in xids if xid["xid"] in ignore],
         "errors": [event for event in recorded if event.get("event") == "error"],
     }
-
-
-if __name__ == "__main__":
-    watch()

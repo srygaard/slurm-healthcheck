@@ -293,8 +293,8 @@ class Paths(Section):
     def xid(self, host: str) -> Path:
         return self.root / "xid" / f"{host}.jsonl"
 
-    def xid_stop(self, job_id: str) -> Path:
-        return self.root / "xid" / f".stop-{job_id}"
+    def xid_stop(self) -> Path:
+        return self.root / "xid" / f".stop-{os.environ['SLURM_JOB_ID']}"
 
     def dcgm_logs(self, host: str) -> Path:
         return self.root / "logs" / "dcgm" / host
