@@ -22,23 +22,22 @@ def main() -> int:
     job_id = os.environ["SLURM_JOB_ID"]
     cfg.paths.root.mkdir(parents=True, exist_ok=True)
     os.chdir(cfg.paths.root)  # the srun steps inherit it
-    print(
-        f"== {datetime.now():%T} job {job_id} on {os.environ['SLURM_JOB_NODELIST']}, results in {cfg.paths.root}",
-        flush=True,
-    )
+    print(f"== {datetime.now():%T} job {job_id} on {os.environ['SLURM_JOB_NODELIST']}, results in {cfg.paths.root}")
 
     # --overlap: the watcher shares CPUs and GPUs with the test steps instead of blocking them.
     # It exits at once unless logs.xid_watch is set.
     watcher = subprocess.Popen(node_command("watch", "--overlap", "--cpus-per-task=1"))
 
-    print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm", flush=True)
+    print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm")
     subprocess.run(node_command("local"), check=False)
 
-    print(f"== {datetime.now():%T} B: nccl", flush=True)
+    print(f"== {datetime.now():%T} B: nccl")
+    code = 0
     try:
-        nccl.main()
+        code = nccl.main()
     except Exception:  # noqa: BLE001 - the report shows the missing NCCL results
         traceback.print_exc()
+        code = 1
 
     stop_file = cfg.paths.xid_stop(job_id)  # the watcher polls for it each second, see healthcheck.node.watch
     stop_file.parent.mkdir(parents=True, exist_ok=True)
@@ -48,10 +47,10 @@ def main() -> int:
     except subprocess.TimeoutExpired:
         watcher.terminate()
 
-    print(f"== {datetime.now():%T} C: logs", flush=True)
+    print(f"== {datetime.now():%T} C: logs")
     subprocess.run(node_command("finalize"), check=False)
-    print(f"== {datetime.now():%T} done", flush=True)
-    return 0
+    print(f"== {datetime.now():%T} done")
+    return code
 
 
 if __name__ == "__main__":

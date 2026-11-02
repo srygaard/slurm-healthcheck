@@ -163,7 +163,6 @@ def wait_for(job_ids: list[int], interval: float = 15) -> None:
             + "  ".join(f"{state.lower()} {count}" for state, count in sorted(states.items()))
             + " " * 10,
             end="",
-            flush=True,
         )
         if not states:
             print()

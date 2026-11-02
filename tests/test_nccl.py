@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 from healthcheck import nccl
+from healthcheck.config import Nccl, NcclTest
 
 ALL_REDUCE = r"""
 # nThread 1 nGpus 1 minBytes 134217728 maxBytes 1073741824 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
@@ -51,26 +52,61 @@ def test_pair_rounds_cover_ring_once_per_round():
 
 
 def test_plan_single_node_has_no_pairs_or_group():
-    kinds = [test.kind for tests in nccl.plan(["a"], {}) for test in tests]
+    kinds = [test.kind for tests in nccl.plan(["a"]) for test in tests]
     assert kinds == ["intra", "loopback"]
-    rounds = nccl.plan(["a", "b", "c"], {})
-    assert {test.kind for tests in rounds for test in tests} == {"intra", "loopback", "pair", "group", "alltoall"}
+    rounds = nccl.plan(["a", "b", "c"])
+    assert {test.kind for tests in rounds for test in tests} == {"intra", "loopback", "pair", "group"}
 
 
 def test_plan_collectives_span_the_whole_job():
     # --job-per picks the job's nodes: a leaf switch's or the cluster's
     nodes = [f"n{index}" for index in range(21)]
-    rounds = nccl.plan(nodes, {})
-    assert [test.nodes for test in rounds[-2]] == [tuple(nodes)]  # group
-    assert [test.nodes for test in rounds[-1]] == [tuple(nodes)]  # alltoall
+    rounds = nccl.plan(nodes)
+    assert [test.nodes for test in rounds[-1]] == [tuple(nodes)]  # group
 
 
-def test_alltoall_runs_its_binary_from_the_same_build():
-    launch = nccl.Launch("pmix", Path("/opt/build/all_reduce_perf"), ["--iters=20"], 4)
-    group = nccl.Run("group", ("a", "b", "c"))
-    alltoall = nccl.Run("alltoall", ("a", "b", "c"))
-    assert launch.command(group)[-2:] == ["/opt/build/all_reduce_perf", "--iters=20"]
-    assert launch.command(alltoall)[-2:] == ["/opt/build/alltoall_perf", "--iters=20"]
+def test_plan_skips_disabled_tests():
+    off = NcclTest(enabled=False)
+    settings = Nccl()
+    alltoall = settings.alltoall.model_copy(update={"enabled": True})
+    only_alltoall = settings.model_copy(
+        update={"intra": off, "loopback": off, "pair": off, "group": off, "alltoall": alltoall}
+    )
+    rounds = nccl.plan(["a", "b"], only_alltoall)
+    assert [[test.label for test in tests] for tests in rounds] == [["alltoall-a-b"]]
+    assert nccl.plan(["only-one"], only_alltoall) == []
+    # Alongside the other tests, two nodes do not run alltoall
+    alongside = settings.model_copy(update={"alltoall": alltoall})
+    assert "alltoall" not in [test.kind for tests in nccl.plan(["a", "b"], alongside) for test in tests]
+
+
+def test_each_test_uses_its_binary_args_and_env():
+    launch = nccl.Launch("pmix", Path("/opt/build"), 4)
+    settings = Nccl()
+    rounds = nccl.plan(["a", "b", "c"])
+    by_kind = {test.kind: test for tests in rounds for test in tests}
+    assert launch.command(by_kind["group"])[-6:] == [
+        "/opt/build/all_reduce_perf",
+        "--minbytes=128M",
+        "--maxbytes=1G",
+        "--stepfactor=2",
+        "--warmup_iters=5",
+        "--iters=20",
+    ]
+    alltoall = nccl.Run(settings.alltoall.name, ("a", "b", "c"), settings.alltoall)
+    assert launch.command(alltoall)[-5:] == [
+        "/opt/build/alltoall_perf",
+        "--minbytes=1G",
+        "--maxbytes=1G",
+        "--warmup_iters=2",
+        "--iters=5",
+    ]
+    assert by_kind["loopback"].env == {
+        "NCCL_P2P_DISABLE": "1",
+        "NCCL_SHM_DISABLE": "1",
+        "NCCL_NVLS_ENABLE": "0",
+    }
+    assert by_kind["intra"].env == {}
 
 
 def test_run_round_terminates_stragglers(tmp_path):

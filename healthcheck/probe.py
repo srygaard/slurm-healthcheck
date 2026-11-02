@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from healthcheck import dcgm, nccl
-from healthcheck.config import cfg
+from healthcheck.config import NcclTest, cfg
 from healthcheck.util.file import write_json
 from healthcheck.util.status import ok
 
@@ -26,8 +26,13 @@ def main() -> int:
     # Prefer the host's running hostengine, then one we start ourselves
     dcgmi = shutil.which("dcgmi")
     hostengine = shutil.which("nv-hostengine")
-    print(f"host dcgmi: {dcgmi or 'none'}, nv-hostengine: {hostengine or 'none'}", flush=True)
-    modes = [mode for mode, available in [("host", dcgmi), ("host-self", dcgmi and hostengine)] if available]
+    print(f"host dcgmi: {dcgmi or 'none'}, nv-hostengine: {hostengine or 'none'}")
+    modes = [
+        mode 
+        for mode, available 
+        in [("host", dcgmi), ("host-self", dcgmi and hostengine)] 
+        if available
+    ]
     for mode in modes:
         try:
             result = dcgm.diag(
@@ -56,11 +61,14 @@ def main() -> int:
             env["dcgm"] = mode
             break
 
-    binary = Path(env["nccl_tests"]) / cfg.nccl.binary
+    probe = NcclTest(args=["--minbytes=8M", "--maxbytes=8M"], timeout_s=120)
     for mpi in ("pmix", "pmi2"):
-        launch = nccl.Launch(mpi, binary, ["--minbytes=8M", "--maxbytes=8M"], cfg.gpu.count)
+        launch = nccl.Launch(mpi, Path(env["nccl_tests"]), cfg.gpu.count)
         [result] = nccl.run_round(
-            [nccl.Run("probe", (cfg.host.name,))], launch, base / "results" / str(env["probe_job"]) / mpi, timeout=120
+            [nccl.Run("probe", (cfg.host.name,), probe)],
+            launch,
+            base / "results" / str(env["probe_job"]) / mpi,
+            timeout=probe.timeout_s,
         )
         env["attempts"].append({"mpi": mpi, **result})
         if ok(result):

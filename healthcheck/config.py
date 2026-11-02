@@ -134,26 +134,64 @@ class CpuLoad(Section):
     min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
 
 
-class Nccl(Section):
-    binary: str = "all_reduce_perf"
-    alltoall_binary: str = "alltoall_perf"  # the alltoall tests', built alongside binary
+class NcclTest(Section):
+    """Settings shared by every NCCL test kind: intra, loopback, pair, group, alltoall."""
+
+    name: str = ""  # the kind recorded in results: intra, loopback, pair, group, alltoall
+    enabled: bool = True
+    binary: str = "all_reduce_perf"  # file in the nccl-tests build directory recorded in env.json
     args: list[str] = ["--minbytes=128M", "--maxbytes=1G", "--stepfactor=2", "--warmup_iters=5", "--iters=20"]
+    env: dict[str, str] = Field(default_factory=dict)
+    # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip phase C.
+    timeout_s: float = 120
+    min_busbw_GBps: float = 0
+    min_frac_of_median: float | None = None  # None: the absolute floor only
+    # Severity of an unblamed timeout of a whole-job test. A slow result still warns.
+    timeout_severity: Literal["fail", "warn"] = "fail"
+
+
+class Nccl(Section):
+    """One NcclTest per kind. Turn a kind off with enabled=false.
+
+    Timeouts are about 3x the healthy times on Rorqual (intra 11 s, loopback 35 s, pair 15 s, a 21-node group 24 s,
+    a leaf alltoall 58 s). A node failing its socket connections took ~140 s per pair. alltoall_perf's busbw is
+    algbw * (n-1)/n and all_reduce_perf's is 2 * algbw * (n-1)/n, so the two don't compare.
+    """
+
     debug: str = "WARN"
-    # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip
-    # phase C. About 3x the healthy times on Rorqual (intra 11 s, loopback 35 s, pair 15 s, 21-node group 24 s and
-    # alltoall 58 s; the last two grow with the job); a node failing its socket connections took ~140 s per pair.
-    timeout_s: dict[str, float] = {"intra": 45, "loopback": 90, "pair": 45, "group": 120, "alltoall": 180}
-    # The loopback round: no NVLink or shared memory, so traffic goes through the NICs
-    loopback_env: dict[str, str] = {"NCCL_P2P_DISABLE": "1", "NCCL_SHM_DISABLE": "1", "NCCL_NVLS_ENABLE": "0"}
-    intra_min_busbw_GBps: float = 300
-    loopback_min_busbw_GBps: float = 5  # Rorqual: one 200 Gb/s NIC per node shared by 4 GPUs, ~6.3 at line rate
-    pair_min_busbw_GBps: float = 20
-    pair_min_frac_of_median: float = 0.7
-    group_min_busbw_GBps: float = 20
-    group_min_frac_of_median: float = 0.8
-    # alltoall_perf's busbw is algbw * (n-1)/n, all_reduce_perf's 2 * algbw * (n-1)/n, so the two don't compare
-    alltoall_min_busbw_GBps: float = 5  # Rorqual: ~6.8 within a leaf switch, ~3.0 across three
-    alltoall_min_frac_of_median: float = 0.8
+    intra: NcclTest = NcclTest(
+        name="intra",
+        timeout_s=45,
+        min_busbw_GBps=120,  # single-node ~337; a 65-node run sat near 149, with two nodes near 20
+    )
+    loopback: NcclTest = NcclTest(
+        name="loopback",
+        env={
+            "NCCL_P2P_DISABLE": "1",  # GPUs would otherwise talk over NVLink
+            "NCCL_SHM_DISABLE": "1",  # the same-node fallback is host shared memory, still off the NIC
+            "NCCL_NVLS_ENABLE": "0",  # NVLink SHARP would still carry the reduction
+        },
+        timeout_s=90,
+        min_busbw_GBps=3,  # single-node ~6.4; the same 65-node run sat near 3.7, lowest 3.22
+    )
+    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20, min_frac_of_median=0.7)
+    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20, min_frac_of_median=0.8)
+    alltoall: NcclTest = NcclTest(
+        name="alltoall",
+        # Off: a 65-node alltoall was still starting at 180 s, and this 600 s timeout does not fit in the template's
+        # --time once phase A has run. Extend #SBATCH --time before setting enabled=true.
+        enabled=False,
+        binary="alltoall_perf",
+        # all_reduce walks 128 MB to 1 GB. alltoall replaces args: one 1 GB size, because a 65-node sweep spent its
+        # timeout in communicator init before any size row.
+        args=["--minbytes=1G", "--maxbytes=1G", "--warmup_iters=2", "--iters=5"],
+        timeout_s=600,
+        # A 64-node run, one 1 GB size: 1.97 GB/s. The floor is about half of that. A leaf was ~6.8; a leaf slow
+        # against the other jobs in the run is caught by min_frac_of_median. Such a timeout names no node, so it warns.
+        min_busbw_GBps=1.0,
+        min_frac_of_median=0.8,
+        timeout_severity="warn",
+    )
 
 
 class Logs(Section):
