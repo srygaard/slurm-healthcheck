@@ -3,18 +3,21 @@
 import enum
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from healthcheck.check import Availability
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median, per_host
 from healthcheck.config import Dcgm
 from healthcheck.util.cmd import Cmd, ExitCode, run
 from healthcheck.util.file import JsonDict
+from healthcheck.util.hostlist import ByHost
 from healthcheck.util.status import Status
 
 # Our own hostengine, for hosts without a running one: non-root, so keep pid and log in a temp dir.
@@ -158,7 +161,7 @@ def parse(stdout: str) -> dict[str, Any]:
     return {"tests": tests}
 
 
-class Check:
+class HealthCheck(HealthCheckBase):
     def __init__(self, cfg: Dcgm, log_dir: Path) -> None:
         self.cfg = cfg
         self.log_dir = log_dir
@@ -192,6 +195,38 @@ class Check:
             **diag(mode, tests, self.cfg.port, self.log_dir, self.cfg.diag_timeout_s, parameters(self.cfg)),
         }
 
+    @staticmethod
+    def report(results: ByHost[JsonDict], cfg: Dcgm, name: str) -> Report:
+        findings = per_host(results, cfg, name, _findings, _skipped)
+        tflops_of = {
+            host: gpus
+            for host, data in results.items()
+            if data.get("status") != Status.SKIPPED
+            and (gpus := diagnostic_tflops(data))
+        }
+        if not tflops_of:
+            return Report(findings, {})
+        mid = median(
+            tflops
+            for gpus in tflops_of.values()
+            for tflops in gpus.values()
+        )
+        fail_floor = (mid or 0) * cfg.diagnostic_min_frac_of_median
+        warn_floor = (mid or 0) * cfg.diagnostic_warn_frac_of_median
+        for host, gpus in tflops_of.items():
+            for gpu, tflops in gpus.items():
+                if tflops < fail_floor:
+                    severity: Severity = "fail"
+                    floor = fail_floor
+                elif tflops < warn_floor:
+                    severity = "warn"
+                    floor = warn_floor
+                else:
+                    continue
+                detail = f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)"
+                findings.setdefault(host, []).append(Finding(severity, "dcgm.tflops", detail))
+        return Report(findings, {"dcgm_diagnostic_tflops": mid})
+
 
 def parameters(cfg: Dcgm) -> str:
     """
@@ -201,3 +236,46 @@ def parameters(cfg: Dcgm) -> str:
     'diagnostic.test_duration=30;diagnostic.precision=h'
     """
     return ";".join([*cfg.parameters, f"diagnostic.precision={cfg.diagnostic_precision_letter}"])
+
+
+def diagnostic_tflops(data: JsonDict) -> dict[int, float]:
+    """
+    Each GPU's TFLOPS from the dcgm diagnostic test's messages.
+
+    >>> message = "GPU 1 calculated at approximately 160231.80 gigaflops"
+    >>> diagnostic_tflops({"tests": {"diagnostic": {"messages": [message]}}})
+    {1: 160.23}
+    """
+    messages = data.get("tests", {}).get("diagnostic", {}).get("messages", [])
+    pattern = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops")
+    return {
+        int(gpu): round(float(gflops) / 1000, 2) 
+        for message 
+        in messages 
+            for gpu, gflops 
+            in pattern.findall(message)
+    }
+
+
+def _skipped(data: JsonDict, cfg: Dcgm, name: str) -> Iterator[Finding]:
+    """A skipped dcgm step still warns when the config used at report time says it should have run."""
+    if cfg.enabled:
+        yield Finding("warn", name, f"not run (dcgm={data.get('mode')})")
+
+
+def _findings(data: JsonDict, cfg: Dcgm) -> Iterator[Finding]:
+    found = False
+    for test_name, test in data["tests"].items():
+        if test["status"] in cfg.fail_on:
+            severity: Severity = "fail"
+        elif test["status"] in cfg.warn_on:
+            severity = "warn"
+        else:
+            continue
+        found = True
+        bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
+        detail = f"{test_name} {test['status']} on {','.join(bad)}"
+        message = f"{detail}: {test['messages'][0]}" if test["messages"] else detail
+        yield Finding(severity, "dcgm", message)
+    if not found and data.get("returncode"):
+        yield Finding("fail", "dcgm", f"dcgmi diag exited {data['returncode']} with no failed test")

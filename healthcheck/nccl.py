@@ -13,15 +13,16 @@ import re
 import signal
 import subprocess
 import time
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from healthcheck.check import Availability
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median
 from healthcheck.config import Nccl, NcclTest, Paths, cfg
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict, write_json
-from healthcheck.util.hostlist import Hostlist
-from healthcheck.util.status import Status
+from healthcheck.util.hostlist import ByHost, Hostlist
+from healthcheck.util.status import Status, ok
 
 
 class Run(NamedTuple):
@@ -254,7 +255,7 @@ def mpi_plugin() -> str:
     return "none"
 
 
-class Check:
+class HealthCheck(HealthCheckBase):
     def __init__(self, settings: Nccl, paths: Paths, ranks: int) -> None:
         self.settings = settings
         self.paths = paths
@@ -358,8 +359,86 @@ class Check:
             )
         return out
 
+    @staticmethod
+    def report(groups: list[dict[str, Any]], cfg: Nccl, name: str) -> Report:
+        out: ByHost[list[Finding]] = defaultdict(list)
+        for group in groups:
+            if group.get("mpi") == "none":
+                for node in group.get("nodes", []):
+                    out[node].append(Finding("warn", name, "skipped: no MPI plugin"))
+            elif group.get("status") == Status.UNAVAILABLE:
+                detail = f"unavailable: {group.get('error', '')}".strip(": ")
+                for node in group.get("nodes", []):
+                    out[node].append(Finding("warn", name, detail))
+        tests = [
+            test
+            for group in groups
+            for test in group["tests"]
+        ]
+        by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for test in tests:
+            by_kind[test["kind"]].append(test)
+        kind_medians = {
+            kind: median(
+                test["peak_busbw"]
+                for test in kind_tests
+                if ok(test)
+            )
+            for kind, kind_tests in by_kind.items()
+        }
+        for spec in (cfg.intra, cfg.loopback):
+            for test in by_kind[spec.name]:
+                if not ok(test):
+                    detail = f"{test['status']} ({test['log']})"
+                    out[test["nodes"][0]].append(Finding("fail", f"{name}.{spec.name}", detail))
+                elif test["peak_busbw"] < spec.min_busbw_GBps:
+                    detail = f"busbw {test['peak_busbw']} < {spec.min_busbw_GBps}"
+                    out[test["nodes"][0]].append(Finding("fail", f"{name}.{spec.name}", detail))
 
-def start(check: Check) -> JsonDict:
+        # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
+        # bad fails too: with two nodes there is one pair, and nothing tells the two apart.
+        pair_floor = _floor(cfg.pair, kind_medians)
+        slow: ByHost[list[str]] = defaultdict(list)
+        pairs_of: Counter[str] = Counter()
+        for test in by_kind[cfg.pair.name]:
+            pairs_of.update(test["nodes"])
+            if not ok(test) or test["peak_busbw"] < pair_floor:
+                for node in test["nodes"]:
+                    other = next(peer for peer in test["nodes"] if peer != node)
+                    slow[node].append(f"{other}: {test['status']} {test['peak_busbw']}")
+        for node, partners in slow.items():
+            severity: Severity = "fail" if len(partners) >= 2 or len(partners) == pairs_of[node] else "warn"
+            detail = f"{len(partners)}/{pairs_of[node]} slow pairs (< {pair_floor:.1f}): {'; '.join(partners)}"
+            out[node].append(Finding(severity, f"{name}.{cfg.pair.name}", detail))
+
+        for spec in (cfg.group, cfg.alltoall):
+            floor = _floor(spec, kind_medians)
+            op = spec.binary.removesuffix("_perf")
+            for test in by_kind[spec.name]:
+                if not ok(test) or test["peak_busbw"] < floor:
+                    # A hung group test with no node already failing for it can't be blamed on one, so every node fails.
+                    # Alltoall's timeout_severity is warn: a full-cluster timeout names no node.
+                    blamed = any(
+                        finding.severity == "fail"
+                        for node in test["nodes"]
+                        for finding in out.get(node, [])
+                    )
+                    severity = spec.timeout_severity if test["status"] == Status.TIMEOUT and not blamed else "warn"
+                    detail = (
+                        f"{len(test['nodes'])}-node {op} {test['status']} "
+                        f"busbw {test['peak_busbw']} (floor {floor:.1f})"
+                    )
+                    for node in test["nodes"]:
+                        out[node].append(Finding(severity, f"{name}.{spec.name}", detail))
+        prefixed = {f"nccl_{kind}_busbw_GBps": value for kind, value in kind_medians.items()}
+        return Report(dict(out), prefixed)
+
+
+def _floor(spec: NcclTest, kind_medians: dict[str, float | None]) -> float:
+    return max(spec.min_busbw_GBps, (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
+
+
+def start(check: HealthCheck) -> JsonDict:
     """Skip a disabled check, record a missing tool, or collect. Writes the group file either way."""
     if not check.enabled:
         return check.write_skipped()
@@ -370,7 +449,7 @@ def start(check: Check) -> JsonDict:
 
 
 def main() -> int:
-    start(Check(cfg.nccl, cfg.paths, cfg.gpu.count))
+    start(HealthCheck(cfg.nccl, cfg.paths, cfg.gpu.count))
     return 0
 
 

@@ -1,460 +1,73 @@
 """Step 6: apply the thresholds in healthcheck/config.py to a run's node and group JSONs, then write the report and --exclude header."""
 
 import json
-import re
-import statistics
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any
 
-from healthcheck.config import Config, CpuLoad, Dcgm, Gpu, LocalTmp, Logs, Nccl, Nic, Paths, Project, Scratch
+from healthcheck import nccl
+from healthcheck.check import Finding
+from healthcheck.config import Config, Paths
+from healthcheck.node import STEPS
 from healthcheck.util.file import read_json
-from healthcheck.util.hostlist import Hostlist
-from healthcheck.util.status import Status, ok
-
-type Severity = Literal["fail", "warn"]
-
-# the node JSON's steps, each with elapsed_s
-STEPS = ("sysinfo", "scratch", "project", "local_tmp", "dcgm", "cpu_load", "logs")
+from healthcheck.util.hostlist import ByHost, Hostlist
 
 
-class Finding(NamedTuple):
-    severity: Severity
-    check: str
-    detail: str
-
-
-def resolve(data: Any, path: str) -> Any:
-    """
-    Values at a dotted key path; "[*]" spans a list or dict, giving a tuple.
-
-    >>> resolve({"nic": {"ib": [{"fw": "1"}, {"fw": "2"}]}}, "nic.ib[*].fw")
-    ('1', '2')
-    """
-    head, _, rest = path.partition(".")
-    spread = head.endswith("[*]")
-    key = head.removesuffix("[*]")
-    if not isinstance(data, dict) or key not in data:
-        return None
-    value = data[key]
-    if spread:
-        items = value.values() if isinstance(value, dict) else value or []
-        return tuple(resolve(item, rest) if rest else item for item in items)
-    return resolve(value, rest) if rest else value
-
-
-def _median(values: list[float]) -> float | None:
-    values = [value for value in values if value is not None]
-    return round(statistics.median(values), 4) if values else None
-
-
-def _step(node: dict[str, Any], name: str, findings: list[Finding]) -> dict[str, Any] | None:
-    """The step's data, or None after recording why it is missing."""
-    result = node.get(name)
-    if result is None:
-        findings.append(Finding("fail", name, "not run"))
-        return None
-    if result.get("status") == Status.UNAVAILABLE:
-        findings.append(Finding("warn", name, f"{result['status']}: {result.get('error', '')}".strip(": ")))
-        return None
-    if not ok(result):
-        findings.append(Finding("fail", name, f"{result['status']}: {result.get('error', '')}".strip(": ")))
-        return None
-    return result["data"]
-
-
-def check_sysinfo(data: dict[str, Any], gpu_cfg: Gpu, nic_cfg: Nic) -> list[Finding]:
-    out = []
-    gpu = data["gpu"]
-    if gpu["count"] != gpu_cfg.count:
-        out.append(Finding("fail", "gpu.count", f"{gpu['count']} GPUs, expected {gpu_cfg.count}"))
-    for device in gpu["devices"]:
-        index = device["index"]
-        if gpu_cfg.require_ecc and device["ecc_enabled"] is False:
-            out.append(Finding("fail", "gpu.ecc", f"GPU{index} ECC disabled"))
-        if device["mig_enabled"]:
-            out.append(Finding("fail", "gpu.mig", f"GPU{index} MIG enabled"))
-        if (device["pcie_gen_max"] or 0) < gpu_cfg.min_pcie_gen:
-            out.append(
-                Finding(
-                    "fail", "gpu.pcie", f"GPU{index} max PCIe gen {device['pcie_gen_max']} < {gpu_cfg.min_pcie_gen}"
-                )
-            )
-        if (device["pcie_width"] or 0) < gpu_cfg.min_pcie_width:
-            out.append(
-                Finding("fail", "gpu.pcie", f"GPU{index} PCIe x{device['pcie_width']} < x{gpu_cfg.min_pcie_width}")
-            )
-        if device["nvlinks_active"] < gpu_cfg.min_nvlinks:
-            out.append(
-                Finding("fail", "gpu.nvlink", f"GPU{index} {device['nvlinks_active']} NVLinks < {gpu_cfg.min_nvlinks}")
-            )
-    for counters in data.get("counters", []):
-        index = counters["index"]
-        if (counters["ecc_volatile"]["uncorrected"] or 0) > gpu_cfg.max_volatile_uncorrected_ecc:
-            out.append(
-                Finding("fail", "gpu.ecc", f"GPU{index} {counters['ecc_volatile']['uncorrected']} uncorrected ECC")
-            )
-        if rows := counters["remapped_rows"]:
-            if rows["failure"] > gpu_cfg.max_remap_failures:
-                out.append(Finding("fail", "gpu.remap", f"GPU{index} row remap failure"))
-            if rows["pending"] > gpu_cfg.max_remap_pending:
-                out.append(Finding("fail", "gpu.remap", f"GPU{index} row remap pending (needs reset)"))
-
-    active = [
-        (dev["name"], port)
-        for dev in data["nic"]["ib"]
-        for port in dev["ports"]
-        if port["state"] == "ACTIVE" and port["link_layer"] == nic_cfg.link_layer
-    ]
-    if len(active) < nic_cfg.min_active_ib_ports:
-        out.append(
-            Finding(
-                "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
-            )
-        )
-    for name, port in active:
-        if (port["rate_gbps"] or 0) < nic_cfg.min_rate_Gbps:
-            out.append(
-                Finding("fail", "nic.rate", f"{name}/{port['port']} {port['rate']} < {nic_cfg.min_rate_Gbps} Gb/s")
-            )
-    return out
-
-
-def check_shared_read(data: dict[str, Any], cfg: Scratch | Project, name: str) -> list[Finding]:
-    """One node's read of a shared filesystem, $SCRATCH or $PROJECT; name labels the findings."""
-    if data["status"] == Status.SKIPPED:
-        return []
-    if not ok(data):
-        return [Finding("warn", f"{name}.read", f"{data['status']}: {data['path']} (run setup)")]
-    if data["gbps"] < cfg.min_GBps:
-        return [Finding(cfg.severity, f"{name}.read", f"read {data['gbps']} < {cfg.min_GBps} GB/s")]
-    return []
-
-
-def check_local_tmp(data: dict[str, Any], cfg: LocalTmp) -> list[Finding]:
-    out = []
-    for path, tmp in data["paths"].items():
-        if tmp["free_gib"] < cfg.min_free_gib:
-            out.append(Finding("fail", "local_tmp.free", f"{path} {tmp['free_gib']} GiB free < {cfg.min_free_gib}"))
-        if "error" in tmp:
-            out.append(Finding("fail", "local_tmp.rw", f"{path}: {tmp['error']}"))
-            continue
-        if "same_device_as" in tmp:  # benchmarked under that path
-            continue
-        if tmp["write"]["gbps"] < cfg.rw.min_write_GBps:
-            out.append(
-                Finding("fail", "local_tmp.rw", f"{path} write {tmp['write']['gbps']} GB/s < {cfg.rw.min_write_GBps}")
-            )
-        if tmp["read"]["gbps"] < cfg.rw.min_read_GBps:
-            out.append(
-                Finding("fail", "local_tmp.rw", f"{path} read {tmp['read']['gbps']} GB/s < {cfg.rw.min_read_GBps}")
-            )
-    for name, disk in data["smart"].get("disks", {}).items():
-        if cfg.fail_on_smart and disk.get("passed") is False:
-            out.append(Finding("fail", "local_tmp.smart", f"/dev/{name} SMART health failed"))
-    return out
-
-
-def check_dcgm(data: dict[str, Any], cfg: Dcgm) -> list[Finding]:
-    if data["status"] == Status.SKIPPED:
-        return [Finding("warn", "dcgm", f"not run (dcgm={data['mode']})")] if cfg.enabled else []
-    out = []
-    for name, test in data["tests"].items():
-        if test["status"] in cfg.fail_on:
-            severity: Severity = "fail"
-        elif test["status"] in cfg.warn_on:
-            severity = "warn"
-        else:
-            continue
-        bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
-        detail = f"{name} {test['status']} on {','.join(bad)}"
-        out.append(Finding(severity, "dcgm", f"{detail}: {test['messages'][0]}" if test["messages"] else detail))
-    if not out and data.get("returncode"):
-        out.append(Finding("fail", "dcgm", f"dcgmi diag exited {data['returncode']} with no failed test"))
-    return out
-
-
-def diagnostic_tflops(data: dict[str, Any]) -> dict[int, float]:
-    """
-    Each GPU's TFLOPS from the dcgm diagnostic test's messages.
-
-    >>> diagnostic_tflops({"tests": {"diagnostic": {"messages": ["GPU 1 calculated at approximately 160231.80 gigaflops"]}}})
-    {1: 160.23}
-    """
-    messages = data.get("tests", {}).get("diagnostic", {}).get("messages", [])
-    pattern = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops")
-    return {
-        int(gpu): round(float(gflops) / 1000, 2) for message in messages for gpu, gflops in pattern.findall(message)
-    }
-
-
-def check_dcgm_tflops(
-    tflops_of: dict[str, dict[int, float]], cfg: Dcgm
-) -> tuple[dict[str, list[Finding]], float | None]:
-    """Each GPU's diagnostic TFLOPS against the median GPU of the run: fail below one fraction, warn below another."""
-    out: dict[str, list[Finding]] = defaultdict(list)
-    median = _median([tflops for gpus in tflops_of.values() for tflops in gpus.values()])
-    fail_floor = (median or 0) * cfg.diagnostic_min_frac_of_median
-    warn_floor = (median or 0) * cfg.diagnostic_warn_frac_of_median
-    for host, gpus in tflops_of.items():
-        for gpu, tflops in gpus.items():
-            if tflops < fail_floor:
-                severity: Severity = "fail"
-                floor = fail_floor
-            elif tflops < warn_floor:
-                severity = "warn"
-                floor = warn_floor
-            else:
-                continue
-            out[host].append(
-                Finding(severity, "dcgm.tflops", f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)")
-            )
-    return out, median
-
-
-def check_cpu_load(data: dict[str, Any], cfg: CpuLoad) -> list[Finding]:
-    if data["status"] == Status.SKIPPED:
-        return []
-    out = []
-    low_share = data.get("low_share") or 0
-    if low_share > cfg.fail_low_share:
-        severity: Severity | None = "fail"
-    elif low_share > cfg.warn_low_share:
-        severity = "warn"
-    else:
-        severity = None
-    if severity:
-        detail = (
-            f"{low_share:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
-            f"{data['max_mhz']} MHz (mean {data['full_power_mhz']})"
-        )
-        out.append(Finding(severity, "cpu_load.low_clocks", detail))
-    if data["throttle_delta"]:
-        out.append(Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events"))
-    return out
-
-
-def check_cpu_load_median(mhz_of: dict[str, float], cfg: CpuLoad) -> tuple[dict[str, list[Finding]], float | None]:
-    """The busy-core clock at full GPU power, against the other nodes'."""
-    out: dict[str, list[Finding]] = defaultdict(list)
-    median = _median(list(mhz_of.values()))
-    floor = (median or 0) * cfg.min_frac_of_median
-    for host, mhz in mhz_of.items():
-        if mhz < floor:
-            out[host].append(Finding("warn", "cpu_load.median", f"busy-core clock {mhz} < {floor:.0f} MHz"))
-    return out, median
-
-
-def check_logs(data: dict[str, Any], cfg: Logs) -> list[Finding]:
-    out = []
-    for event in data["xid"].get("events", []):
-        out.append(Finding("fail", "logs.xid", f"GPU{event['gpu']} Xid {event['xid']} at {event['time']}"))
-    for delta in data.get("counter_deltas") or []:
-        for key, increase in delta["increased"].items():
-            if key.startswith("ecc_aggregate"):
-                continue  # rises with ecc_volatile, which is reported
-            nvlink_over = key.startswith("nvlink_errors") and increase > cfg.max_nvlink_error_delta
-            if key.endswith("uncorrected") or key.startswith("remapped_rows"):
-                out.append(Finding("fail", "logs.counters", f"GPU{delta['index']} {key} +{increase}"))
-            elif nvlink_over or key.endswith("corrected"):
-                out.append(Finding("warn", "logs.counters", f"GPU{delta['index']} {key} +{increase}"))
-        if delta["hw_throttle"]:
-            out.append(Finding("warn", "logs.throttle", f"GPU{delta['index']} {','.join(delta['hw_throttle'])}"))
-    if data["nccl"]["count"]:
-        out.append(
-            Finding(
-                "fail",
-                "logs.nccl",
-                f"{data['nccl']['count']} NCCL log matches, e.g. {data['nccl']['matches'][0][-160:]}",
-            )
-        )
-    for source, result in data["kernel"].items():
-        if result.get("matches"):
-            out.append(
-                Finding(
-                    "fail", f"logs.{source}", f"{len(result['matches'])} matches, e.g. {result['matches'][0][-160:]}"
-                )
-            )
-    return out
-
-
-def check_homogeneity(
-    sysinfos: dict[str, dict[str, Any]],
-    *,
-    fail_keys: list[str],
-    warn_keys: list[str],
-) -> dict[str, list[Finding]]:
-    """fail_keys and warn_keys are key paths into sysinfo that should match on every node.
-
-    Nodes outside the majority value are flagged; with no value on more than half the nodes, all of them are."""
-    out: dict[str, list[Finding]] = defaultdict(list)
-    severity: Severity
-    for severity, keys in (("fail", fail_keys), ("warn", warn_keys)):
-        for key in keys:
-            values = {host: json.dumps(resolve(data, key), default=str) for host, data in sysinfos.items()}
-            if len(set(values.values())) < 2:
-                continue
-            most_common, count = Counter(values.values()).most_common(1)[0]
-            if count * 2 <= len(values):
-                for host, value in values.items():
-                    out[host].append(Finding(severity, "homogeneity", f"{key}={value} (no majority)"))
-                continue
-            for host, value in values.items():
-                if value != most_common:
-                    out[host].append(Finding(severity, "homogeneity", f"{key}={value} (majority {most_common})"))
-    return out
-
-
-def check_shared_read_median(
-    gbps_of: dict[str, float], cfg: Scratch | Project, name: str
-) -> tuple[dict[str, list[Finding]], float | None]:
-    """Shared-filesystem throughput depends on load, so compare nodes against each other too."""
-    out: dict[str, list[Finding]] = defaultdict(list)
-    median = _median(list(gbps_of.values()))
-    floor = (median or 0) * cfg.min_frac_of_median
-    for host, gbps in gbps_of.items():
-        if gbps < floor:
-            out[host].append(Finding(cfg.severity, f"{name}.read", f"read {gbps} < {floor:.2f} GB/s (frac of median)"))
-    return out, median
-
-
-def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[Finding]], dict]:
-    out: dict[str, list[Finding]] = defaultdict(list)
-    for group in groups:
-        if group.get("mpi") == "none":
-            for node in group.get("nodes", []):
-                out[node].append(Finding("warn", "nccl", "skipped: no MPI plugin"))
-        elif group.get("status") == Status.UNAVAILABLE:
-            detail = f"unavailable: {group.get('error', '')}".strip(": ")
-            for node in group.get("nodes", []):
-                out[node].append(Finding("warn", "nccl", detail))
-    tests = [test for group in groups for test in group["tests"]]
-    by_kind = defaultdict(list)
-    for test in tests:
-        by_kind[test["kind"]].append(test)
-    medians = {
-        kind: _median([test["peak_busbw"] for test in kind_tests if ok(test)]) for kind, kind_tests in by_kind.items()
-    }
-
-    for spec in (cfg.intra, cfg.loopback):
-        for test in by_kind[spec.name]:
-            if not ok(test):
-                out[test["nodes"][0]].append(Finding("fail", f"nccl.{spec.name}", f"{test['status']} ({test['log']})"))
-            elif test["peak_busbw"] < spec.min_busbw_GBps:
-                out[test["nodes"][0]].append(
-                    Finding("fail", f"nccl.{spec.name}", f"busbw {test['peak_busbw']} < {spec.min_busbw_GBps}")
-                )
-
-    # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
-    # bad fails too: with two nodes there is one pair, and nothing tells the two apart.
-    pair_floor = max(cfg.pair.min_busbw_GBps, (medians.get(cfg.pair.name) or 0) * (cfg.pair.min_frac_of_median or 0))
-    slow: dict[str, list[str]] = defaultdict(list)
-    pairs_of: Counter[str] = Counter()
-    for test in by_kind[cfg.pair.name]:
-        pairs_of.update(test["nodes"])
-        if not ok(test) or test["peak_busbw"] < pair_floor:
-            for node in test["nodes"]:
-                other = next(peer for peer in test["nodes"] if peer != node)
-                slow[node].append(f"{other}: {test['status']} {test['peak_busbw']}")
-    for node, partners in slow.items():
-        severity: Severity = "fail" if len(partners) >= 2 or len(partners) == pairs_of[node] else "warn"
-        out[node].append(
-            Finding(
-                severity,
-                f"nccl.{cfg.pair.name}",
-                f"{len(partners)}/{pairs_of[node]} slow pairs (< {pair_floor:.1f}): {'; '.join(partners)}",
-            )
-        )
-
-    for spec in (cfg.group, cfg.alltoall):
-        floor = max(spec.min_busbw_GBps, (medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
-        op = spec.binary.removesuffix("_perf")
-        for test in by_kind[spec.name]:
-            if not ok(test) or test["peak_busbw"] < floor:
-                # A hung group test with no node already failing for it can't be blamed on one, so every node fails.
-                # Alltoall's timeout_severity is warn: a full-cluster timeout names no node.
-                blamed = any(finding.severity == "fail" for node in test["nodes"] for finding in out.get(node, []))
-                severity: Severity = "warn"
-                if test["status"] == Status.TIMEOUT and not blamed:
-                    severity = spec.timeout_severity
-                for node in test["nodes"]:
-                    out[node].append(
-                        Finding(
-                            severity,
-                            f"nccl.{spec.name}",
-                            f"{len(test['nodes'])}-node {op} {test['status']} "
-                            f"busbw {test['peak_busbw']} (floor {floor:.1f})",
-                        )
-                    )
-    return out, medians
-
-
-def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any]:
+def evaluate(run: Path, cfg: Config, switch_of: ByHost[str]) -> dict[str, Any]:
     """switch_of maps every node the run targeted to its leaf switch."""
     layout = Paths(root=run)
     jobs = read_json(layout.jobs) or []
     job_of = {node: job for job in jobs for node in job["nodes"]}
-    findings: dict[str, list[Finding]] = defaultdict(list)
-    sysinfos = {}
-    scratch = {}
-    project = {}
-    cpu_mhz = {}
-    tflops = {}
-    step_seconds: dict[str, dict[str, float]] = {}
+    findings: ByHost[list[Finding]] = defaultdict(list)
+    results: dict[str, ByHost[Any]] = {name: {} for name in STEPS}
+    missing: dict[str, ByHost[Finding]] = {name: {} for name in STEPS}
+    step_seconds: ByHost[dict[str, float]] = {}
 
-    groups = [group for path in sorted(layout.groups.glob("*.json")) if (group := read_json(path))]
-    hosts = {path.stem for path in layout.nodes.glob("*.json")} | set(switch_of) | set(job_of)
+    groups = [
+        group
+        for path in sorted(layout.groups.glob("*.json"))
+        if (group := read_json(path))
+    ]
+    hosts = (
+        {path.stem for path in layout.nodes.glob("*.json")}
+        | set(switch_of)
+        | set(job_of)
+    )
     for host in sorted(hosts):
         node = read_json(layout.node(host))
         if node is None:
             job = job_of.get(host, {})
             findings[host].append(Finding("fail", "no_report", f"job {job.get('job_id')} {job.get('state', '?')}"))
             continue
-        step_seconds[host] = {name: node[name]["elapsed_s"] for name in STEPS if node.get(name)}
-        if data := _step(node, "sysinfo", findings[host]):
-            sysinfos[host] = data
-            findings[host] += check_sysinfo(data, cfg.gpu, cfg.nic)
-        if data := _step(node, "scratch", findings[host]):
-            findings[host] += check_shared_read(data, cfg.scratch, "scratch")
-            if ok(data):
-                scratch[host] = data["gbps"]
-        if data := _step(node, "project", findings[host]):
-            findings[host] += check_shared_read(data, cfg.project, "project")
-            if ok(data):
-                project[host] = data["gbps"]
-        if data := _step(node, "local_tmp", findings[host]):
-            findings[host] += check_local_tmp(data, cfg.local_tmp)
-        if data := _step(node, "dcgm", findings[host]):
-            findings[host] += check_dcgm(data, cfg.dcgm)
-            if gpus := diagnostic_tflops(data):
-                tflops[host] = gpus
-        if node.get("cpu_load") is not None and (data := _step(node, "cpu_load", findings[host])):  # runs before it
-            findings[host] += check_cpu_load(data, cfg.cpu_load)
-            if data.get("full_power_mhz"):
-                cpu_mhz[host] = data["full_power_mhz"]
-        if node.get("logs") is None:
-            findings[host].append(Finding("warn", "logs", "finalize did not run"))
-        elif data := _step(node, "logs", findings[host]):
-            findings[host] += check_logs(data, cfg.logs)
+        step_seconds[host] = {
+            name: node[name]["elapsed_s"]
+            for name in STEPS
+            if node.get(name)
+        }
+        for name, check in STEPS.items():
+            data, finding = check.unwrap(node, name)
+            if finding:
+                missing[name][host] = finding
+            if data is not None:
+                results[name][host] = data
 
-    # Checks across nodes
-    scratch_findings, scratch_median = check_shared_read_median(scratch, cfg.scratch, "scratch")
-    project_findings, project_median = check_shared_read_median(project, cfg.project, "project")
-    cpu_findings, cpu_median = check_cpu_load_median(cpu_mhz, cfg.cpu_load)
-    tflops_findings, tflops_median = check_dcgm_tflops(tflops, cfg.dcgm)
-    nccl_findings, nccl_medians = check_nccl(groups, cfg.nccl)
-    homogeneity_findings = check_homogeneity(sysinfos, fail_keys=cfg.homogeneity.fail, warn_keys=cfg.homogeneity.warn)
-    across = (scratch_findings, project_findings, tflops_findings, cpu_findings, homogeneity_findings, nccl_findings)
-    for by_host in across:
-        for host, fs in by_host.items():
-            findings[host] += fs
-    # GBps: gigabytes per second, as nccl-tests reports busbw
-    medians = {"scratch_read_GBps": scratch_median} if scratch else {}
-    medians |= {"project_read_GBps": project_median} if project else {}
-    medians |= {"dcgm_diagnostic_tflops": tflops_median} if tflops else {}
-    medians |= {"cpu_load_busy_mhz": cpu_median} if cpu_mhz else {}
-    medians |= {f"nccl_{kind}_busbw_GBps": median for kind, median in nccl_medians.items()}
+    medians: dict[str, float | None] = {}
+    for name, check in STEPS.items():
+        # sysinfo reads the GPU, NIC, and homogeneity sections; every other step's section is named after it
+        if name == "sysinfo":
+            result = check.report(results[name], cfg.gpu, cfg.nic, cfg.homogeneity)
+        else:
+            result = check.report(results[name], getattr(cfg, name), name)
+        medians |= result.medians
+        for host, finding in missing[name].items():
+            findings[host].append(finding)
+        for host, found in result.findings.items():
+            findings[host] += found
+    nccl_report = nccl.HealthCheck.report(groups, cfg.nccl, "nccl")
+    for host, found in nccl_report.findings.items():
+        findings[host] += found
+    medians |= nccl_report.medians
 
     nodes = {}
     for host in sorted(set(findings) | set(switch_of)):
@@ -531,7 +144,7 @@ def include_header(report: dict[str, Any], exclude_on: list[str]) -> str:
 def write(
     run: Path,
     cfg: Config,
-    switch_of: dict[str, str],
+    switch_of: ByHost[str],
     exclude_on: list[str],
 ) -> tuple[dict[str, Any], str, str]:
     """Returns the report and the exclude and include headers."""

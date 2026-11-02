@@ -33,14 +33,14 @@ def test_step_skips_when_disabled(monkeypatch, tmp_path):
         raise AssertionError("checked tools")
 
     monkeypatch.setattr(dcgm, "choose_mode", checked_tools)
-    result = step(dcgm.Check(Dcgm(enabled=False), tmp_path))
+    result = step(dcgm.HealthCheck(Dcgm(enabled=False), tmp_path))
     assert result["status"] == "ok"
     assert result["data"] == {"status": "skipped"}
 
 
 def test_available_without_dcgmi(monkeypatch, tmp_path):
     monkeypatch.setattr(dcgm.shutil, "which", lambda name: None)
-    found = dcgm.Check(Dcgm(enabled=True), tmp_path).available()
+    found = dcgm.HealthCheck(Dcgm(enabled=True), tmp_path).available()
     assert found.available is False
     assert found.reason == "dcgmi not on PATH"
 
@@ -48,7 +48,7 @@ def test_available_without_dcgmi(monkeypatch, tmp_path):
 def test_available_without_hostengine(monkeypatch, tmp_path):
     monkeypatch.setattr(dcgm.shutil, "which", lambda name: "/usr/bin/dcgmi" if name == "dcgmi" else None)
     monkeypatch.setattr(dcgm, "run", lambda cmd, **kwargs: Cmd(1, "", ""))
-    found = dcgm.Check(Dcgm(enabled=True), tmp_path).available()
+    found = dcgm.HealthCheck(Dcgm(enabled=True), tmp_path).available()
     assert found.available is False
     assert found.reason == "no hostengine, and nv-hostengine is not on PATH"
 
@@ -88,7 +88,7 @@ def test_step_unavailable_does_not_collect(monkeypatch, tmp_path):
         raise AssertionError("collected")
 
     monkeypatch.setattr(dcgm, "diag", diag)
-    result = step(dcgm.Check(Dcgm(enabled=True), tmp_path))
+    result = step(dcgm.HealthCheck(Dcgm(enabled=True), tmp_path))
     assert result["status"] == "unavailable"
     assert result["error"] == "dcgmi not on PATH"
     assert "data" not in result

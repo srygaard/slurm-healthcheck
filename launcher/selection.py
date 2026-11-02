@@ -1,12 +1,12 @@
 """Find the healthcheck candidate nodes and group them into jobs."""
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from enum import StrEnum
 from typing import NamedTuple
 
 from healthcheck.util.cmd import run
-from healthcheck.util.hostlist import Hostlist
+from healthcheck.util.hostlist import ByHost, Hostlist
 
 
 class JobPer(StrEnum):
@@ -33,7 +33,7 @@ class Node(NamedTuple):
 
 def parse_sinfo(text: str) -> list[Node]:
     """Parse `sinfo -N -h -o "%N|%t|%f|%G"`; nodes in several partitions appear once."""
-    nodes: dict[str, Node] = {}
+    nodes: ByHost[Node] = {}
     for line in text.splitlines():
         if line.count("|") != 3:
             continue
@@ -68,7 +68,7 @@ def select_nodes(
 
 def filter_nodes(
     nodes: Iterable[str],
-    switch_of: Mapping[str, str],
+    switch_of: ByHost[str],
     names: Iterable[str] | None,
     switches: Iterable[str] | None,
 ) -> tuple[Hostlist, Hostlist]:
@@ -80,7 +80,7 @@ def filter_nodes(
     return kept, Hostlist(wanted - set(nodes))
 
 
-def group_nodes(nodes: Iterable[str], switch_of: Mapping[str, str], job_per: JobPer) -> dict[str, Hostlist]:
+def group_nodes(nodes: Iterable[str], switch_of: ByHost[str], job_per: JobPer) -> dict[str, Hostlist]:
     """Nodes per job label: one job for the cluster, one per leaf switch, or one per node."""
     groups: dict[str, list[str]] = {}
     for node in nodes:
