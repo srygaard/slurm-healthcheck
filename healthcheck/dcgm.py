@@ -60,7 +60,9 @@ def diag(
     # for the job. Jobs hold whole nodes, so testing every GPU is what we want anyway.
     env = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
     with tempfile.TemporaryDirectory(prefix="hc-dcgm-", dir=os.environ.get("SLURM_TMPDIR")) as tmp:
-        args = ["-r", suite, "-j"]
+        # DCGM 4.4.2+: the hostengine stops nvvs when this client dies. Without it, a cancelled job
+        # leaves the diagnostic holding the GPUs and the next dcgmi diag exits 222 (resource in use).
+        args = ["-r", suite, "-j", "--enable-heartbeat"]
         if mode == "host-self":
             # Our hostengine runs as us and logs to the working directory, which all nodes of a job share. The host's
             # runs as another user that can't write to our directories, and logs outside them anyway.
