@@ -179,7 +179,7 @@ def _off() -> Nccl:
 
 def test_available_without_build(monkeypatch, tmp_path):
     monkeypatch.delenv("HC_NCCL_TESTS", raising=False)
-    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    found = nccl.HealthCheck(Nccl(), Paths(root=tmp_path), 4).available()
     assert found == Availability(False, "HC_NCCL_TESTS is not set")
 
 
@@ -192,7 +192,7 @@ def test_available_missing_binary(monkeypatch, tmp_path):
         raise AssertionError("probed")
 
     monkeypatch.setattr(nccl, "mpi_plugin", probed)
-    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    found = nccl.HealthCheck(Nccl(), Paths(root=tmp_path), 4).available()
     assert found.available is False
     assert found.reason == f"missing all_reduce_perf in {build}"
 
@@ -203,7 +203,7 @@ def test_available_without_mpi(monkeypatch, tmp_path):
     (build / "all_reduce_perf").write_bytes(b"")
     monkeypatch.setenv("HC_NCCL_TESTS", str(tmp_path))
     monkeypatch.setattr(nccl, "mpi_plugin", lambda: "none")
-    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    found = nccl.HealthCheck(Nccl(), Paths(root=tmp_path), 4).available()
     assert found == Availability(False, "no MPI plugin")
 
 
@@ -215,7 +215,7 @@ def test_write_unavailable_keeps_mpi_none(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_JOB_ID", "9")
     monkeypatch.setenv("SLURM_JOB_NODELIST", "cn-l001")
     monkeypatch.setattr(nccl, "mpi_plugin", lambda: "none")
-    check = nccl.Check(Nccl(), Paths(root=tmp_path / "run"), 4)
+    check = nccl.HealthCheck(Nccl(), Paths(root=tmp_path / "run"), 4)
     written = check.write_unavailable(check.available())
     assert written["mpi"] == "none"
     assert "status" not in written
@@ -235,7 +235,7 @@ def test_start_skips_when_disabled(monkeypatch, tmp_path):
         raise AssertionError("probed")
 
     monkeypatch.setattr(nccl, "mpi_plugin", probed)
-    written = nccl.start(nccl.Check(_off(), Paths(root=tmp_path / "run"), 4))
+    written = nccl.start(nccl.HealthCheck(_off(), Paths(root=tmp_path / "run"), 4))
     assert written["tests"] == []
     assert "status" not in written
     assert "mpi" not in written

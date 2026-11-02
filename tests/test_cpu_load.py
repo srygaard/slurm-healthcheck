@@ -11,7 +11,7 @@ def test_skipped_when_dcgm_returns_early():
     cpu_0 = min(os.sched_getaffinity(0))
     gpus_done = threading.Event()
     gpus_done.set()  # dcgm skipped: its future is done before the load starts
-    out = cpu_load.Check(CpuLoad(enabled=True), gpus_done, [cpu_0]).collect()
+    out = cpu_load.HealthCheck(CpuLoad(enabled=True), gpus_done, [cpu_0]).collect()
     assert out["status"] == "skipped"
     assert out["reason"].startswith("dcgm returned after")
     assert "full_power_mhz" not in out  # nothing for the report's median

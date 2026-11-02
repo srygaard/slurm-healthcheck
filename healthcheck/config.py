@@ -47,18 +47,10 @@ class Scratch(Section):
     severity: Literal["fail", "warn"] = "warn"
 
 
-class Project(Section):
+class Project(Scratch):
     """$PROJECT, tested like $SCRATCH: load isn't a node fault, so this only warns by default."""
 
     enabled: bool = False  # off: no $PROJECT needed, and setup skips its files
-    files: int = 8  # read-test files written by setup; each node reads f<crc32(host) % n>
-    file_gib: float = 1  # small: a busy OST writes at only a few MB/s
-    write_block_mib: int = 16  # Lustre is slow with small writes
-    read_max_s: float = 5  # loops over the file for read_max_s
-    read_block_mib: int = 16
-    min_GBps: float = 0.2
-    min_frac_of_median: float = 0.5
-    severity: Literal["fail", "warn"] = "warn"
 
 
 class LocalTmpRw(Section):

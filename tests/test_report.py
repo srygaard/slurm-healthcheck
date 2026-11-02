@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from healthcheck import dcgm
+from healthcheck import dcgm, nccl, sysinfo
+from healthcheck.check import Finding
 from healthcheck.config import Config, Project, Scratch
 from launcher import report
 
@@ -310,8 +311,8 @@ def test_node_fails(run, change):
 
 
 def test_resolve_spread_over_dict():
-    assert report.resolve({"net": {"a": {"mtu": 1}, "b": {"mtu": 2}}}, "net[*].mtu") == (1, 2)
-    assert report.resolve({}, "gpu.driver_version") is None
+    assert sysinfo.resolve({"net": {"a": {"mtu": 1}, "b": {"mtu": 2}}}, "net[*].mtu") == (1, 2)
+    assert sysinfo.resolve({}, "gpu.driver_version") is None
 
 
 def test_dcgm_parse_v4_layout():
@@ -419,12 +420,13 @@ def test_alltoall_timeout_warns_every_node(run):
 
 
 def test_nccl_without_mpi_warns_instead_of_failing():
-    findings, medians = report.check_nccl(
+    result = nccl.HealthCheck.report(
         [{"job_id": 1, "nodes": ["cn-l001"], "mpi": "none", "tests": [], "elapsed_s": 0}],
         Config().nccl,
+        "nccl",
     )
-    assert findings["cn-l001"] == [report.Finding("warn", "nccl", "skipped: no MPI plugin")]
-    assert medians == {}
+    assert result.findings["cn-l001"] == [Finding("warn", "nccl", "skipped: no MPI plugin")]
+    assert result.medians == {}
 
 
 def test_unavailable_step_warns_and_does_not_fail(run):
@@ -446,7 +448,7 @@ def test_step_error_fails(run):
 
 
 def test_nccl_unavailable_warns():
-    findings, medians = report.check_nccl(
+    result = nccl.HealthCheck.report(
         [
             {
                 "job_id": 1,
@@ -458,7 +460,8 @@ def test_nccl_unavailable_warns():
             }
         ],
         Config().nccl,
+        "nccl",
     )
-    assert findings["cn-l001"] == [report.Finding("warn", "nccl", "unavailable: missing all_reduce_perf in /build")]
-    assert medians == {}
+    assert result.findings["cn-l001"] == [Finding("warn", "nccl", "unavailable: missing all_reduce_perf in /build")]
+    assert result.medians == {}
 

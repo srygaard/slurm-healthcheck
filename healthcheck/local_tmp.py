@@ -3,12 +3,14 @@
 import json
 import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
-from healthcheck.check import Availability
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, per_host
 from healthcheck.config import LocalTmp
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict
+from healthcheck.util.hostlist import ByHost
 from healthcheck.util.io_throughput import read_throughput, write_throughput
 from healthcheck.util.status import Status, ok
 
@@ -50,7 +52,7 @@ def smart() -> JsonDict:
     return {"status": status, "disks": results}
 
 
-class Check:
+class HealthCheck(HealthCheckBase):
     def __init__(self, cfg: LocalTmp, host: str) -> None:
         self.cfg = cfg
         self.host = host
@@ -86,3 +88,27 @@ class Check:
                     entry["error"] = str(error)
             paths[str(directory)] = entry
         return {"paths": paths, "smart": smart()}
+
+    @staticmethod
+    def report(results: ByHost[JsonDict], cfg: LocalTmp, name: str) -> Report:
+        return Report(per_host(results, cfg, name, _findings), {})
+
+
+def _findings(data: JsonDict, cfg: LocalTmp) -> Iterator[Finding]:
+    for path, tmp in data["paths"].items():
+        if tmp["free_gib"] < cfg.min_free_gib:
+            yield Finding("fail", "local_tmp.free", f"{path} {tmp['free_gib']} GiB free < {cfg.min_free_gib}")
+        if "error" in tmp:
+            yield Finding("fail", "local_tmp.rw", f"{path}: {tmp['error']}")
+            continue
+        if "same_device_as" in tmp:  # benchmarked under that path
+            continue
+        if tmp["write"]["gbps"] < cfg.rw.min_write_GBps:
+            rate = tmp["write"]["gbps"]
+            yield Finding("fail", "local_tmp.rw", f"{path} write {rate} GB/s < {cfg.rw.min_write_GBps}")
+        if tmp["read"]["gbps"] < cfg.rw.min_read_GBps:
+            rate = tmp["read"]["gbps"]
+            yield Finding("fail", "local_tmp.rw", f"{path} read {rate} GB/s < {cfg.rw.min_read_GBps}")
+    for disk_name, disk in data["smart"].get("disks", {}).items():
+        if cfg.fail_on_smart and disk.get("passed") is False:
+            yield Finding("fail", "local_tmp.smart", f"/dev/{disk_name} SMART health failed")

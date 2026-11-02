@@ -4,6 +4,9 @@ import re
 from collections.abc import Iterable
 from typing import Self
 
+# A dict whose keys are hostnames.
+type ByHost[T] = dict[str, T]
+
 
 class Hostlist(tuple[str, ...]):
     """

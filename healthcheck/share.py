@@ -5,14 +5,16 @@
 
 import os
 import zlib
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from healthcheck.check import Availability
-from healthcheck.config import Project, Scratch, cfg
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, below_median, per_host
+from healthcheck.config import Scratch, cfg
 from healthcheck.util.file import JsonDict
+from healthcheck.util.hostlist import ByHost
 from healthcheck.util.io_throughput import read_throughput
-from healthcheck.util.status import Status
+from healthcheck.util.status import Status, ok
 
 
 def file_path(base: Path, index: int) -> Path:
@@ -31,8 +33,8 @@ def write_random(path: Path, size: int, block: int) -> bool:
     return True
 
 
-class Check:
-    def __init__(self, base: Path, cfg: Scratch | Project, host: str) -> None:
+class HealthCheck(HealthCheckBase):
+    def __init__(self, base: Path, cfg: Scratch, host: str) -> None:
         self.base = base
         self.cfg = cfg
         self.host = host
@@ -57,8 +59,34 @@ class Check:
             **read_throughput(path, float("inf"), self.cfg.read_max_s, self.cfg.read_block_mib * 2**20, loop=True),
         }
 
+    @staticmethod
+    def report(results: ByHost[JsonDict], cfg: Scratch, name: str) -> Report:
+        """name is the step, scratch or project: both run this check and read their own thresholds."""
+        findings = per_host(results, cfg, name, lambda data, section: _findings(data, section, name))
+        gbps = {
+            host: data["gbps"]
+            for host, data in results.items()
+            if ok(data)
+        }
+        if not gbps:
+            return Report(findings, {})
+        mid, floor, slow = below_median(gbps, cfg.min_frac_of_median)
+        for host in slow:
+            detail = f"read {gbps[host]} < {floor:.2f} GB/s (frac of median)"
+            findings.setdefault(host, []).append(Finding(cfg.severity, f"{name}.read", detail))
+        return Report(findings, {f"{name}_read_GBps": mid})
 
-def write_files(base: Path, cfg: Scratch | Project) -> None:
+
+def _findings(data: JsonDict, cfg: Scratch, name: str) -> Iterator[Finding]:
+    """One node's read of a shared filesystem. name labels the findings."""
+    if not ok(data):
+        yield Finding("warn", f"{name}.read", f"{data['status']}: {data['path']} (run setup)")
+        return
+    if data["gbps"] < cfg.min_GBps:
+        yield Finding(cfg.severity, f"{name}.read", f"read {data['gbps']} < {cfg.min_GBps} GB/s")
+
+
+def write_files(base: Path, cfg: Scratch) -> None:
     size = int(cfg.file_gib * 2**30)
     block = cfg.write_block_mib * 2**20
     paths = [file_path(base, index) for index in range(cfg.files)]

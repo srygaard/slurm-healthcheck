@@ -5,17 +5,18 @@ GPU counter deltas and the NCCL debug logs, which a normal user can always read.
 """
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from healthcheck import xid
-from healthcheck.check import Availability
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, per_host
 from healthcheck.config import Logs, Paths
 from healthcheck.sysinfo import gpu
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict
+from healthcheck.util.hostlist import ByHost
 from healthcheck.util.status import Status
 
 
@@ -94,7 +95,11 @@ def counter_deltas(before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[
     return deltas
 
 
-class Check:
+class HealthCheck(HealthCheckBase):
+    @classmethod
+    def missing(cls, name: str) -> Finding:
+        return Finding("warn", name, "finalize did not run")
+
     def __init__(
         self,
         cfg: Logs,
@@ -125,3 +130,33 @@ class Check:
             "counters": after,
             "counter_deltas": counter_deltas(self.before, after) if self.before else None,
         }
+
+    @staticmethod
+    def report(results: ByHost[JsonDict], cfg: Logs, name: str) -> Report:
+        return Report(per_host(results, cfg, name, _findings), {})
+
+
+def _findings(data: JsonDict, cfg: Logs) -> Iterator[Finding]:
+    for event in data["xid"].get("events", []):
+        yield Finding("fail", "logs.xid", f"GPU{event['gpu']} Xid {event['xid']} at {event['time']}")
+    for delta in data.get("counter_deltas") or []:
+        for key, increase in delta["increased"].items():
+            if key.startswith("ecc_aggregate"):
+                continue  # rises with ecc_volatile, which is reported
+            nvlink_over = key.startswith("nvlink_errors") and increase > cfg.max_nvlink_error_delta
+            if key.endswith("uncorrected") or key.startswith("remapped_rows"):
+                yield Finding("fail", "logs.counters", f"GPU{delta['index']} {key} +{increase}")
+            elif nvlink_over or key.endswith("corrected"):
+                yield Finding("warn", "logs.counters", f"GPU{delta['index']} {key} +{increase}")
+        if delta["hw_throttle"]:
+            yield Finding("warn", "logs.throttle", f"GPU{delta['index']} {','.join(delta['hw_throttle'])}")
+    if data["nccl"]["count"]:
+        yield Finding(
+            "fail",
+            "logs.nccl",
+            f"{data['nccl']['count']} NCCL log matches, e.g. {data['nccl']['matches'][0][-160:]}",
+        )
+    for source, result in data["kernel"].items():
+        if result.get("matches"):
+            example = result["matches"][0][-160:]
+            yield Finding("fail", f"logs.{source}", f"{len(result['matches'])} matches, e.g. {example}")

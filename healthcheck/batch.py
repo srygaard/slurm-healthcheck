@@ -38,7 +38,7 @@ def main() -> int:
     code = 0
     try:
         # enabled, then available, then collect. Disabled or a missing tool writes the group file and does not launch.
-        nccl.start(nccl.Check(cfg.nccl, cfg.paths, cfg.gpu.count))
+        nccl.start(nccl.HealthCheck(cfg.nccl, cfg.paths, cfg.gpu.count))
     except Exception:  # noqa: BLE001 - the report shows the missing NCCL results
         traceback.print_exc()
         code = 1

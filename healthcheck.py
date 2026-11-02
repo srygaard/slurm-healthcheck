@@ -16,7 +16,7 @@ from typing import Any
 
 from healthcheck.config import Paths, cfg
 from healthcheck.util.file import read_json
-from healthcheck.util.hostlist import Hostlist
+from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
 from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue
@@ -131,7 +131,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
-        switch_of: dict[str, str] = {}
+        switch_of: ByHost[str] = {}
         groups = {f"any{args.any}": Hostlist()}
         print(f"Submitting 1 job on any {args.any} free node(s)")
     else:

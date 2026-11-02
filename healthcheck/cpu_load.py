@@ -10,15 +10,17 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pynvml
 
-from healthcheck.check import Availability
+from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, below_median, per_host
 from healthcheck.config import CpuLoad
 from healthcheck.sysinfo.gpu import watts
 from healthcheck.sysinfo.topology import cpulist
 from healthcheck.util.file import JsonDict, read_sys
+from healthcheck.util.hostlist import ByHost
 from healthcheck.util.nvml import session
 from healthcheck.util.status import Status
 
@@ -107,11 +109,16 @@ def summarize(samples: list[JsonDict], cfg: CpuLoad) -> JsonDict:
     }
 
 
-class Check:
+class HealthCheck(HealthCheckBase):
     def __init__(self, cfg: CpuLoad, gpus_done: threading.Event, cpus: list[int]) -> None:
         self.cfg = cfg
         self.gpus_done = gpus_done
         self.cpus = cpus
+
+    @classmethod
+    def missing(cls, _name: str) -> None:
+        """A node JSON from before this step existed has no cpu_load key, and that is not a fault."""
+        return
 
     @property
     def enabled(self) -> bool:
@@ -164,3 +171,38 @@ class Check:
             "throttle_delta": throttle_count() - throttles_before,
             "samples": samples,
         }
+
+    @staticmethod
+    def report(results: ByHost[JsonDict], cfg: CpuLoad, name: str) -> Report:
+        findings = per_host(results, cfg, name, _findings)
+        mhz = {
+            host: data["full_power_mhz"]
+            for host, data in results.items()
+            if data.get("status") != Status.SKIPPED
+            and data.get("full_power_mhz")
+        }
+        if not mhz:
+            return Report(findings, {})
+        mid, floor, slow = below_median(mhz, cfg.min_frac_of_median)
+        for host in slow:
+            detail = f"busy-core clock {mhz[host]} < {floor:.0f} MHz"
+            findings.setdefault(host, []).append(Finding("warn", "cpu_load.median", detail))
+        return Report(findings, {"cpu_load_busy_mhz": mid})
+
+
+def _findings(data: JsonDict, cfg: CpuLoad) -> Iterator[Finding]:
+    low_share = data.get("low_share") or 0
+    if low_share > cfg.fail_low_share:
+        severity: Severity = "fail"
+    elif low_share > cfg.warn_low_share:
+        severity = "warn"
+    else:
+        severity = None
+    if severity:
+        detail = (
+            f"{low_share:.0%} of busy-core readings at full GPU power over {cfg.low_frac:.0%} below "
+            f"{data['max_mhz']} MHz (mean {data['full_power_mhz']})"
+        )
+        yield Finding(severity, "cpu_load.low_clocks", detail)
+    if data["throttle_delta"]:
+        yield Finding("warn", "cpu_load.throttle", f"{data['throttle_delta']} CPU thermal throttle events")
