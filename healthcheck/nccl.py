@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from healthcheck.config import cfg
+from healthcheck.config import Nccl, NcclTest, cfg
 from healthcheck.util.file import Json, read_json, write_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status
@@ -25,11 +25,15 @@ from healthcheck.util.status import Status
 class Run(NamedTuple):
     kind: str
     nodes: tuple[str, ...]
-    env: dict[str, str] = {}
+    test: NcclTest = NcclTest()
 
     @property
     def label(self) -> str:
         return f"{self.kind}-{self.nodes[0]}" + (f"-{self.nodes[-1]}" if len(self.nodes) > 1 else "")
+
+    @property
+    def env(self) -> dict[str, str]:
+        return self.test.env
 
 
 def parse(text: str) -> dict[str, Any]:
@@ -86,11 +90,13 @@ def pair_rounds(nodes: list[str]) -> list[list[tuple[str, str]]]:
 
 
 class Launch(NamedTuple):
-    """How every test of a run is started: the same binary, arguments and ranks per node."""
+    """How every test of a run is started: one nccl-tests build directory and the ranks per node.
+
+    The binary and arguments come from the test.
+    """
 
     mpi: str
-    binary: Path
-    args: list[str]
+    build: Path
     ranks_per_node: int
 
     @property
@@ -110,9 +116,8 @@ class Launch(NamedTuple):
             f"--ntasks-per-node={self.ranks_per_node}",
             f"--cpus-per-task={self.cpus_per_task}",
             f"--nodelist={Hostlist(test.nodes)}",
-            # except the alltoall tests, which run alltoall_perf from the same build
-            str(self.binary.with_name(cfg.nccl.alltoall_binary) if test.kind == "alltoall" else self.binary),
-            *self.args,
+            str(self.build / test.test.binary),
+            *test.test.args,
         ]
 
 
@@ -200,21 +205,37 @@ def run_round(
     return results
 
 
-def plan(nodes: list[str], loopback_env: dict[str, str]) -> list[list[Run]]:
+def plan(nodes: list[str], settings: Nccl | None = None) -> list[list[Run]]:
     """
-    Rounds of concurrent tests. The per-node and pair rounds take about the same time at any node count; the group
-    and alltoall tests span the whole job, when it has more than two nodes, so they slow down as it grows.
+    Rounds of concurrent tests, skipping kinds whose NcclTest is disabled. The per-node and pair rounds take about
+    the same time at any node count; the group and alltoall tests span the whole job, when it has more than two
+    nodes, so they slow down as it grows. Alltoall alone runs from two nodes; alongside the other tests it waits
+    for more than two, the same rule as group.
 
-    >>> [[test.label for test in tests] for tests in plan(["a", "b", "c", "d"], {})][2:]
-    [['pair-a-b', 'pair-c-d'], ['pair-b-c', 'pair-d-a'], ['group-a-d'], ['alltoall-a-d']]
-    >>> [test.kind for tests in plan(["a", "b"], {}) for test in tests]
+    >>> [[test.label for test in tests] for tests in plan(["a", "b", "c", "d"])][2:]
+    [['pair-a-b', 'pair-c-d'], ['pair-b-c', 'pair-d-a'], ['group-a-d']]
+    >>> [test.kind for tests in plan(["a", "b"]) for test in tests]
     ['intra', 'intra', 'loopback', 'loopback', 'pair']
+    >>> plan([])
+    []
     """
-    rounds = [[Run("intra", (node,)) for node in nodes], [Run("loopback", (node,), loopback_env) for node in nodes]]
-    rounds += [[Run("pair", pair) for pair in pairs] for pairs in pair_rounds(nodes)]
-    if len(nodes) > 2:
-        rounds.append([Run("group", tuple(nodes))])
-        rounds.append([Run("alltoall", tuple(nodes))])
+    chosen = cfg.nccl if settings is None else settings
+    rounds: list[list[Run]] = []
+    if chosen.intra.enabled and nodes:
+        rounds.append([Run(chosen.intra.name, (node,), chosen.intra) for node in nodes])
+    if chosen.loopback.enabled and nodes:
+        rounds.append([Run(chosen.loopback.name, (node,), chosen.loopback) for node in nodes])
+    if chosen.pair.enabled and len(nodes) >= 2:
+        rounds += [[Run(chosen.pair.name, pair, chosen.pair) for pair in pairs] for pairs in pair_rounds(nodes)]
+    whole = tuple(nodes)
+    if chosen.group.enabled and len(nodes) > 2:
+        rounds.append([Run(chosen.group.name, whole, chosen.group)])
+    # Two nodes already have a pair. Alltoall joins them only when it is the only test configured.
+    only_alltoall = not (
+        chosen.intra.enabled or chosen.loopback.enabled or chosen.pair.enabled or chosen.group.enabled
+    )
+    if chosen.alltoall.enabled and len(nodes) >= (2 if only_alltoall else 3):
+        rounds.append([Run(chosen.alltoall.name, whole, chosen.alltoall)])
     return rounds
 
 
@@ -226,14 +247,25 @@ def main() -> int:
     env = read_json(cfg.paths.env) or {}
     job_id = os.environ["SLURM_JOB_ID"]
     nodes = list(Hostlist.expand(os.environ["SLURM_JOB_NODELIST"]))
-    # One rank per GPU
-    launch = Launch(env.get("mpi", "pmix"), Path(env["nccl_tests"]) / cfg.nccl.binary, cfg.nccl.args, cfg.gpu.count)
+    # One rank per GPU. Each test names its own binary and arguments.
+    launch = Launch(env.get("mpi", "pmix"), Path(env["nccl_tests"]), cfg.gpu.count)
     start = time.monotonic()
     finished: list[dict[str, Any]] = []
-    out: dict[str, Json] = {"job_id": job_id, "nodes": nodes, "mpi": launch.mpi, "tests": finished}
-    for tests in plan(nodes, cfg.nccl.loopback_env):
-        timeout = cfg.nccl.timeout_s[tests[0].kind]
-        finished += run_round(tests, launch, results.group_logs(job_id), timeout, results.nccl_logs)
+    rounds = plan(nodes)
+    out: dict[str, Json] = {
+        "job_id": job_id,
+        "nodes": nodes,
+        "mpi": launch.mpi,
+        "kinds": list(dict.fromkeys(tests[0].kind for tests in rounds if tests)),
+        "tests": finished,
+    }
+    if not rounds:
+        out["elapsed_s"] = 0
+        write_json(results.group(job_id), out)
+        print(f"nccl: nothing to run ({len(nodes)} node(s))")
+        return 0
+    for tests in rounds:
+        finished += run_round(tests, launch, results.group_logs(job_id), tests[0].test.timeout_s, results.nccl_logs)
         out["elapsed_s"] = round(time.monotonic() - start, 1)  # the phase's wall time; a round's tests overlap
         write_json(results.group(job_id), out)  # after each round, in case the job is killed
         print(
@@ -241,7 +273,6 @@ def main() -> int:
             + ", ".join(
                 f"{result['nodes'][0]}={result['peak_busbw']}({result['status']})" for result in finished[-len(tests) :]
             ),
-            flush=True,
         )
     return 0
 

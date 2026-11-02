@@ -45,7 +45,7 @@ def write_files(base: Path, cfg: Scratch | Project) -> None:
     size = int(cfg.file_gib * 2**30)
     block = cfg.write_block_mib * 2**20
     paths = [file_path(base, index) for index in range(cfg.files)]
-    print(f"{len(paths)} x {cfg.file_gib} GiB read-test files in {paths[0].parent}", flush=True)
+    print(f"{len(paths)} x {cfg.file_gib} GiB read-test files in {paths[0].parent}")
     with ThreadPoolExecutor(max_workers=len(paths)) as pool:
         written = sum(pool.map(write_random, paths, [size] * len(paths), [block] * len(paths)))
     print(f"wrote {written}, {len(paths) - written} already there")

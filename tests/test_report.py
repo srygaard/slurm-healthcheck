@@ -398,15 +398,22 @@ def test_group_timeout_blames_the_pair_culprit_only(run):
 
 
 def test_slow_alltoall_warns_every_node(run):
-    set_tests(run, lambda test: True, lambda test: test.update(peak_busbw=2) if test["kind"] == "alltoall" else None)
-    assert set(statuses(run).values()) == {"warn"}  # below alltoall_min_busbw_GBps 5
-    assert evaluate(run)["medians"]["nccl_alltoall_busbw_GBps"] == 2
+    set_tests(run, lambda test: True, lambda test: test.update(peak_busbw=0.5) if test["kind"] == "alltoall" else None)
+    assert set(statuses(run).values()) == {"warn"}  # below nccl.alltoall.min_busbw_GBps 1.0
+    assert evaluate(run)["medians"]["nccl_alltoall_busbw_GBps"] == 0.5
 
 
-@pytest.mark.parametrize("kind", ["group", "alltoall"])
-def test_group_timeout_without_culprit_excludes_the_group(run, kind):
-    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == kind else None)
+def test_group_timeout_without_culprit_excludes_the_group(run):
+    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "group" else None)
     assert set(statuses(run).values()) == {"fail"}
     _, exclude, include = report.write(run, Config(), switches(run), ["fail"])
     assert exclude == "#SBATCH --exclude=rg[1-6]\n"
     assert include == "# no nodes to include\n"
+
+
+def test_alltoall_timeout_warns_every_node(run):
+    set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "alltoall" else None)
+    assert set(statuses(run).values()) == {"warn"}
+    _, exclude, _ = report.write(run, Config(), switches(run), ["fail"])
+    assert exclude == "# no nodes to exclude\n"
+

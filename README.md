@@ -49,48 +49,38 @@ so `--job-per switch` runs as `--job-per cluster`.
 `--job-per` also decides what the NCCL group and alltoall tests cover, since they run across all of a job's nodes
 when it has more than two: one leaf switch with `switch` (the default), every node with `cluster`, and none with
 `node`; with `--any N`, the N nodes Slurm picks, on whichever switches they are. Their time grows with the job, up
-to `nccl.timeout_s`.
-
-The cluster is detected from `$CC_CLUSTER` (or the `mila.quebec` domain), and each cluster needs its own job template,
-`slurm/templates/<cluster>.sh`, which the probe and healthcheck jobs share. A template holds only the resources;
-healthcheck.py passes the per-job name, logs, nodes, `--dependency` and the probe's `--nodes=1` as sbatch options.
-
-The report is printed and written to the run directory. Paste one of its headers into the training job:
-`exclude.sbatch` (`#SBATCH --exclude=rg[21703,31605]`) keeps the job off the failed nodes, and `include.sbatch`
-(`#SBATCH --nodelist=rg[21701-21702,31601-31604]`) pins it to the nodes that passed. Both follow `--exclude-on`.
-Slurm reports a healthcheck job as COMPLETED even when nodes fail; only the report says whether they passed.
+to `nccl.<kind>.timeout_s`.
 
 ## What a job checks
 Each node runs three phases:
 
 1. **Phase A**, all steps run in parallel; the job's time limit caps them:
-   - **sysinfo**: GPU driver, CUDA, ECC, remapped rows, PCIe, NVLink; IB firmware, port state and rate; MTU;
-     NUMA nodes and each GPU's and HCA's PCI address, ids, NUMA node and PCIe root port, from which each node
-     writes its NUMA layout table to `<run>/numa/<host>.json`;
-     kernel, OS and OFED; system BIOS version (DMI), and the CPU clock and power settings a user can read
-     (cpufreq governor and max clock, turbo, energy-performance preference, RAPL limits).
+   - **sysinfo**: GPU, NIC, NUMA, software, BIOS, and CPU power. The NUMA layout goes to `<run>/numa/<host>.json`.
    - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and `setup` skips its files too.
-   - **project**: `$PROJECT` read, in parallel with scratch and with its own thresholds; `setup` and `run` need
-     `$PROJECT` set; disabled by default (`project.enabled`), and `setup` then skips its files too.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
      node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
      (`dcgm.diagnostic_precision`) and warns below 95%.
    - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns. Over 4 min or more at full
-     GPU power ([Heat Soak](#heat-soak)), it fails a node with over 20% of busy-core readings more than 10% below
+     GPU power ([Power limit](#power-limit)), it fails a node with over 20% of busy-core readings more than 10% below
      its highest and warns over 5%.
-2. **Phase B**, `all_reduce_perf` with 4 ranks per node, then `alltoall_perf`:
+2. **Phase B**, `all_reduce_perf` with 4 ranks per node:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
    3. ring pairs of nodes, so a bad NIC shows up in both of a node's pairs;
    4. all of the job's nodes together, when there are more than two: a leaf switch's with `--job-per switch`,
-      every node with `--job-per cluster`;
-   5. the same nodes with `alltoall_perf`, where every rank sends to every other.
-
-   Each kind runs as one round of concurrent tests, so the first three take about the same time at any node count;
-   the last two grow with the job. A test past its `nccl.timeout_s` is stopped and reported as `timeout`.
+      every node with `--job-per cluster`.
 3. **Phase C**: Xid events from a watcher that runs for the whole job, GPU error counter deltas, NCCL `WARN`
    lines, and kernel log matches when they are readable (not on Rorqual).
+
+## Off by default
+Turn these on in `healthcheck/config.py`.
+
+- **project** (`project.enabled`): `$PROJECT` read, like scratch, with its own thresholds. `setup` and `run` need
+  `$PROJECT` set; while this is off, `setup` skips its files.
+- **alltoall** (`nccl.alltoall.enabled`): `alltoall_perf` on the same nodes as the group test, every rank sending
+  to every other. Its timeout is 600 s, so extend the template's `#SBATCH --time` first. Alone, with every other
+  NCCL test disabled, it runs from two nodes.
 
 The report fails a node when a check fails, when a step errors or times out, or when its result file is still
 empty after the job. It also compares the `homogeneity` keys across nodes and flags those that differ from the
@@ -114,30 +104,6 @@ results/<job_id>/
 ```
 Setup jobs only have `jobs/`, plus the probe's DCGM and MPI test output.
 
-## Calibrating thresholds
-The medians at the top of `report.txt` are there to set the thresholds from. Typical values on Rorqual:
-
-| median                     | measured | threshold                         |
-|----------------------------|----------|-----------------------------------|
-| `dcgm_diagnostic_tflops`   | ~650     | per GPU, `dcgm.diagnostic_min_frac_of_median: 0.90` of it, warn at 0.95 |
-| `nccl_intra_busbw_GBps`    | ~337     | `nccl.intra_min_busbw_GBps: 300`  |
-| `nccl_loopback_busbw_GBps` | ~6.4     | `nccl.loopback_min_busbw_GBps: 5` |
-| `nccl_pair_busbw_GBps`     | ~40      | `nccl.pair_min_busbw_GBps: 20`    |
-| `nccl_group_busbw_GBps`    | ~24.6    | `nccl.group_min_busbw_GBps: 20`   |
-| `nccl_alltoall_busbw_GBps` | ~6.8     | `nccl.alltoall_min_busbw_GBps: 5` |
-| `scratch_read_GBps`        | 0.05–0.3 | `scratch.min_GBps: 0.2`, warn only |
-| `project_read_GBps`        | not yet measured | `project.min_GBps: 0.2`, warn only |
-
-The group and alltoall values are for one leaf switch (7 nodes, `--job-per switch`). Across switches the traffic
-goes through the spine: 21 nodes on 3 switches with `--job-per cluster` measured ~19.2 and ~3.0, below these
-thresholds, so such a run warns on every node.
-
-Bandwidths are GB/s. TFLOPS are DCGM's coarse estimate at `dcgm.diagnostic_precision: fp16`: each H100 reads
-640.9 or 659.8 (runs before fp16 used DCGM's default of all three precisions and read 160–165). `$SCRATCH` read
-speed depends on the load on Lustre, which is why it only warns. Use `gpu.min_nvlinks` and `nic.*` to pin the
-expected hardware. The thresholds are pydantic defaults in
-`healthcheck/config.py`; after editing it, re-run `report <run>` instead of resubmitting.
-
 ## Finding the slow node of a pair
 A bad node slows both of its ring pairs, so in a larger run it fails `nccl.pair` with `2/2 slow pairs` while its
 neighbours only warn with `1/2`. Two nodes form a single pair, so a slow pair fails both with `1/1 slow pairs`. To
@@ -152,16 +118,15 @@ tell which one is slow:
    ```
    The three form a ring of three pairs, each node in two. The slow node is the one both slow pairs share; read the
    pairs' `peak_busbw` in `groups/<job_id>.json` (~40 GB/s when healthy). The report may not flag it: two of the
-   three pairs are slow, so the median is too, and only `nccl.pair_min_busbw_GBps` still applies.
+   three pairs are slow, so the median is too, and only `nccl.pair.min_busbw_GBps` still applies.
 3. NCCL debug logs, `logs/nccl/pair-<a>-<b>.<host>.<pid>.log`, are kept when a rank logged something, such as a
    `WARN` naming the failing connection.
 
-## Heat Soak
+## Node Power Limit
 cpu_load judges the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
-default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). A soak gives a slow node longer to show:
-rg21701 read 21–31% low after 4 minutes at full power and 31–48% after 10, against the 20% limit.
+default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s).
 
-| setting | default | soak |
+| setting | default | longer |
 |---|---|---|
 | `targeted_power.test_duration` in `dcgm.parameters` | 260 | 600 |
 | `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:15:00 | 00:20:00 |

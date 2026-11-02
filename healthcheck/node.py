@@ -60,7 +60,7 @@ def local() -> None:
         futures["dcgm"].add_done_callback(lambda _: gpus_done.set())
         for name, future in futures.items():
             out[name] = future.result()
-            print(f"{host} {name}: {out[name]['status']} in {out[name]['elapsed_s']}s", flush=True)
+            print(f"{host} {name}: {out[name]['status']} in {out[name]['elapsed_s']}s")
     # sysinfo returns the NUMA layout for its own file; the node's results are written first, so they survive a failure
     numa_layout = out["sysinfo"].get("data", {}).pop(sysinfo.NUMA_LAYOUT, None) if ok(out["sysinfo"]) else None
     write_json(path, out)
@@ -127,7 +127,7 @@ def finalize() -> None:
     out["logs"] = step(logs.collect, cfg.logs, cfg.paths, host, since, before)
     out["finished"] = datetime.now().astimezone().isoformat(timespec="seconds")
     write_json(path, out)
-    print(f"{host} logs: {out['logs']['status']} in {out['logs']['elapsed_s']}s", flush=True)
+    print(f"{host} logs: {out['logs']['status']} in {out['logs']['elapsed_s']}s")
 
 
 if __name__ == "__main__":

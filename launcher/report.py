@@ -326,19 +326,21 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
         kind: _median([test["peak_busbw"] for test in kind_tests if ok(test)]) for kind, kind_tests in by_kind.items()
     }
 
-    for kind, minimum in (("intra", cfg.intra_min_busbw_GBps), ("loopback", cfg.loopback_min_busbw_GBps)):
-        for test in by_kind[kind]:
+    for spec in (cfg.intra, cfg.loopback):
+        for test in by_kind[spec.name]:
             if not ok(test):
-                out[test["nodes"][0]].append(Finding("fail", f"nccl.{kind}", f"{test['status']} ({test['log']})"))
-            elif test["peak_busbw"] < minimum:
-                out[test["nodes"][0]].append(Finding("fail", f"nccl.{kind}", f"busbw {test['peak_busbw']} < {minimum}"))
+                out[test["nodes"][0]].append(Finding("fail", f"nccl.{spec.name}", f"{test['status']} ({test['log']})"))
+            elif test["peak_busbw"] < spec.min_busbw_GBps:
+                out[test["nodes"][0]].append(
+                    Finding("fail", f"nccl.{spec.name}", f"busbw {test['peak_busbw']} < {spec.min_busbw_GBps}")
+                )
 
     # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
     # bad fails too: with two nodes there is one pair, and nothing tells the two apart.
-    pair_floor = max(cfg.pair_min_busbw_GBps, (medians.get("pair") or 0) * cfg.pair_min_frac_of_median)
+    pair_floor = max(cfg.pair.min_busbw_GBps, (medians.get(cfg.pair.name) or 0) * (cfg.pair.min_frac_of_median or 0))
     slow: dict[str, list[str]] = defaultdict(list)
     pairs_of: Counter[str] = Counter()
-    for test in by_kind["pair"]:
+    for test in by_kind[cfg.pair.name]:
         pairs_of.update(test["nodes"])
         if not ok(test) or test["peak_busbw"] < pair_floor:
             for node in test["nodes"]:
@@ -349,26 +351,27 @@ def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[
         out[node].append(
             Finding(
                 severity,
-                "nccl.pair",
+                f"nccl.{cfg.pair.name}",
                 f"{len(partners)}/{pairs_of[node]} slow pairs (< {pair_floor:.1f}): {'; '.join(partners)}",
             )
         )
 
-    for kind, op, minimum, frac in (
-        ("group", "all_reduce", cfg.group_min_busbw_GBps, cfg.group_min_frac_of_median),
-        ("alltoall", "alltoall", cfg.alltoall_min_busbw_GBps, cfg.alltoall_min_frac_of_median),
-    ):
-        floor = max(minimum, (medians.get(kind) or 0) * frac)
-        for test in by_kind[kind]:
+    for spec in (cfg.group, cfg.alltoall):
+        floor = max(spec.min_busbw_GBps, (medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
+        op = spec.binary.removesuffix("_perf")
+        for test in by_kind[spec.name]:
             if not ok(test) or test["peak_busbw"] < floor:
-                # A hung test with no node already failing for it can't be blamed on one, so every node in it fails
+                # A hung group test with no node already failing for it can't be blamed on one, so every node fails.
+                # Alltoall's timeout_severity is warn: a full-cluster timeout names no node.
                 blamed = any(finding.severity == "fail" for node in test["nodes"] for finding in out.get(node, []))
-                severity = "fail" if test["status"] == Status.TIMEOUT and not blamed else "warn"
+                severity: Severity = "warn"
+                if test["status"] == Status.TIMEOUT and not blamed:
+                    severity = spec.timeout_severity
                 for node in test["nodes"]:
                     out[node].append(
                         Finding(
                             severity,
-                            f"nccl.{kind}",
+                            f"nccl.{spec.name}",
                             f"{len(test['nodes'])}-node {op} {test['status']} "
                             f"busbw {test['peak_busbw']} (floor {floor:.1f})",
                         )
@@ -389,6 +392,7 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
     tflops = {}
     step_seconds: dict[str, dict[str, float]] = {}
 
+    groups = [group for path in sorted(layout.groups.glob("*.json")) if (group := read_json(path))]
     hosts = {path.stem for path in layout.nodes.glob("*.json")} | set(switch_of) | set(job_of)
     for host in sorted(hosts):
         node = read_json(layout.node(host))
@@ -428,7 +432,6 @@ def evaluate(run: Path, cfg: Config, switch_of: dict[str, str]) -> dict[str, Any
     project_findings, project_median = check_shared_read_median(project, cfg.project, "project")
     cpu_findings, cpu_median = check_cpu_load_median(cpu_mhz, cfg.cpu_load)
     tflops_findings, tflops_median = check_dcgm_tflops(tflops, cfg.dcgm)
-    groups = [group for path in sorted(layout.groups.glob("*.json")) if (group := read_json(path))]
     nccl_findings, nccl_medians = check_nccl(groups, cfg.nccl)
     homogeneity_findings = check_homogeneity(sysinfos, fail_keys=cfg.homogeneity.fail, warn_keys=cfg.homogeneity.warn)
     across = (scratch_findings, project_findings, tflops_findings, cpu_findings, homogeneity_findings, nccl_findings)
