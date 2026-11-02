@@ -30,8 +30,8 @@ Anything already built is skipped.
 `run` submits and returns. A job takes at least 9 minutes; run `report` when it finishes.
 
 ```bash
-uv run healthcheck.py run                                      # one job per leaf switch
-uv run healthcheck.py run --job-per cluster                    # one job across all eligible nodes
+uv run healthcheck.py run                                      # one job across all eligible nodes
+uv run healthcheck.py run --job-per switch                     # one job per leaf switch
 uv run healthcheck.py run --job-per node --nodes rg31601       # one job per node, here a single node
 uv run healthcheck.py run --switches ihpc316u25                # only nodes under these leaf switches
 uv run healthcheck.py run --any 2                              # one job on any 2 free nodes picked by Slurm
@@ -43,10 +43,10 @@ uv run healthcheck.py report --exclude-on fail,warn $SCRATCH/slurm-healthcheck/r
 The job template's `#SBATCH` lines also decide the eligible nodes: exactly `gpu:<--gpus-per-node>` in
 `sinfo %G` (so no MIG or partial-GPU nodes), all the `--constraint` features, in the `--partition` if set, and in
 `USABLE_STATES` (launcher/selection.py). Trillium's fabric is non-blocking and Slurm has no switch topology there,
-so `--job-per switch` runs as `--job-per cluster`.
+so `--job-per switch` fails.
 
 `--job-per` also decides what the NCCL group and alltoall tests cover, since they run across all of a job's nodes
-when it has more than two: one leaf switch with `switch` (the default), every node with `cluster`, and none with
+when it has more than two: every node with `cluster` (the default), one leaf switch with `switch`, and none with
 `node`; with `--any N`, the N nodes Slurm picks, on whichever switches they are. Their time grows with the job, up
 to `nccl.<kind>.timeout_s`.
 

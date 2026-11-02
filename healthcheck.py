@@ -133,7 +133,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
         switch_of: dict[str, str] = {}
         groups = {f"any{args.any}": Hostlist()}
-        print(f"1 job on any {args.any} free node(s)")
+        print(f"Submitting 1 job on any {args.any} free node(s)")
     else:
         # The nodes the template's jobs can run on
         directives = sbatch_directives()
@@ -155,9 +155,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not all_switches and args.switches:
             raise SystemExit(f"{Ansi.RED}Slurm has no switch topology here, so --switches matches no node{Ansi.RESET}")
         if not all_switches and args.job_per == selection.JobPer.SWITCH:
-            # topology/flat, e.g. Trillium's non-blocking fabric: every node is under the same switch
-            print("No switch topology: one job across all nodes, as --job-per cluster")
-            args.job_per = selection.JobPer.CLUSTER
+            # topology/flat, e.g. Trillium: scontrol show topology lists no switches
+            raise SystemExit(f"{Ansi.RED}Slurm has no switch topology here, so --job-per switch cannot run{Ansi.RESET}")
         nodes, missing = selection.filter_nodes(
             (node.name for node in selected),
             all_switches,
@@ -248,7 +247,7 @@ def parse_args() -> argparse.Namespace:
         "--job-per",
         type=selection.JobPer,
         choices=list(selection.JobPer),
-        default=selection.JobPer.SWITCH,
+        default=selection.JobPer.CLUSTER,
         help="One job for all nodes, one per leaf switch, or one per node",
     )
     run_parser.add_argument(
