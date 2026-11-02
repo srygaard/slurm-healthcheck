@@ -27,15 +27,14 @@ Anything already built is skipped.
 
 ## Running
 
-Running commands _without_ `--no-wait` will wait for ~9 minutes before reporting the results.
+`run` submits and returns. A job takes at least 9 minutes; run `report` when it finishes.
 
 ```bash
-uv run healthcheck.py run                                      # one job per leaf switch, wait, then report
+uv run healthcheck.py run                                      # one job per leaf switch
 uv run healthcheck.py run --job-per cluster                    # one job across all eligible nodes
 uv run healthcheck.py run --job-per node --nodes rg31601       # one job per node, here a single node
 uv run healthcheck.py run --switches ihpc316u25                # only nodes under these leaf switches
 uv run healthcheck.py run --any 2                              # one job on any 2 free nodes picked by Slurm
-uv run healthcheck.py run --no-wait                            # submit and exit; run `report` later
 uv run healthcheck.py run --dependency afterok:12345           # sbatch --dependency for every job of the run
 
 uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>                         # re-evaluate a finished run

@@ -19,7 +19,7 @@ from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
-from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue, wait_for
+from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue
 
 REPO = Path(__file__).parent
 
@@ -193,22 +193,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         by_switch.setdefault(switch, []).append(node)
     run.switches.write_text(json.dumps(by_switch, indent=1))
     print(f"Submitted {len(jobs)}/{len(groups)} jobs; run dir {Ansi.PURPLE}{run.root}{Ansi.RESET}")
-
-    if args.no_wait:
-        print(f"Report when the jobs finish: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
-        return 0
-    job_ids = [job["job_id"] for job in jobs]
-    waiting_on = f"{len(job_ids)} job(s) ({', '.join(map(str, job_ids))}) to start and finish"
-    print(f"Waiting for {waiting_on}; a run takes at least 9 minutes. Ctrl+C doesn't cancel anything.")
-    try:
-        wait_for(job_ids)
-    except KeyboardInterrupt:
-        print(
-            "\nStopped waiting; the jobs still run. Report when they finish: "
-            f"{Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}"
-        )
-        return 130
-    return cmd_report(run.root, args.exclude_on.split(","))
+    print(f"Generate the report when the jobs finishes with: {Ansi.GREEN}uv run healthcheck.py report {run.root}{Ansi.RESET}")
+    return 0
 
 
 def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
@@ -256,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         help="Build on the login node (nccl-tests, read-test files, venv)",
     )
 
-    run_parser = sub.add_parser("run", formatter_class=defaults, help="Submit health checks, wait, and report")
+    run_parser = sub.add_parser("run", formatter_class=defaults, help="Submit health check(s)")
     run_parser.add_argument(
         "-j",
         "--job-per",
@@ -282,8 +268,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="sbatch --dependency, e.g. afterok:12345",
     )
-    run_parser.add_argument("--no-wait", action="store_true", help="Submit and exit; run `report` later")
-    run_parser.add_argument("-e", "--exclude-on", default="fail", help=exclude_on_help)
 
     report_parser = sub.add_parser(
         "report", formatter_class=defaults, help="Re-evaluate a run, e.g. after editing healthcheck/config.py"
