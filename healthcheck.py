@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from healthcheck.config import Paths, cfg
+from healthcheck.config import Paths, cfg, directives, gpu_from_template, template_file, template_stem
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.switches import node_switches
@@ -53,6 +53,8 @@ def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None =
     """Variables every job gets, plus extra; the templates and healthcheck read them."""
     env: dict[str, object] = {"HC_BASE": base, "HC_VENV": venv_dir(base), "HC_CODE": REPO, "PYTHONPATH": REPO}
     env["HC_CLUSTER"] = detect_cluster() or ""
+    if stem := template_stem():  # the job's cfg reads the same template this submission used
+        env["HC_TEMPLATE"] = stem
     if run_id:
         env["HC_RUN_ID"] = run_id
     env.update(extra or {})
@@ -71,21 +73,20 @@ def sbatch_options(base: Path, label: str, run_id: int | None) -> list[str]:
 
 
 def template() -> str:
-    """slurm/templates/<cluster>.sh."""
-    cluster = detect_cluster()
-    templates = REPO / "slurm" / "templates"
-    path = templates / f"{cluster}.sh"
-    if not cluster or not path.is_file():
-        known = ", ".join(sorted(found.stem for found in templates.glob("*.sh")))
+    """slurm/templates/<stem>.sh. $HC_TEMPLATE overrides the cluster name, for example trillium.b200."""
+    path = template_file(REPO / "slurm" / "templates")
+    if path is None:
+        known = ", ".join(sorted(found.stem for found in (REPO / "slurm" / "templates").glob("*.sh")))
         raise SystemExit(
-            f"{Ansi.RED}No job template for cluster {cluster or '?'}: set $CC_CLUSTER to one of {known}{Ansi.RESET}"
+            f"{Ansi.RED}No job template for {template_stem() or '?'}: "
+            f"set $HC_TEMPLATE or $CC_CLUSTER to one of {known}{Ansi.RESET}"
         )
     return path.read_text()
 
 
 def sbatch_directives() -> dict[str, str]:
     """The healthcheck template's `#SBATCH --option=value` lines as {option: value}."""
-    return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(), re.MULTILINE))
+    return directives(template())
 
 
 def submit(
@@ -180,7 +181,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         options += [f"--nodelist={members}"] if members else []
         options += [f"--dependency={args.dependency}"] if args.dependency else []
         if job_id := submit('exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
-            jobs.append({"job_id": job_id, "label": label, "nodes": members})
+            job = {"job_id": job_id, "label": label, "nodes": members}
+            if stem := template_stem():  # report grades the run with this template, not whichever is current
+                job["template"] = stem
+            jobs.append(job)
     if not jobs:
         print(f"Submitted 0/{len(groups)} jobs")
         return 1
@@ -222,7 +226,9 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
         topo = node_switches()
         switch_of |= {node: topo.get(node, "unknown") for node in missing}
 
-    result, exclude, include = report.write(run.root, cfg, switch_of, exclude_on)
+    stem = next((job["template"] for job in jobs if job.get("template")), None)
+    report_cfg = cfg.model_copy(update={"gpu": gpu_from_template(stem=stem)}) if stem else cfg
+    result, exclude, include = report.write(run.root, report_cfg, switch_of, exclude_on)
     print(report.format_text(result))
     color = Ansi.RED if "--exclude" in exclude else Ansi.GREEN
     print(f"{color}{exclude}{Ansi.RESET}{include}")
