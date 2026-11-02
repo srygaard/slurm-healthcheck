@@ -1,10 +1,8 @@
-"""Query the cluster, and submit and follow its Slurm jobs."""
+"""Query the cluster and submit its Slurm jobs."""
 
 import json
 import os
 import socket
-import time
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -146,28 +144,6 @@ def squeue(options: Sequence[str]) -> SqueueResult:
         for job in _jobs(result.stdout)
     ]
     return SqueueResult(jobs, result.returncode, result.stderr)
-
-
-def wait_for(job_ids: list[int], interval: float = 15) -> None:
-    """Poll squeue until none of the jobs remain."""
-    ids = ",".join(map(str, job_ids))
-    while True:
-        result = squeue(["-j", ids])
-        if result.returncode and "Invalid job id" not in result.stderr:
-            time.sleep(interval)  # transient slurmctld error: retry
-            continue
-        states = Counter(job.state for job in result.jobs)
-        done = len(job_ids) - sum(states.values())
-        print(
-            f"\r[{datetime.now():%H:%M:%S}] {done}/{len(job_ids)} done  "
-            + "  ".join(f"{state.lower()} {count}" for state, count in sorted(states.items()))
-            + " " * 10,
-            end="",
-        )
-        if not states:
-            print()
-            return
-        time.sleep(interval)
 
 
 def sacct_states(job_ids: Sequence[int]) -> dict[int, SacctJob]:
