@@ -417,3 +417,48 @@ def test_alltoall_timeout_warns_every_node(run):
     _, exclude, _ = report.write(run, Config(), switches(run), ["fail"])
     assert exclude == "# no nodes to exclude\n"
 
+
+def test_nccl_without_mpi_warns_instead_of_failing():
+    findings, medians = report.check_nccl(
+        [{"job_id": 1, "nodes": ["cn-l001"], "mpi": "none", "tests": [], "elapsed_s": 0}],
+        Config().nccl,
+    )
+    assert findings["cn-l001"] == [report.Finding("warn", "nccl", "skipped: no MPI plugin")]
+    assert medians == {}
+
+
+def test_unavailable_step_warns_and_does_not_fail(run):
+    edit(
+        run,
+        "rg2",
+        lambda node: node.update(sysinfo={"status": "unavailable", "error": "Driver Not Loaded", "elapsed_s": 0.1}),
+    )
+    result = evaluate(run)["nodes"]["rg2"]
+    assert result["status"] == "warn"
+    assert result["findings"] == [{"severity": "warn", "check": "sysinfo", "detail": "unavailable: Driver Not Loaded"}]
+
+
+def test_step_error_fails(run):
+    edit(run, "rg2", lambda node: node.update(dcgm={"status": "error", "error": "DiagError: boom", "elapsed_s": 1}))
+    result = evaluate(run)["nodes"]["rg2"]
+    assert result["status"] == "fail"
+    assert result["findings"][0]["detail"] == "error: DiagError: boom"
+
+
+def test_nccl_unavailable_warns():
+    findings, medians = report.check_nccl(
+        [
+            {
+                "job_id": 1,
+                "nodes": ["cn-l001"],
+                "status": "unavailable",
+                "error": "missing all_reduce_perf in /build",
+                "tests": [],
+                "elapsed_s": 0,
+            }
+        ],
+        Config().nccl,
+    )
+    assert findings["cn-l001"] == [report.Finding("warn", "nccl", "unavailable: missing all_reduce_perf in /build")]
+    assert medians == {}
+

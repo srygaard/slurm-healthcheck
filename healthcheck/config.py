@@ -95,6 +95,10 @@ class Dcgm(Section):
         # "nccl_tests",  # not timed; the NCCL step covers collectives
     ]
     port: int = 5556  # for a hostengine we start ourselves
+    discovery_timeout_s: float = 15  # a missing hostengine errors at once; a hung discovery must not stall phase A
+    # The configured suite is about 7 min (targeted_power ~280 s, the other tests ~2 min). 10 min leaves the template's
+    # 15 min enough for NCCL after a hang.
+    diag_timeout_s: float = 600
     parameters: list[str] = [  # dcgmi diag -p, joined with ";"
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
@@ -139,7 +143,7 @@ class NcclTest(Section):
 
     name: str = ""  # the kind recorded in results: intra, loopback, pair, group, alltoall
     enabled: bool = True
-    binary: str = "all_reduce_perf"  # file in the nccl-tests build directory recorded in env.json
+    binary: str = "all_reduce_perf"  # file in $HC_NCCL_TESTS/build
     args: list[str] = ["--minbytes=128M", "--maxbytes=1G", "--stepfactor=2", "--warmup_iters=5", "--iters=20"]
     env: dict[str, str] = Field(default_factory=dict)
     # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip phase C.
@@ -252,14 +256,9 @@ class Paths(Section):
 
     base: Path = Path(
         os.environ.get("HC_BASE", ".")
-    )  # shared across runs: env.json, .opt/, diskprobe/, results/; healthcheck.py exports it
+    )  # shared across runs: .opt/, diskprobe/, results/; healthcheck.py exports it
     root: Path = Field(default_factory=_run_root)
-    project: Path = Path(os.environ.get("HC_PROJECT", "."))  # like base, on $PROJECT; healthcheck.py exports it
-
-    @property
-    def env(self) -> Path:
-        """Written by the probe job; each node's result copies what it read."""
-        return self.base / "env.json"
+    project: Path = Path(os.environ.get("HC_PROJECT", "."))  # like base, on $PROJECT; slurm/scripts/.*.env export it
 
     @property
     def switches(self) -> Path:

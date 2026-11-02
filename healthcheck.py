@@ -19,7 +19,7 @@ from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
-from launcher.slurm import detect_cluster, my_queued, sacct_states, sbatch, squeue, wait_for, with_dependency
+from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue, wait_for
 
 REPO = Path(__file__).parent
 
@@ -34,21 +34,13 @@ class Ansi(StrEnum):
 
 
 def base_dir() -> Path:
-    """.opt/, .uv-cache/, .venv/, diskprobe/, env.json, results/; jobs get it as $HC_BASE."""
+    """.opt/, .uv-cache/, .venv/, diskprobe/, results/; jobs get it as $HC_BASE."""
     scratch = os.environ.get("SCRATCH")
     if not scratch:
         raise SystemExit(f"{Ansi.RED}$SCRATCH is not set{Ansi.RESET}")
     base = Path(scratch) / "slurm-healthcheck"
     base.mkdir(parents=True, exist_ok=True)  # sbatch runs from it, so it must exist before the first setup
     return base
-
-
-def project_dir() -> Path:
-    """Holds diskprobe/ for the $PROJECT read test; jobs get it as $HC_PROJECT."""
-    project = os.environ.get("PROJECT")
-    if not project:
-        raise SystemExit(f"{Ansi.RED}$PROJECT is not set{Ansi.RESET}")
-    return Path(project) / "slurm-healthcheck"
 
 
 def venv_dir(base: Path) -> Path:
@@ -60,8 +52,7 @@ def venv_dir(base: Path) -> Path:
 def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None = None) -> dict[str, str]:
     """Variables every job gets, plus extra; the templates and healthcheck read them."""
     env: dict[str, object] = {"HC_BASE": base, "HC_VENV": venv_dir(base), "HC_CODE": REPO, "PYTHONPATH": REPO}
-    if cfg.project.enabled:
-        env["HC_PROJECT"] = project_dir()
+    env["HC_CLUSTER"] = detect_cluster() or ""
     if run_id:
         env["HC_RUN_ID"] = run_id
     env.update(extra or {})
@@ -80,7 +71,7 @@ def sbatch_options(base: Path, label: str, run_id: int | None) -> list[str]:
 
 
 def template() -> str:
-    """slurm/templates/<cluster>.sh: the resources of every job on this cluster, the probe's and the healthcheck's."""
+    """slurm/templates/<cluster>.sh."""
     cluster = detect_cluster()
     templates = REPO / "slurm" / "templates"
     path = templates / f"{cluster}.sh"
@@ -92,13 +83,8 @@ def template() -> str:
     return path.read_text()
 
 
-def job_script(command: str) -> str:
-    """The cluster's template followed by command."""
-    return f"{template().rstrip()}\n\n{command}\n"
-
-
 def sbatch_directives() -> dict[str, str]:
-    """The template's `#SBATCH --option=value` lines as {option: value}."""
+    """The healthcheck template's `#SBATCH --option=value` lines as {option: value}."""
     return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(), re.MULTILINE))
 
 
@@ -114,7 +100,8 @@ def submit(
     The job logs to results/<run_id or its own job id>/jobs/.
     """
     options = [*sbatch_options(base, label, run_id), *options]
-    result = sbatch(job_script(command), options, cwd=base, env=job_env(base, run_id))
+    script = f"{template().rstrip()}\n\n{command}\n"
+    result = sbatch(script, options, cwd=base, env=job_env(base, run_id))
     if not result.job_id:
         print(f"{Ansi.RED}{result.stderr or result.stdout}{Ansi.RESET}")
         return None
@@ -124,7 +111,7 @@ def submit(
 
 
 def cmd_setup() -> int:
-    """Build on the login node, which can reach git and PyPI, then submit the probe job."""
+    """Build on the login node, which can reach git and PyPI."""
     base = base_dir()
     uv = shutil.which("uv")
     if not uv:
@@ -133,27 +120,14 @@ def cmd_setup() -> int:
     if subprocess.run(["bash", REPO / "slurm" / "scripts" / "build.sh"], env=os.environ | env).returncode:
         print(f"{Ansi.RED}Build failed{Ansi.RESET}")
         return 1
-    job_id = submit('exec "$HC_VENV/bin/python" -m healthcheck.probe', base, "probe", options=["--nodes=1"])
-    if not job_id:
-        return 1
-    print(f"probe job {Ansi.PURPLE}{job_id}{Ansi.RESET}: log {base}/results/{job_id}/jobs/{job_id}-stdout.txt")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     base = base_dir()
     venv = venv_dir(base)
-    env_json = Paths(base=base).env
-    # The jobs read env.json when they start, so they wait for a probe still in the queue to rewrite it
-    probes = my_queued("hc-probe")
-    if not (venv.is_dir() and (env_json.is_file() or probes)):
-        raise SystemExit(
-            f"{Ansi.RED}Missing {venv if not venv.is_dir() else env_json}: "
-            f"run `uv run healthcheck.py setup` first{Ansi.RESET}"
-        )
-    if probes:
-        print(f"Waiting for probe job(s) {', '.join(map(str, probes))} to succeed")
-    dependency = with_dependency(args.dependency, probes)
+    if not venv.is_dir():
+        raise SystemExit(f"{Ansi.RED}Missing {venv}: run `uv run healthcheck.py setup` first{Ansi.RESET}")
 
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
@@ -205,7 +179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_id = jobs[0]["job_id"] if jobs else None  # the first job's id names the run dir; later jobs get HC_RUN_ID
         options = [f"--nodes={len(members) or args.any}"]
         options += [f"--nodelist={members}"] if members else []
-        options += [f"--dependency={dependency}"] if dependency else []
+        options += [f"--dependency={args.dependency}"] if args.dependency else []
         if job_id := submit('exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
             jobs.append({"job_id": job_id, "label": label, "nodes": members})
     if not jobs:
@@ -225,8 +199,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
     job_ids = [job["job_id"] for job in jobs]
     waiting_on = f"{len(job_ids)} job(s) ({', '.join(map(str, job_ids))}) to start and finish"
-    if probes:
-        waiting_on += f", after probe job(s) {', '.join(map(str, probes))}"
     print(f"Waiting for {waiting_on}; a run takes at least 9 minutes. Ctrl+C doesn't cancel anything.")
     try:
         wait_for(job_ids)
@@ -281,8 +253,7 @@ def parse_args() -> argparse.Namespace:
 
     sub.add_parser(
         "setup",
-        help="Build on the login node (nccl-tests, read-test files, venv), then a GPU probe job "
-        "(how to run DCGM, which srun MPI plugin works)",
+        help="Build on the login node (nccl-tests, read-test files, venv)",
     )
 
     run_parser = sub.add_parser("run", formatter_class=defaults, help="Submit health checks, wait, and report")
@@ -309,7 +280,7 @@ def parse_args() -> argparse.Namespace:
         "-d",
         "--dependency",
         default=None,
-        help="sbatch --dependency, e.g. afterok:12345; a queued probe job is added with afterok",
+        help="sbatch --dependency, e.g. afterok:12345",
     )
     run_parser.add_argument("--no-wait", action="store_true", help="Submit and exit; run `report` later")
     run_parser.add_argument("-e", "--exclude-on", default="fail", help=exclude_on_help)

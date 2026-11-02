@@ -5,6 +5,7 @@ import os
 import shutil
 from pathlib import Path
 
+from healthcheck.check import Availability
 from healthcheck.config import LocalTmp
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict
@@ -49,24 +50,39 @@ def smart() -> JsonDict:
     return {"status": status, "disks": results}
 
 
-def collect(cfg: LocalTmp, host: str) -> JsonDict:
-    """Free space for every path; read/write only for the first path on each filesystem."""
-    expanded = [os.path.expandvars(path) for path in cfg.paths]
-    # An empty expansion would mean "."; dict.fromkeys drops paths that resolve to the same directory, in order
-    directories = dict.fromkeys(Path(path).resolve() for path in expanded if path and Path(path).is_dir())
-    first_on_device: dict[int, Path] = {}
-    paths = {}
-    for directory in directories:
-        usage = shutil.disk_usage(directory)
-        entry: dict[str, Json] = {"free_gib": round(usage.free / 2**30, 1), "total_gib": round(usage.total / 2**30, 1)}
-        device = directory.stat().st_dev
-        if device in first_on_device:
-            entry["same_device_as"] = str(first_on_device[device])
-        else:
-            first_on_device[device] = directory
-            try:
-                entry |= rw(directory, host, cfg.rw.gib, cfg.rw.max_s, cfg.rw.block_mib)
-            except OSError as error:
-                entry["error"] = str(error)
-        paths[str(directory)] = entry
-    return {"paths": paths, "smart": smart()}
+class Check:
+    def __init__(self, cfg: LocalTmp, host: str) -> None:
+        self.cfg = cfg
+        self.host = host
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def available(self) -> Availability:
+        return Availability(True)
+
+    def collect(self) -> JsonDict:
+        """Free space for every path; read/write only for the first path on each filesystem."""
+        expanded = [os.path.expandvars(path) for path in self.cfg.paths]
+        # An empty expansion would mean "."; dict.fromkeys drops paths that resolve to the same directory, in order
+        directories = dict.fromkeys(Path(path).resolve() for path in expanded if path and Path(path).is_dir())
+        first_on_device: dict[int, Path] = {}
+        paths = {}
+        for directory in directories:
+            usage = shutil.disk_usage(directory)
+            entry: dict[str, Json] = {
+                "free_gib": round(usage.free / 2**30, 1),
+                "total_gib": round(usage.total / 2**30, 1),
+            }
+            device = directory.stat().st_dev
+            if device in first_on_device:
+                entry["same_device_as"] = str(first_on_device[device])
+            else:
+                first_on_device[device] = directory
+                try:
+                    entry |= rw(directory, self.host, self.cfg.rw.gib, self.cfg.rw.max_s, self.cfg.rw.block_mib)
+                except OSError as error:
+                    entry["error"] = str(error)
+            paths[str(directory)] = entry
+        return {"paths": paths, "smart": smart()}

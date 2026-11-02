@@ -1,10 +1,14 @@
-"""Step 2a: $SCRATCH and $PROJECT read throughput, one step each. `python -m healthcheck.scratch` writes the read-test files (`healthcheck.py setup`)."""
+"""Step 2a: shared filesystem read throughput, $SCRATCH and $PROJECT, one step each.
+
+`python -m healthcheck.share` writes the read-test files of the enabled ones (`healthcheck.py setup`).
+"""
 
 import os
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from healthcheck.check import Availability
 from healthcheck.config import Project, Scratch, cfg
 from healthcheck.util.file import JsonDict
 from healthcheck.util.io_throughput import read_throughput
@@ -27,18 +31,31 @@ def write_random(path: Path, size: int, block: int) -> bool:
     return True
 
 
-def collect(base: Path, cfg: Scratch | Project, host: str) -> JsonDict:
-    """Read one of the files written by setup; spread nodes across files to avoid one hot OST set."""
-    if not cfg.enabled:
-        return {"status": Status.SKIPPED}
-    path = file_path(base, zlib.crc32(host.encode()) % cfg.files)
-    if not path.is_file():
-        return {"status": Status.MISSING, "path": str(path)}
-    return {
-        "status": Status.OK,
-        "path": str(path),
-        **read_throughput(path, float("inf"), cfg.read_max_s, cfg.read_block_mib * 2**20, loop=True),
-    }
+class Check:
+    def __init__(self, base: Path, cfg: Scratch | Project, host: str) -> None:
+        self.base = base
+        self.cfg = cfg
+        self.host = host
+
+    @property
+    def enabled(self) -> bool:
+        return self.cfg.enabled
+
+    def available(self) -> Availability:
+        if self.base.is_dir():
+            return Availability(True)
+        return Availability(False, f"{self.base} is not a directory")
+
+    def collect(self) -> JsonDict:
+        """Read one of the files written by setup; spread nodes across files to avoid one hot OST set."""
+        path = file_path(self.base, zlib.crc32(self.host.encode()) % self.cfg.files)
+        if not path.is_file():
+            return {"status": Status.MISSING, "path": str(path)}
+        return {
+            "status": Status.OK,
+            "path": str(path),
+            **read_throughput(path, float("inf"), self.cfg.read_max_s, self.cfg.read_block_mib * 2**20, loop=True),
+        }
 
 
 def write_files(base: Path, cfg: Scratch | Project) -> None:

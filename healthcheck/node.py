@@ -1,62 +1,45 @@
-"""Per-node entry point, one srun task per node: `python -m healthcheck.node {local,watch,finalize}`.
+"""Per-node entry point, one srun task per node: `python -m healthcheck.node {local,finalize}`.
 
 Each node writes only its own <run>/nodes/<host>.json and <run>/numa/<host>.json.
 """
 
 import argparse
-import json
 import os
-import signal
 import threading
 import time
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
-import pynvml
-
-from healthcheck import cpu_load, dcgm, local_tmp, logs, scratch, sysinfo
+from healthcheck import cpu_load, dcgm, local_tmp, logs, share, sysinfo
+from healthcheck.check import step
 from healthcheck.config import cfg
-from healthcheck.util.file import JsonDict, read_json, write_json
-from healthcheck.util.nvml import session
-from healthcheck.util.status import Status, ok
-
-
-def step(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> JsonDict:
-    """Run one check; a crash is recorded rather than propagated, so other checks still report."""
-    start = time.monotonic()
-    try:
-        result = {"status": Status.OK, "data": fn(*args, **kwargs)}
-    except Exception as error:  # noqa: BLE001 - any failure is a node finding
-        result = {"status": Status.ERROR, "error": f"{type(error).__name__}: {error}"}
-    result["elapsed_s"] = round(time.monotonic() - start, 2)
-    return result
+from healthcheck.util.file import read_json, write_json
+from healthcheck.util.status import ok
 
 
 def local() -> None:
     """Steps 1, 2a, 2b, 2c and 3a concurrently; the job's time limit caps them."""
     host = cfg.host.name
-    env = read_json(cfg.paths.env) or {}
     path = cfg.paths.node(host)
     out: dict[str, Any] = {
         "host": host,
         "job_id": os.environ.get("SLURM_JOB_ID"),
         "started": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "env": env,
     }
 
     # cpu_load holds its CPU load until dcgm returns
     gpus_done = threading.Event()
+    checks = {
+        "sysinfo": sysinfo.Check(host, cfg.nic.link_layer),
+        "scratch": share.Check(cfg.paths.base, cfg.scratch, host),
+        "project": share.Check(cfg.paths.project, cfg.project, host),
+        "local_tmp": local_tmp.Check(cfg.local_tmp, host),
+        "dcgm": dcgm.Check(cfg.dcgm, cfg.paths.dcgm_logs(host)),
+        "cpu_load": cpu_load.Check(cfg.cpu_load, gpus_done, sorted(os.sched_getaffinity(0))),
+    }
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {
-            "sysinfo": pool.submit(step, sysinfo.collect, host, cfg.nic.link_layer),
-            "scratch": pool.submit(step, scratch.collect, cfg.paths.base, cfg.scratch, host),
-            "project": pool.submit(step, scratch.collect, cfg.paths.project, cfg.project, host),
-            "local_tmp": pool.submit(step, local_tmp.collect, cfg.local_tmp, host),
-            "dcgm": pool.submit(step, dcgm.collect, cfg.dcgm, env, cfg.paths.dcgm_logs(host)),
-            "cpu_load": pool.submit(step, cpu_load.collect, cfg.cpu_load, gpus_done, sorted(os.sched_getaffinity(0))),
-        }
+        futures = {name: pool.submit(step, check) for name, check in checks.items()}
         futures["dcgm"].add_done_callback(lambda _: gpus_done.set())
         for name, future in futures.items():
             out[name] = future.result()
@@ -68,55 +51,6 @@ def local() -> None:
         write_json(cfg.paths.numa(host), numa_layout)
 
 
-def watch() -> None:
-    """Record NVML Xid events until the stop file appears; this stands in for the root-only kernel log's NVRM lines.
-
-    A stop file rather than a signal: srun answers SIGTERM by killing the step, before "stopped" is written.
-    """
-    if not cfg.logs.xid_watch:
-        return
-    path = cfg.paths.xid(cfg.host.name)
-    stop_file = cfg.paths.xid_stop(os.environ.get("SLURM_JOB_ID", ""))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stop = False
-
-    def on_term(*_: Any) -> None:
-        nonlocal stop
-        stop = True
-
-    signal.signal(signal.SIGTERM, on_term)
-    signal.signal(signal.SIGINT, on_term)
-
-    with open(path, "a", buffering=1) as xid_log:
-
-        def emit(**event: Any) -> None:
-            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-            xid_log.write(json.dumps({"time": stamp, **event}) + "\n")
-
-        with session():
-            events = pynvml.nvmlEventSetCreate()
-            for index in range(pynvml.nvmlDeviceGetCount()):
-                try:
-                    pynvml.nvmlDeviceRegisterEvents(
-                        pynvml.nvmlDeviceGetHandleByIndex(index), pynvml.nvmlEventTypeXidCriticalError, events
-                    )
-                except pynvml.NVMLError as error:
-                    emit(event="error", gpu=index, error=str(error))
-            emit(event="started")
-            while not stop and not stop_file.exists():
-                try:
-                    data = pynvml.nvmlEventSetWait_v2(events, 1000)
-                except pynvml.NVMLError_Timeout:
-                    continue
-                except pynvml.NVMLError as error:
-                    emit(event="error", error=str(error))
-                    time.sleep(1)
-                    continue
-                emit(event="xid", gpu=pynvml.nvmlDeviceGetIndex(data.device), xid=int(data.eventData))
-            emit(event="stopped")
-            pynvml.nvmlEventSetFree(events)
-
-
 def finalize() -> None:
     """Step 4, merged into the node's JSON from phase A."""
     host = cfg.host.name
@@ -124,7 +58,7 @@ def finalize() -> None:
     out = read_json(path) or {"host": host, "job_id": os.environ.get("SLURM_JOB_ID")}
     before = (out.get("sysinfo") or {}).get("data", {}).get("counters")
     since = float(os.environ.get("SLURM_JOB_START_TIME", time.time() - 600))
-    out["logs"] = step(logs.collect, cfg.logs, cfg.paths, host, since, before)
+    out["logs"] = step(logs.Check(cfg.logs, cfg.paths, host, since, before))
     out["finished"] = datetime.now().astimezone().isoformat(timespec="seconds")
     write_json(path, out)
     print(f"{host} logs: {out['logs']['status']} in {out['logs']['elapsed_s']}s")
@@ -132,5 +66,5 @@ def finalize() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=["local", "watch", "finalize"])
-    {"local": local, "watch": watch, "finalize": finalize}[parser.parse_args().phase]()
+    parser.add_argument("phase", choices=["local", "finalize"])
+    {"local": local, "finalize": finalize}[parser.parse_args().phase]()

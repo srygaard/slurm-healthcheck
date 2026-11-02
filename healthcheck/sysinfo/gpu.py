@@ -56,6 +56,17 @@ def _handles() -> list[tuple[int, Any]]:
     return [(index, pynvml.nvmlDeviceGetHandleByIndex(index)) for index in range(pynvml.nvmlDeviceGetCount())]
 
 
+def watts() -> float | None:
+    """Total power draw in watts; None if any GPU can't be read. Call inside session().
+
+    One unsupported device drops the whole reading: a partial sum would look like a lighter load.
+    """
+    try:
+        return round(sum(pynvml.nvmlDeviceGetPowerUsage(handle) for _, handle in _handles()) / 1000)
+    except pynvml.NVMLError:
+        return None
+
+
 @dataclass(frozen=True, kw_only=True)
 class GpuCounters:
     """One GPU's error counters at a point in time; finalize compares a second snapshot against step 1's."""

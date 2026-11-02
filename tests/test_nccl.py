@@ -3,7 +3,9 @@ import time
 from pathlib import Path
 
 from healthcheck import nccl
-from healthcheck.config import Nccl, NcclTest
+from healthcheck.check import Availability
+from healthcheck.config import Nccl, NcclTest, Paths
+from healthcheck.util.cmd import Cmd
 
 ALL_REDUCE = r"""
 # nThread 1 nGpus 1 minBytes 134217728 maxBytes 1073741824 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
@@ -149,6 +151,92 @@ def test_run_round_names_debug_logs_and_removes_empty_ones(tmp_path):
     logs = tmp_path / "nccl"
     logs.mkdir()
     (logs / "intra-b.b.7.log").touch()  # another job's rank, still running
-    nccl.run_round([nccl.Run("intra", ("a",))], Ranks(), tmp_path / "groups", debug_dir=logs)
+    nccl.run_round([nccl.Run("intra", ("a",))], Ranks(), tmp_path / "groups", timeout=30, debug_dir=logs)
     assert sorted(path.name for path in logs.iterdir()) == ["intra-a.a.100.log", "intra-b.b.7.log"]
     assert (logs / "intra-a.a.100.log").read_text() == "NCCL version"
+
+
+def test_mpi_plugin(monkeypatch):
+    def listed(stdout="", stderr="", returncode=0):
+        monkeypatch.setattr(nccl, "run", lambda cmd, **_: Cmd(returncode, stdout, stderr))
+
+    listed("MPI plugin types are...\n\tpmix\n\tpmi2\n\tnone\n")
+    assert nccl.mpi_plugin() == "pmix"
+    listed("\tnone\n\tpmi2\n")
+    assert nccl.mpi_plugin() == "pmi2"
+    listed("srun: MPI types are...\nsrun: none\n")
+    assert nccl.mpi_plugin() == "none"
+    listed("", "srun: pmix\nsrun: pmi2\n")
+    assert nccl.mpi_plugin() == "pmix"  # some srun versions print the list on stderr
+    listed("", "srun: error: MPI plugin pmix not available\n", 1)
+    assert nccl.mpi_plugin() == "none"
+
+
+def _off() -> Nccl:
+    disabled = NcclTest(enabled=False)
+    return Nccl(intra=disabled, loopback=disabled, pair=disabled, group=disabled, alltoall=disabled)
+
+
+def test_available_without_build(monkeypatch, tmp_path):
+    monkeypatch.delenv("HC_NCCL_TESTS", raising=False)
+    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    assert found == Availability(False, "HC_NCCL_TESTS is not set")
+
+
+def test_available_missing_binary(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    monkeypatch.setenv("HC_NCCL_TESTS", str(tmp_path))
+
+    def probed():
+        raise AssertionError("probed")
+
+    monkeypatch.setattr(nccl, "mpi_plugin", probed)
+    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    assert found.available is False
+    assert found.reason == f"missing all_reduce_perf in {build}"
+
+
+def test_available_without_mpi(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "all_reduce_perf").write_bytes(b"")
+    monkeypatch.setenv("HC_NCCL_TESTS", str(tmp_path))
+    monkeypatch.setattr(nccl, "mpi_plugin", lambda: "none")
+    found = nccl.Check(Nccl(), Paths(root=tmp_path), 4).available()
+    assert found == Availability(False, "no MPI plugin")
+
+
+def test_write_unavailable_keeps_mpi_none(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "all_reduce_perf").write_bytes(b"")
+    monkeypatch.setenv("HC_NCCL_TESTS", str(tmp_path))
+    monkeypatch.setenv("SLURM_JOB_ID", "9")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "cn-l001")
+    monkeypatch.setattr(nccl, "mpi_plugin", lambda: "none")
+    check = nccl.Check(Nccl(), Paths(root=tmp_path / "run"), 4)
+    written = check.write_unavailable(check.available())
+    assert written["mpi"] == "none"
+    assert "status" not in written
+    assert (tmp_path / "run" / "groups" / "9.json").is_file()
+
+
+def test_start_skips_when_disabled(monkeypatch, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "all_reduce_perf").write_bytes(b"")
+    (build / "alltoall_perf").write_bytes(b"")
+    monkeypatch.setenv("HC_NCCL_TESTS", str(tmp_path))
+    monkeypatch.setenv("SLURM_JOB_ID", "9")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "cn-l001")
+
+    def probed():
+        raise AssertionError("probed")
+
+    monkeypatch.setattr(nccl, "mpi_plugin", probed)
+    written = nccl.start(nccl.Check(_off(), Paths(root=tmp_path / "run"), 4))
+    assert written["tests"] == []
+    assert "status" not in written
+    assert "mpi" not in written
+    assert written["elapsed_s"] == 0

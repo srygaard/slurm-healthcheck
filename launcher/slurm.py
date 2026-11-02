@@ -90,7 +90,7 @@ def sbatch(script: str, options: Sequence[str], cwd: Path, env: Mapping[str, str
     Submit a job script to SLURM; options override the script's #SBATCH directives. The job starts with this
     environment plus env, before the script's first line: --export=ALL, unlike --export=NAME=value, takes any value.
     """
-    # cwd: job_submit.lua may refuse jobs submitted from /home; a missing cwd also gives 127
+    # cwd: job_submit.lua may refuse jobs submitted from /home; a missing cwd is ExitCode.NOT_FOUND
     command = ["sbatch", "--parsable", "--export=ALL", *options]
     result = run(command, timeout=None, input=script, cwd=cwd, env=os.environ | env)
     try:
@@ -168,22 +168,6 @@ def wait_for(job_ids: list[int], interval: float = 15) -> None:
             print()
             return
         time.sleep(interval)
-
-
-def my_queued(name: str) -> list[int]:
-    """My pending or running jobs named name; [] if squeue fails or isn't installed."""
-    return sorted(job.job_id for job in squeue(["--me", "-n", name]).jobs)
-
-
-def with_dependency(dependency: str | None, job_ids: Sequence[int]) -> str | None:
-    """
-    An sbatch --dependency that also waits for job_ids to succeed; "," means all of them must hold.
-
-    >>> with_dependency("afterany:7", [12, 13])
-    'afterany:7,afterok:12:13'
-    """
-    after = f"afterok:{':'.join(map(str, job_ids))}" if job_ids else None
-    return ",".join(part for part in (dependency, after) if part) or None
 
 
 def sacct_states(job_ids: Sequence[int]) -> dict[int, SacctJob]:

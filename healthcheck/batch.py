@@ -26,7 +26,9 @@ def main() -> int:
 
     # --overlap: the watcher shares CPUs and GPUs with the test steps instead of blocking them.
     # It exits at once unless logs.xid_watch is set.
-    watcher = subprocess.Popen(node_command("watch", "--overlap", "--cpus-per-task=1"))
+    watcher = subprocess.Popen(
+        ["srun", "--ntasks-per-node=1", "--overlap", "--cpus-per-task=1", sys.executable, "-m", "healthcheck.xid"]
+    )
 
     print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm")
     subprocess.run(node_command("local"), check=False)
@@ -34,12 +36,13 @@ def main() -> int:
     print(f"== {datetime.now():%T} B: nccl")
     code = 0
     try:
-        code = nccl.main()
+        # enabled, then available, then collect. Disabled or a missing tool writes the group file and does not launch.
+        nccl.start(nccl.Check(cfg.nccl, cfg.paths, cfg.gpu.count))
     except Exception:  # noqa: BLE001 - the report shows the missing NCCL results
         traceback.print_exc()
         code = 1
 
-    stop_file = cfg.paths.xid_stop(job_id)  # the watcher polls for it each second, see healthcheck.node.watch
+    stop_file = cfg.paths.xid_stop(job_id)  # the watcher polls for it each second, see healthcheck.xid.watch
     stop_file.parent.mkdir(parents=True, exist_ok=True)
     stop_file.touch()
     try:

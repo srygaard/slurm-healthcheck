@@ -8,22 +8,22 @@ the checks (see [Configuration](#configuration)).
 | file | sets | takes effect |
 |------|------|--------------|
 | [healthcheck/config.py](healthcheck/config.py) | thresholds, `homogeneity` keys, DCGM tests, NCCL timeouts, `/tmp` test size | next job; thresholds also on `report <run>` |
-| [slurm/scripts/.env](slurm/scripts/.env) | modules, nccl-tests version, CUDA arch | after `setup` |
+| [slurm/scripts/.drac.env](slurm/scripts/.drac.env), [.mila.env](slurm/scripts/.mila.env) | modules, nccl-tests version, CUDA arch | after `setup` |
 | `healthcheck.py` options | which nodes, how they're grouped into jobs, `--exclude-on` | per command, see [Running](#running) |
 
 Jobs import the code from this checkout, so an edit to `healthcheck/config.py` also reaches jobs that are still
-queued. `$SCRATCH/slurm-healthcheck/env.json` is written by the probe; run `setup` again rather than editing it.
+queued. Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.drac.env`/`.mila.env`.
 
 ## Setup
 
-This starts a quick job to determine what tools are available:
+Build on the login node, which can reach git and PyPI. Each healthcheck job skips DCGM when `dcgmi` is missing, or
+when no hostengine answers and `nv-hostengine` is missing. It skips NCCL when `srun --mpi=list` offers neither
+`pmix` nor `pmi2`.
 
 ```bash
-uv run healthcheck.py setup               # build here (nccl-tests, read-test files, venv), then a probe job
-cat $SCRATCH/slurm-healthcheck/env.json   # probe result: how to run DCGM, which srun --mpi plugin works
+uv run healthcheck.py setup               # nccl-tests, read-test files, venv
 ```
-Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.env`; anything already
-built is skipped.
+Anything already built is skipped.
 
 ## Running
 
@@ -76,8 +76,9 @@ Each node runs three phases:
 ## Off by default
 Turn these on in `healthcheck/config.py`.
 
-- **project** (`project.enabled`): `$PROJECT` read, like scratch, with its own thresholds. `setup` and `run` need
-  `$PROJECT` set; while this is off, `setup` skips its files.
+- **project** (`project.enabled`): `$PROJECT` read, like scratch, with its own thresholds. `$PROJECT` is set in
+  `slurm/scripts/.drac.env` and `.mila.env`. `setup` and `run` need `$PROJECT` set; while this is off, `setup`
+  skips its files.
 - **alltoall** (`nccl.alltoall.enabled`): `alltoall_perf` on the same nodes as the group test, every rank sending
   to every other. Its timeout is 600 s, so extend the template's `#SBATCH --time` first. Alone, with every other
   NCCL test disabled, it runs from two nodes.
@@ -87,8 +88,8 @@ empty after the job. It also compares the `homogeneity` keys across nodes and fl
 majority; with only two nodes, which one counts as the majority is arbitrary.
 
 ## Results
-Every job, setup jobs included, writes to `$SCRATCH/slurm-healthcheck/results/<job_id>/`. A run with several
-jobs shares the directory of its first job:
+Every job writes to `$SCRATCH/slurm-healthcheck/results/<job_id>/`. A run with several jobs shares the directory
+of its first job:
 ```
 results/<job_id>/
   report.txt  report.json            outputs
@@ -96,13 +97,12 @@ results/<job_id>/
   jobs.json                          submitted jobs, with states from sacct
   jobs/<job_id>-{stdout,stderr}.txt  job logs
   switches.json                      leaf switch -> its nodes, written at submit
-  nodes/<host>.json                  per-node results, including the env.json they ran with
+  nodes/<host>.json                  per-node results
   groups/<job_id>.json               NCCL results; raw output in groups/<job_id>/
   logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log), kept only if a rank wrote one
   numa/<host>.json                   per-node NUMA layout table
   xid/<host>.jsonl                   Xid events
 ```
-Setup jobs only have `jobs/`, plus the probe's DCGM and MPI test output.
 
 ## Finding the slow node of a pair
 A bad node slows both of its ring pairs, so in a larger run it fails `nccl.pair` with `2/2 slow pairs` while its
@@ -155,7 +155,7 @@ at 0 and its CPUs at ~65 °C, so only `cpu_load.low_clocks` flags it, not `cpu_l
 - [dmesg](https://man7.org/linux/man-pages/man1/dmesg.1.html) and
   [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html) for kernel log matches.
 - [Environment modules](https://docs.alliancecan.ca/wiki/Utiliser_des_modules/en) ([Lmod](https://lmod.readthedocs.io/))
-  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.env`; see the
+  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.drac.env`; see the
   [Rorqual docs](https://docs.alliancecan.ca/wiki/Rorqual/en).
 
 ## Tests
