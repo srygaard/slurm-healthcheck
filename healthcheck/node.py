@@ -1,5 +1,6 @@
-"""Per-node entry point, one srun task per node: `python -m healthcheck.node {local,finalize}`.
+"""Per-node entry point, one srun task per node: `python -m healthcheck.node {watch_xid,local,finalize}`.
 
+watch_xid is the overlapping Xid thread and stays up for the job. local and finalize are phases A and C.
 Each node writes only its own <run>/nodes/<host>.json and <run>/numa/<host>.json.
 """
 
@@ -11,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
-from healthcheck import cpu_load, dcgm, local_tmp, logs, share, sysinfo
+from healthcheck import cpu_load, dcgm, local_tmp, logs, share, sysinfo, xid
 from healthcheck.check import HealthCheckBase, step
 from healthcheck.config import cfg
 from healthcheck.util.file import read_json, write_json
@@ -76,6 +77,18 @@ def local() -> None:
         write_json(cfg.paths.numa(host), numa_layout)
 
 
+def watch_xid() -> None:
+    """Record NVIDIA Xid errors, the GPU driver's fault codes, until the batch step touches the stop file after NCCL."""
+    if not cfg.logs.xid_watch:
+        return
+    watcher = xid.Watcher()
+    watcher.start()
+    stop_xid = cfg.paths.xid_stop()
+    while not stop_xid.exists():
+        time.sleep(1)
+    watcher.stop()
+
+
 def finalize() -> None:
     """Step 4, merged into the node's JSON from phase A."""
     host = cfg.host.name
@@ -89,7 +102,21 @@ def finalize() -> None:
     print(f"{host} logs: {out['logs']['status']} in {out['logs']['elapsed_s']}s")
 
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=["local", "finalize"])
-    {"local": local, "finalize": finalize}[parser.parse_args().phase]()
+    parser.add_argument("phase", choices=["watch_xid", "local", "finalize"])
+    return parser.parse_args()
+
+
+def main() -> None:
+    phase = parse_args().phase
+    if phase == "watch_xid":
+        watch_xid()
+    elif phase == "local":
+        local()
+    elif phase == "finalize":
+        finalize()
+
+
+if __name__ == "__main__":
+    main()

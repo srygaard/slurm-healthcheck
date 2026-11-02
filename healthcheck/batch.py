@@ -24,12 +24,9 @@ def main() -> int:
     os.chdir(cfg.paths.root)  # the srun steps inherit it
     print(f"== {datetime.now():%T} job {job_id} on {os.environ['SLURM_JOB_NODELIST']}, results in {cfg.paths.root}")
 
-    # --overlap: the watcher shares CPUs and GPUs with the test steps instead of blocking them.
+    # --overlap and one CPU: the watcher shares the node with the test steps instead of blocking them.
     # It exits at once unless logs.xid_watch is set.
-    # TODO: move this to a process.
-    xid_watch = subprocess.Popen(
-        ["srun", "--ntasks-per-node=1", "--overlap", "--cpus-per-task=1", sys.executable, "-m", "healthcheck.xid"]
-    )
+    xid_watch = subprocess.Popen(node_command("watch_xid", "--overlap", "--cpus-per-task=1"))
 
     print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm")
     subprocess.run(node_command("local"), check=False)
@@ -43,9 +40,9 @@ def main() -> int:
         traceback.print_exc()
         code = 1
 
-    stop_file = cfg.paths.xid_stop(job_id)  # the watcher polls for it each second, see healthcheck.xid.watch
-    stop_file.parent.mkdir(parents=True, exist_ok=True)
-    stop_file.touch()
+    stop_xid = cfg.paths.xid_stop()  # the watcher thread stops once this exists
+    stop_xid.parent.mkdir(parents=True, exist_ok=True)
+    stop_xid.touch()
     try:
         xid_watch.wait(timeout=20)
     except subprocess.TimeoutExpired:
