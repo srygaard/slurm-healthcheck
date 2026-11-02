@@ -8,5 +8,5 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --time=00:15:00
 
-source "$HC_CODE/slurm/scripts/.env"
+source "$HC_CODE/slurm/scripts/.drac.env"
 module load $HC_MODULES

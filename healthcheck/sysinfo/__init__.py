@@ -2,6 +2,9 @@
 
 import platform
 
+import pynvml
+
+from healthcheck.check import Availability
 from healthcheck.sysinfo import bios, cpu_power, gpu, job, nic, software, topology
 from healthcheck.util.file import JsonDict, read_sys
 from healthcheck.util.nvml import session
@@ -10,31 +13,49 @@ from healthcheck.util.nvml import session
 NUMA_LAYOUT = "numa_layout"
 
 
-def collect(host: str, link_layer: str) -> JsonDict:
-    """link_layer is the one NCCL's NICs use: the NUMA layout lists those HCAs apart from the rest."""
-    total = topology.total_bytes()
-    placements = topology.placements()
-    nodes = topology.numa_nodes(placements)
-    with session():  # one NVML init for devices(), info() and counters(): slow without persistence mode
-        gpus = gpu.devices()
-        gpu_info = gpu.info()
-        counters = gpu.counters()
-    hcas = nic.hcas()
-    return {
-        "host": host,
-        "kernel": platform.release(),
-        "os_release": software.os_release(),
-        "cmdline": read_sys("/proc/cmdline"),
-        "bios": bios.collect(),
-        "cpu": [socket.to_json() for socket in topology.sockets(placements)],
-        "cpu_power": cpu_power.collect(),
-        "ram_gib": round(total / 2**30, 1) if total else None,
-        "allocation": job.allocation()._asdict(),
-        "numa_nodes": [node.to_json() for node in nodes],
-        "hugepages": topology.meminfo("HugePages_Total"),
-        "gpu": {"count": len(gpus), **gpu_info, "devices": [device.to_json() for device in gpus]},
-        "counters": [snapshot.to_json() for snapshot in counters],
-        "nic": {"ib": [hca.to_json() for hca in hcas], **nic.collect()},
-        "software": software.collect(),
-        NUMA_LAYOUT: topology.numa_layout(nodes, gpus, hcas, link_layer),
-    }
+class Check:
+    def __init__(self, host: str, link_layer: str) -> None:
+        self.host = host
+        self.link_layer = link_layer
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def available(self) -> Availability:
+        """NVML has to initialize: the GPU fields come from it."""
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError as error:
+            return Availability(False, str(error))
+        pynvml.nvmlShutdown()
+        return Availability(True)
+
+    def collect(self) -> JsonDict:
+        """The link layer is the one NCCL's NICs use: the NUMA layout lists those HCAs apart from the rest."""
+        total = topology.total_bytes()
+        placements = topology.placements()
+        nodes = topology.numa_nodes(placements)
+        with session():  # one NVML init for devices(), info() and counters(): slow without persistence mode
+            gpus = gpu.devices()
+            gpu_info = gpu.info()
+            counters = gpu.counters()
+        hcas = nic.hcas()
+        return {
+            "host": self.host,
+            "kernel": platform.release(),
+            "os_release": software.os_release(),
+            "cmdline": read_sys("/proc/cmdline"),
+            "bios": bios.collect(),
+            "cpu": [socket.to_json() for socket in topology.sockets(placements)],
+            "cpu_power": cpu_power.collect(),
+            "ram_gib": round(total / 2**30, 1) if total else None,
+            "allocation": job.allocation()._asdict(),
+            "numa_nodes": [node.to_json() for node in nodes],
+            "hugepages": topology.meminfo("HugePages_Total"),
+            "gpu": {"count": len(gpus), **gpu_info, "devices": [device.to_json() for device in gpus]},
+            "counters": [snapshot.to_json() for snapshot in counters],
+            "nic": {"ib": [hca.to_json() for hca in hcas], **nic.collect()},
+            "software": software.collect(),
+            NUMA_LAYOUT: topology.numa_layout(nodes, gpus, hcas, self.link_layer),
+        }

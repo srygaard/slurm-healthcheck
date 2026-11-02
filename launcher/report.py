@@ -55,6 +55,9 @@ def _step(node: dict[str, Any], name: str, findings: list[Finding]) -> dict[str,
     if result is None:
         findings.append(Finding("fail", name, "not run"))
         return None
+    if result.get("status") == Status.UNAVAILABLE:
+        findings.append(Finding("warn", name, f"{result['status']}: {result.get('error', '')}".strip(": ")))
+        return None
     if not ok(result):
         findings.append(Finding("fail", name, f"{result['status']}: {result.get('error', '')}".strip(": ")))
         return None
@@ -318,6 +321,14 @@ def check_shared_read_median(
 
 def check_nccl(groups: list[dict[str, Any]], cfg: Nccl) -> tuple[dict[str, list[Finding]], dict]:
     out: dict[str, list[Finding]] = defaultdict(list)
+    for group in groups:
+        if group.get("mpi") == "none":
+            for node in group.get("nodes", []):
+                out[node].append(Finding("warn", "nccl", "skipped: no MPI plugin"))
+        elif group.get("status") == Status.UNAVAILABLE:
+            detail = f"unavailable: {group.get('error', '')}".strip(": ")
+            for node in group.get("nodes", []):
+                out[node].append(Finding("warn", "nccl", detail))
     tests = [test for group in groups for test in group["tests"]]
     by_kind = defaultdict(list)
     for test in tests:

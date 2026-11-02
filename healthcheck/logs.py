@@ -4,13 +4,14 @@ Kernel logs need root on most clusters, so the main signals are the NVML Xid wat
 GPU counter deltas and the NCCL debug logs, which a normal user can always read.
 """
 
-import json
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from healthcheck import xid
+from healthcheck.check import Availability
 from healthcheck.config import Logs, Paths
 from healthcheck.sysinfo import gpu
 from healthcheck.util.cmd import run
@@ -69,21 +70,6 @@ def nccl_logs(log_dir: Path, host: str, patterns: list[str]) -> JsonDict:
     return {"files": len(files), "count": len(matches), "matches": matches[:30]}
 
 
-def xid_events(path: Path, ignore: list[int]) -> JsonDict:
-    try:
-        events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    except FileNotFoundError:
-        return {"status": Status.UNAVAILABLE, "error": "watcher wrote nothing"}
-    xids = [event for event in events if event.get("event") == "xid"]
-    errors = [event for event in events if event.get("event") == "error"]
-    return {
-        "status": Status.OK if any(event.get("event") == "started" for event in events) else Status.UNAVAILABLE,
-        "events": [xid for xid in xids if xid["xid"] not in ignore],
-        "ignored": [xid for xid in xids if xid["xid"] in ignore],
-        "errors": errors,
-    }
-
-
 def counter_deltas(before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[str, Any]]) -> list[JsonDict]:
     """Increases in any error counter, plus hardware throttling seen at the end."""
 
@@ -108,18 +94,34 @@ def counter_deltas(before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[
     return deltas
 
 
-def collect(
-    cfg: Logs,
-    run: Paths,
-    host: str,
-    since: float,
-    before: Sequence[Mapping[str, Any]] | None,
-) -> JsonDict:
-    after = [snapshot.to_json() for snapshot in gpu.counters()]
-    return {
-        "kernel": kernel(cfg.kernel_patterns, since),
-        "nccl": nccl_logs(run.nccl_logs, host, cfg.nccl_fail_patterns),
-        "xid": xid_events(run.xid(host), cfg.xid_ignore),
-        "counters": after,
-        "counter_deltas": counter_deltas(before, after) if before else None,
-    }
+class Check:
+    def __init__(
+        self,
+        cfg: Logs,
+        run: Paths,
+        host: str,
+        since: float,
+        before: Sequence[Mapping[str, Any]] | None,
+    ) -> None:
+        self.cfg = cfg
+        self.run = run
+        self.host = host
+        self.since = since
+        self.before = before
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    def available(self) -> Availability:
+        return Availability(True)
+
+    def collect(self) -> JsonDict:
+        after = [snapshot.to_json() for snapshot in gpu.counters()]
+        return {
+            "kernel": kernel(self.cfg.kernel_patterns, self.since),
+            "nccl": nccl_logs(self.run.nccl_logs, self.host, self.cfg.nccl_fail_patterns),
+            "xid": xid.events(self.run.xid(self.host), self.cfg.xid_ignore),
+            "counters": after,
+            "counter_deltas": counter_deltas(self.before, after) if self.before else None,
+        }

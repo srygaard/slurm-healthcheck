@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from healthcheck.util.cmd import Cmd
+from healthcheck.util.cmd import Cmd, ExitCode
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.switches import parse_topology
 from launcher import selection, slurm
@@ -105,16 +105,10 @@ def test_filter_and_group_nodes():
     assert selection.group_nodes("ab", switch_of, selection.JobPer.NODE) == {"a": ("a",), "b": ("b",)}
 
 
-def test_with_dependency():
-    assert slurm.with_dependency(None, []) is None
-    assert slurm.with_dependency("afterok:7", []) == "afterok:7"
-    assert slurm.with_dependency(None, [12]) == "afterok:12"
-
-
 # Rorqual (Slurm 25.11, data_parser v0.0.44), cut down to the fields the parsers read
 SQUEUE_JSON = r"""
 {"jobs": [
- {"job_id": 25034106, "name": "hc-probe", "job_state": ["PENDING"], "state_reason": "Priority",
+ {"job_id": 25034106, "name": "hc-cluster", "job_state": ["PENDING"], "state_reason": "Priority",
   "start_time": {"set": true, "infinite": false, "number": 1793318464}},
  {"job_id": 25035268, "name": "hc-any1", "job_state": ["PENDING"], "state_reason": "Dependency"}
 ], "meta": {"plugin": {"data_parser": "data_parser/v0.0.44"}}}
@@ -179,4 +173,4 @@ def test_sbatch_passes_env(monkeypatch, tmp_path):
 def test_sbatch_without_slurm(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
     result = slurm.sbatch("#!/bin/bash\n", [], tmp_path, {})
-    assert (result.job_id, result.returncode) == (None, 127)
+    assert (result.job_id, result.returncode) == (None, ExitCode.NOT_FOUND)

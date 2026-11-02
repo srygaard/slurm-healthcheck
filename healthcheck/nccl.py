@@ -16,8 +16,10 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from healthcheck.config import Nccl, NcclTest, cfg
-from healthcheck.util.file import Json, read_json, write_json
+from healthcheck.check import Availability
+from healthcheck.config import Nccl, NcclTest, Paths, cfg
+from healthcheck.util.cmd import run
+from healthcheck.util.file import Json, JsonDict, write_json
 from healthcheck.util.hostlist import Hostlist
 from healthcheck.util.status import Status
 
@@ -125,15 +127,15 @@ def run_round(
     tests: list[Run],
     launch: Launch,
     out_dir: Path,
-    timeout: float | None = None,
-    debug_dir: Path | None = None,
+    timeout: float,
+    debug_dir: Path,
 ) -> list[dict[str, Any]]:
     """
-    Run tests concurrently; a straggler past the timeout, if given, is terminated and reported as such.
+    Run tests concurrently; a straggler past timeout is terminated and reported as such.
 
-    With debug_dir, each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and the empty ones of
-    tests that finished are removed after it: at NCCL_DEBUG=WARN a healthy rank writes nothing, rank 0 only the
-    version. A timed-out test's are all kept, since its remote ranks may outlive srun and still be writing.
+    Each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and the empty ones of tests that
+    finished are removed after it: at NCCL_DEBUG=WARN a healthy rank writes nothing, rank 0 only the version. A
+    timed-out test's are all kept, since its remote ranks may outlive srun and still be writing.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
@@ -141,8 +143,7 @@ def run_round(
     for test in tests:
         log = out_dir / f"{test.label}.txt"
         env = os.environ | test.env
-        if debug_dir is not None:
-            env["NCCL_DEBUG_FILE"] = str(debug_dir / f"{test.label}.%h.%p.log")
+        env["NCCL_DEBUG_FILE"] = str(debug_dir / f"{test.label}.%h.%p.log")
         with open(log, "w") as output:
             procs.append(
                 (
@@ -158,7 +159,7 @@ def run_round(
         for index, (_, _, proc) in enumerate(procs):
             if index not in ended and proc.poll() is not None:
                 ended[index] = now
-        if len(ended) == len(procs) or (timeout is not None and now - start >= timeout):
+        if len(ended) == len(procs) or now - start >= timeout:
             break
         time.sleep(0.2)
     results = []
@@ -196,12 +197,11 @@ def run_round(
                 "log": str(log),
             }
         )
-    if debug_dir is not None:
-        # Only this round's finished tests: the run's other jobs share debug_dir, and their ranks may still be writing
-        for index, (test, _, _) in enumerate(procs):
-            for path in debug_dir.glob(f"{test.label}.*.log") if index in ended else ():
-                if path.stat().st_size == 0:
-                    path.unlink(missing_ok=True)
+    # Only this round's finished tests: the run's other jobs share debug_dir, and their ranks may still be writing
+    for index, (test, _, _) in enumerate(procs):
+        for path in debug_dir.glob(f"{test.label}.*.log") if index in ended else ():
+            if path.stat().st_size == 0:
+                path.unlink(missing_ok=True)
     return results
 
 
@@ -239,41 +239,138 @@ def plan(nodes: list[str], settings: Nccl | None = None) -> list[list[Run]]:
     return rounds
 
 
-def main() -> int:
-    results = cfg.paths
-    # srun passes these to every rank; run_round names each rank's debug log, and finalize scans them for warnings
-    results.nccl_logs.mkdir(parents=True, exist_ok=True)
-    os.environ["NCCL_DEBUG"] = cfg.nccl.debug
-    env = read_json(cfg.paths.env) or {}
-    job_id = os.environ["SLURM_JOB_ID"]
-    nodes = list(Hostlist.expand(os.environ["SLURM_JOB_NODELIST"]))
-    # One rank per GPU. Each test names its own binary and arguments.
-    launch = Launch(env.get("mpi", "pmix"), Path(env["nccl_tests"]), cfg.gpu.count)
-    start = time.monotonic()
-    finished: list[dict[str, Any]] = []
-    rounds = plan(nodes)
-    out: dict[str, Json] = {
-        "job_id": job_id,
-        "nodes": nodes,
-        "mpi": launch.mpi,
-        "kinds": list(dict.fromkeys(tests[0].kind for tests in rounds if tests)),
-        "tests": finished,
-    }
-    if not rounds:
-        out["elapsed_s"] = 0
-        write_json(results.group(job_id), out)
-        print(f"nccl: nothing to run ({len(nodes)} node(s))")
-        return 0
-    for tests in rounds:
-        finished += run_round(tests, launch, results.group_logs(job_id), tests[0].test.timeout_s, results.nccl_logs)
-        out["elapsed_s"] = round(time.monotonic() - start, 1)  # the phase's wall time; a round's tests overlap
-        write_json(results.group(job_id), out)  # after each round, in case the job is killed
-        print(
-            f"nccl {tests[0].kind}: "
-            + ", ".join(
-                f"{result['nodes'][0]}={result['peak_busbw']}({result['status']})" for result in finished[-len(tests) :]
-            ),
+def mpi_plugin() -> str:
+    """The srun --mpi plugin to use: pmix if listed, else pmi2, else none.
+
+    No plugin skips NCCL. An attempt would default to pmix and fail, while the other phases still run.
+    """
+    out = run(["srun", "--mpi=list"], timeout=30)
+    if out.returncode:
+        return "none"
+    listed = set(re.findall(r"\b(pmix|pmi2)\b", f"{out.stdout}\n{out.stderr}"))
+    for name in ("pmix", "pmi2"):
+        if name in listed:
+            return name
+    return "none"
+
+
+class Check:
+    def __init__(self, settings: Nccl, paths: Paths, ranks: int) -> None:
+        self.settings = settings
+        self.paths = paths
+        self.ranks = ranks
+        self._mpi: str | None = None
+        self._build: Path | None = None
+
+    def _tests(self) -> tuple[NcclTest, ...]:
+        settings = self.settings
+        return (settings.intra, settings.loopback, settings.pair, settings.group, settings.alltoall)
+
+    @property
+    def enabled(self) -> bool:
+        return any(test.enabled for test in self._tests())
+
+    def available(self) -> Availability:
+        """The nccl-tests build for every enabled kind, and an srun MPI plugin."""
+        root = os.environ.get("HC_NCCL_TESTS")
+        if not root:
+            return Availability(False, "HC_NCCL_TESTS is not set")
+        build = Path(root) / "build"
+        self._build = build
+        missing = list(
+            dict.fromkeys(
+                test.binary for test in self._tests() if test.enabled and not (build / test.binary).is_file()
+            )
         )
+        if missing:
+            return Availability(False, f"missing {', '.join(missing)} in {build}")
+        self._mpi = mpi_plugin()
+        if self._mpi == "none":
+            return Availability(False, "no MPI plugin")
+        return Availability(True)
+
+    def _job(self) -> tuple[str, list[str]]:
+        return os.environ["SLURM_JOB_ID"], list(Hostlist.expand(os.environ["SLURM_JOB_NODELIST"]))
+
+    def _save(self, out: dict[str, Json]) -> None:
+        self.paths.nccl_logs.mkdir(parents=True, exist_ok=True)
+        write_json(self.paths.group(str(out["job_id"])), out)
+
+    def write_skipped(self) -> JsonDict:
+        """The group file when every kind is disabled. No plugin probe and no launch."""
+        job_id, nodes = self._job()
+        out: dict[str, Json] = {"job_id": job_id, "nodes": nodes, "kinds": [], "tests": [], "elapsed_s": 0}
+        self._save(out)
+        print(f"nccl: nothing to run ({len(nodes)} node(s))")
+        return out
+
+    def write_unavailable(self, found: Availability) -> JsonDict:
+        """The group file when the tool is missing. A missing MPI plugin keeps the report's mpi=none warning."""
+        job_id, nodes = self._job()
+        out: dict[str, Json] = {"job_id": job_id, "nodes": nodes, "kinds": [], "tests": [], "elapsed_s": 0}
+        if self._mpi == "none":
+            out["mpi"] = "none"
+            message = "skipped, no MPI plugin"
+        else:
+            out["status"] = Status.UNAVAILABLE
+            out["error"] = found.reason
+            message = f"unavailable, {found.reason}"
+        self._save(out)
+        print(f"nccl: {message} ({len(nodes)} node(s))")
+        return out
+
+    def collect(self) -> JsonDict:
+        results = self.paths
+        # srun passes these to every rank; run_round names each rank's debug log, and finalize scans them for warnings
+        results.nccl_logs.mkdir(parents=True, exist_ok=True)
+        os.environ["NCCL_DEBUG"] = self.settings.debug
+        job_id, nodes = self._job()
+        # No plugin means no rounds: one empty result either way, and the report warns when mpi is none.
+        mpi = self._mpi if self._mpi is not None else mpi_plugin()
+        rounds = [] if mpi == "none" else plan(nodes, self.settings)
+        finished: list[dict[str, Any]] = []
+        out: dict[str, Json] = {
+            "job_id": job_id,
+            "nodes": nodes,
+            "mpi": mpi,
+            "kinds": list(dict.fromkeys(tests[0].kind for tests in rounds if tests)),
+            "tests": finished,
+        }
+        if not rounds:
+            out["elapsed_s"] = 0
+            write_json(results.group(job_id), out)
+            print(f"nccl: {'skipped, no MPI plugin' if mpi == 'none' else 'nothing to run'} ({len(nodes)} node(s))")
+            return out
+        # One rank per GPU. Each test names its own binary and arguments.
+        build = self._build if self._build is not None else Path(os.environ["HC_NCCL_TESTS"]) / "build"
+        launch = Launch(mpi, build, self.ranks)
+        started = time.monotonic()
+        for tests in rounds:
+            finished += run_round(tests, launch, results.group_logs(job_id), tests[0].test.timeout_s, results.nccl_logs)
+            out["elapsed_s"] = round(time.monotonic() - started, 1)  # the phase's wall time; a round's tests overlap
+            write_json(results.group(job_id), out)  # after each round, in case the job is killed
+            print(
+                f"nccl {tests[0].kind}: "
+                + ", ".join(
+                    f"{result['nodes'][0]}={result['peak_busbw']}({result['status']})"
+                    for result in finished[-len(tests) :]
+                ),
+            )
+        return out
+
+
+def start(check: Check) -> JsonDict:
+    """Skip a disabled check, record a missing tool, or collect. Writes the group file either way."""
+    if not check.enabled:
+        return check.write_skipped()
+    found = check.available()
+    if not found.available:
+        return check.write_unavailable(found)
+    return check.collect()
+
+
+def main() -> int:
+    start(Check(cfg.nccl, cfg.paths, cfg.gpu.count))
     return 0
 
 

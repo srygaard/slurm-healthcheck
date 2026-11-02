@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pynvml
 
+from healthcheck.check import Availability
 from healthcheck.config import CpuLoad
+from healthcheck.sysinfo.gpu import watts
 from healthcheck.sysinfo.topology import cpulist
 from healthcheck.util.file import JsonDict, read_sys
 from healthcheck.util.nvml import session
@@ -71,15 +73,6 @@ def throttle_count(root: Path = Path("/sys/devices/system/cpu")) -> int:
     return sum(int(value) for path in paths if (value := read_sys(path)))
 
 
-def gpu_watts() -> float | None:
-    """The GPUs' total power draw; None if NVML can't read it."""
-    try:
-        handles = [pynvml.nvmlDeviceGetHandleByIndex(index) for index in range(pynvml.nvmlDeviceGetCount())]
-        return round(sum(pynvml.nvmlDeviceGetPowerUsage(handle) for handle in handles) / 1000)
-    except pynvml.NVMLError:
-        return None
-
-
 def _mean(values: list[float]) -> float | None:
     return round(statistics.mean(values)) if values else None
 
@@ -114,49 +107,60 @@ def summarize(samples: list[JsonDict], cfg: CpuLoad) -> JsonDict:
     }
 
 
-def collect(cfg: CpuLoad, gpus_done: threading.Event, cpus: list[int]) -> JsonDict:
-    """Hold the load until gpus_done is set; cpus are the job's, os.sched_getaffinity(0).
+class Check:
+    def __init__(self, cfg: CpuLoad, gpus_done: threading.Event, cpus: list[int]) -> None:
+        self.cfg = cfg
+        self.gpus_done = gpus_done
+        self.cpus = cpus
 
-    The burners run at SCHED_IDLE, so the other phase A steps, DCGM and the Xid watcher never wait for a CPU.
-    A hung dcgm holds phase A until the job's time limit anyway, and Slurm then kills the burners with the step.
-    """
-    if not cfg.enabled:
-        return {"status": Status.SKIPPED}
-    busy = spread(sorted(cpus), cfg.busy_frac)
-    throttles_before = throttle_count()
-    burners = []
-    samples = []
-    start = time.monotonic()
-    try:
-        for cpu in busy:
-            burners.append(start_burner(cpu))
-        with contextlib.ExitStack() as nvml:
-            with contextlib.suppress(pynvml.NVMLError):  # gpu_w is None without a driver
-                nvml.enter_context(session())
-            while not gpus_done.is_set():
-                mhz = cpu_mhz()
-                samples.append(
-                    {
-                        "t_s": round(time.monotonic() - start, 1),
-                        "busy_mhz": _mean([mhz[cpu] for cpu in busy if cpu in mhz]),
-                        "idle_mhz": _mean([mhz[cpu] for cpu in cpus if cpu in mhz and cpu not in busy]),
-                        "gpu_w": gpu_watts(),
-                    }
-                )
-                gpus_done.wait(cfg.interval_s)
-    finally:
-        for burner in burners:
-            burner.kill()
-        for burner in burners:
-            burner.wait()
-    held_s = round(time.monotonic() - start, 1)
-    if held_s < cfg.min_full_power_s:  # dcgm skipped or failed early: too short to judge
-        return {"status": Status.SKIPPED, "held_s": held_s, "reason": f"dcgm returned after {held_s} s"}
-    return {
-        "status": Status.OK,
-        "busy_cpus": cpulist(busy),
-        "held_s": held_s,
-        **summarize(samples, cfg),
-        "throttle_delta": throttle_count() - throttles_before,
-        "samples": samples,
-    }
+    @property
+    def enabled(self) -> bool:
+        return self.cfg.enabled
+
+    def available(self) -> Availability:
+        return Availability(True)
+
+    def collect(self) -> JsonDict:
+        """Hold the load until gpus_done is set; cpus are the job's, os.sched_getaffinity(0).
+
+        The burners run at SCHED_IDLE, so the other phase A steps, DCGM and the Xid watcher never wait for a CPU.
+        They stop when dcgm returns; its own timeout ends a hang.
+        """
+        busy = spread(sorted(self.cpus), self.cfg.busy_frac)
+        throttles_before = throttle_count()
+        burners = []
+        samples = []
+        start = time.monotonic()
+        try:
+            for cpu in busy:
+                burners.append(start_burner(cpu))
+            with contextlib.ExitStack() as nvml:
+                with contextlib.suppress(pynvml.NVMLError):  # gpu_w is None without a driver
+                    nvml.enter_context(session())
+                while not self.gpus_done.is_set():
+                    mhz = cpu_mhz()
+                    samples.append(
+                        {
+                            "t_s": round(time.monotonic() - start, 1),
+                            "busy_mhz": _mean([mhz[cpu] for cpu in busy if cpu in mhz]),
+                            "idle_mhz": _mean([mhz[cpu] for cpu in self.cpus if cpu in mhz and cpu not in busy]),
+                            "gpu_w": watts(),
+                        }
+                    )
+                    self.gpus_done.wait(self.cfg.interval_s)
+        finally:
+            for burner in burners:
+                burner.kill()
+            for burner in burners:
+                burner.wait()
+        held_s = round(time.monotonic() - start, 1)
+        if held_s < self.cfg.min_full_power_s:  # dcgm skipped or failed early: too short to judge
+            return {"status": Status.SKIPPED, "held_s": held_s, "reason": f"dcgm returned after {held_s} s"}
+        return {
+            "status": Status.OK,
+            "busy_cpus": cpulist(busy),
+            "held_s": held_s,
+            **summarize(samples, self.cfg),
+            "throttle_delta": throttle_count() - throttles_before,
+            "samples": samples,
+        }
