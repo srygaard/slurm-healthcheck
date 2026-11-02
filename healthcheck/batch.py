@@ -26,7 +26,8 @@ def main() -> int:
 
     # --overlap: the watcher shares CPUs and GPUs with the test steps instead of blocking them.
     # It exits at once unless logs.xid_watch is set.
-    watcher = subprocess.Popen(
+    # TODO: move this to a process.
+    xid_watch = subprocess.Popen(
         ["srun", "--ntasks-per-node=1", "--overlap", "--cpus-per-task=1", sys.executable, "-m", "healthcheck.xid"]
     )
 
@@ -46,9 +47,9 @@ def main() -> int:
     stop_file.parent.mkdir(parents=True, exist_ok=True)
     stop_file.touch()
     try:
-        watcher.wait(timeout=20)
+        xid_watch.wait(timeout=20)
     except subprocess.TimeoutExpired:
-        watcher.terminate()
+        xid_watch.terminate()
 
     print(f"== {datetime.now():%T} C: logs")
     subprocess.run(node_command("finalize"), check=False)
