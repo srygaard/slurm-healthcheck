@@ -451,12 +451,12 @@ def start(check: HealthCheck) -> JsonDict:
 
 def main() -> int:
     try:
-        script = JobTemplate.load()
+        gres = JobTemplate.load().gres
+        if gres is None:
+            raise ValueError("job template has no --gpus-per-node")
     except ValueError as error:
         raise SystemExit(error) from error
-    if script.gres is None:
-        raise SystemExit("job template has no --gpus-per-node")
-    start(HealthCheck(cfg.nccl, cfg.paths, script.gres.count))
+    start(HealthCheck(cfg.nccl, cfg.paths, gres.count))
     return 0
 
 

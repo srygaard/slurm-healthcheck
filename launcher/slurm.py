@@ -75,10 +75,18 @@ class JobTemplate:
         raw = self.directives.get("gpus-per-node")
         if not raw:
             return None
+        # Unsupported: gpu:h100:4, gpu:4, h100:4(S:0-1), a comma list (gpu:h100:4,mps:100),
+        # and a GPU requested only as --gres=gpu:h100:4, --gpus=h100:4, -G h100:4,
+        # --gpus-per-task, or --gpus-per-socket. #SBATCH --gpus-per-node h100:4 (no "=") is also missed.
         name, sep, count = raw.partition(":")
+        token = count if sep else name
+        try:
+            parsed = int(token)
+        except ValueError:
+            raise ValueError(f"invalid --gpus-per-node count in {raw}") from None
         if not sep:
-            return Gres(None, int(name))
-        return Gres(name, int(count))
+            return Gres(None, parsed)
+        return Gres(name, parsed)
 
     @property
     def time(self) -> str | None:

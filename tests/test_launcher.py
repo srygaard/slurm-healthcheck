@@ -218,6 +218,13 @@ def test_job_template_load(monkeypatch, tmp_path):
         slurm.JobTemplate.load(tmp_path)
 
 
+def test_job_template_gres_count_must_be_int():
+    with pytest.raises(ValueError, match="invalid --gpus-per-node count in h100:abc"):
+        slurm.JobTemplate("#SBATCH --gpus-per-node=h100:abc\n").gres
+    with pytest.raises(ValueError, match="invalid --gpus-per-node count in abc"):
+        slurm.JobTemplate("#SBATCH --gpus-per-node=abc\n").gres
+
+
 def test_job_template_constraint_must_be_and():
     with pytest.raises(ValueError, match="Only AND constraints"):
         slurm.JobTemplate("#SBATCH --constraint=h100|b200\n").constraint

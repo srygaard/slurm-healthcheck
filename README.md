@@ -5,9 +5,11 @@ Each job takes about four minutes, and the result is an `#SBATCH --exclude=` lin
 the checks (see [Configuration](#configuration)).
 
 ## Configuration
+
 | file | sets | takes effect |
 |------|------|--------------|
 | [healthcheck/config.py](healthcheck/config.py) | thresholds, `homogeneity` keys, DCGM tests, NCCL timeouts, `/tmp` test size | next job; thresholds also on `report <run>` |
+| [slurm/templates/*.sh](slurm/templates/) | GPU and count via `--gpus-per-node`: `h100:4` on Fir, Rorqual, Tamia and Trillium; `l40s:4` on Mila | next job; `report` grades that chip |
 | [slurm/scripts/.drac.env](slurm/scripts/.drac.env), [.mila.env](slurm/scripts/.mila.env) | modules, nccl-tests version, CUDA arch | after `setup` |
 | `healthcheck.py` options | which nodes, how they're grouped into jobs, `--exclude-on` | per command, see [Running](#running) |
 
@@ -40,6 +42,7 @@ uv run healthcheck.py run --dependency afterok:12345           # sbatch --depend
 uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>                         # re-evaluate a finished run
 uv run healthcheck.py report --exclude-on fail,warn $SCRATCH/slurm-healthcheck/results/<job_id>  # also exclude nodes that only warn
 ```
+
 The job template's `#SBATCH` lines also decide the eligible nodes: exactly `gpu:<--gpus-per-node>` in
 `sinfo %G` (so no MIG or partial-GPU nodes), all the `--constraint` features, in the `--partition` if set, and in
 `USABLE_STATES` (launcher/selection.py). Trillium's fabric is non-blocking and Slurm has no switch topology there,

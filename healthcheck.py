@@ -13,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from healthcheck.config import Paths, cfg, gpu_gres
+from healthcheck.config import Paths, cfg, gpu_limits
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.switches import node_switches
@@ -113,11 +113,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         script = JobTemplate.load()
+        gres, _limits = gpu_limits(script.gres)
     except ValueError as error:
         raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
-    gres = script.gres
-    if gres is None or gres.name is None:
-        raise SystemExit(f"{Ansi.RED}job template has no named --gpus-per-node{Ansi.RESET}")
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
         switch_of: ByHost[str] = {}
@@ -213,18 +211,15 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
         switch_of |= {node: topo.get(node, "unknown") for node in missing}
 
     try:
-        script = JobTemplate.load()
+        gres, limits = gpu_limits(JobTemplate.load().gres)
     except ValueError as error:
         raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
-    gres = script.gres
-    if gres is None or gres.name is None:
-        raise SystemExit(f"{Ansi.RED}job template has no named --gpus-per-node{Ansi.RESET}")
     result, exclude, include = report.write(
         run.root,
         cfg,
         switch_of,
         exclude_on,
-        gpu_gres[gres.name],
+        limits,
         gres.count,
     )
     print(report.format_text(result))

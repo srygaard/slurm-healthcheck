@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from launcher.slurm import Gres
+
 
 class Section(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -37,6 +39,17 @@ gpu_gres: dict[str, GpuLimits] = {
     "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
     "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0),
 }
+
+
+def gpu_limits(gres: Gres | None) -> tuple[Gres, GpuLimits]:
+    """The named `--gpus-per-node` and its limits. ValueError when it is missing or not a known chip."""
+    if gres is None or gres.name is None:
+        raise ValueError("job template has no named --gpus-per-node")
+    try:
+        return gres, gpu_gres[gres.name]
+    except KeyError:
+        known = ", ".join(sorted(gpu_gres))
+        raise ValueError(f"unknown GPU type {gres.name}; expected one of {known}") from None
 
 
 class Nic(Section):
