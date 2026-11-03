@@ -11,6 +11,7 @@ from datetime import datetime
 
 from healthcheck import nccl
 from healthcheck.config import cfg
+from launcher.slurm import JobTemplate
 
 
 def node_command(command: str, *srun_args: str) -> list[str]:
@@ -34,8 +35,14 @@ def main() -> int:
     print(f"== {datetime.now():%T} B: nccl")
     code = 0
     try:
+        script = JobTemplate.load()
+    except ValueError as error:
+        raise SystemExit(error) from error
+    if script.gres is None:
+        raise SystemExit("job template has no --gpus-per-node")
+    try:
         # enabled, then available, then collect. Disabled or a missing tool writes the group file and does not launch.
-        nccl.start(nccl.HealthCheck(cfg.nccl, cfg.paths, cfg.gpu.count))
+        nccl.start(nccl.HealthCheck(cfg.nccl, cfg.paths, script.gres.count))
     except Exception:  # noqa: BLE001 - the report shows the missing NCCL results
         traceback.print_exc()
         code = 1

@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 from collections import Counter
@@ -14,12 +13,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from healthcheck.config import Paths, cfg, directives, gpu_from_template, template_file, template_stem
+from healthcheck.config import Paths, cfg, gpu_gres
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
-from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue
+from launcher.slurm import JobTemplate, detect_cluster, sacct_states, sbatch, squeue
 
 REPO = Path(__file__).parent
 
@@ -53,8 +52,6 @@ def job_env(base: Path, run_id: int | None, extra: Mapping[str, object] | None =
     """Variables every job gets, plus extra; the templates and healthcheck read them."""
     env: dict[str, object] = {"HC_BASE": base, "HC_VENV": venv_dir(base), "HC_CODE": REPO, "PYTHONPATH": REPO}
     env["HC_CLUSTER"] = detect_cluster() or ""
-    if stem := template_stem():  # the job's cfg reads the same template this submission used
-        env["HC_TEMPLATE"] = stem
     if run_id:
         env["HC_RUN_ID"] = run_id
     env.update(extra or {})
@@ -72,37 +69,21 @@ def sbatch_options(base: Path, label: str, run_id: int | None) -> list[str]:
     return [f"--job-name=hc-{label}", f"--output={logs}/%j-stdout.txt", f"--error={logs}/%j-stderr.txt"]
 
 
-def template() -> str:
-    """slurm/templates/<stem>.sh. $HC_TEMPLATE overrides the cluster name, for example trillium.b200."""
-    path = template_file(REPO / "slurm" / "templates")
-    if path is None:
-        known = ", ".join(sorted(found.stem for found in (REPO / "slurm" / "templates").glob("*.sh")))
-        raise SystemExit(
-            f"{Ansi.RED}No job template for {template_stem() or '?'}: "
-            f"set $HC_TEMPLATE or $CC_CLUSTER to one of {known}{Ansi.RESET}"
-        )
-    return path.read_text()
-
-
-def sbatch_directives() -> dict[str, str]:
-    """The healthcheck template's `#SBATCH --option=value` lines as {option: value}."""
-    return directives(template())
-
-
 def submit(
+    script: JobTemplate,
     command: str,
     base: Path,
     label: str,
     options: Sequence[str] = (),
     run_id: int | None = None,
 ) -> int | None:
-    """sbatch the cluster's template followed by command, printing why a submission failed.
+    """sbatch script followed by command, printing why a submission failed.
 
     The job logs to results/<run_id or its own job id>/jobs/.
     """
     options = [*sbatch_options(base, label, run_id), *options]
-    script = f"{template().rstrip()}\n\n{command}\n"
-    result = sbatch(script, options, cwd=base, env=job_env(base, run_id))
+    body = f"{script.text.rstrip()}\n\n{command}\n"
+    result = sbatch(body, options, cwd=base, env=job_env(base, run_id))
     if not result.job_id:
         print(f"{Ansi.RED}{result.stderr or result.stdout}{Ansi.RESET}")
         return None
@@ -130,6 +111,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not venv.is_dir():
         raise SystemExit(f"{Ansi.RED}Missing {venv}: run `uv run healthcheck.py setup` first{Ansi.RESET}")
 
+    try:
+        script = JobTemplate.load()
+    except ValueError as error:
+        raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
+    gres = script.gres
+    if gres is None or gres.name is None:
+        raise SystemExit(f"{Ansi.RED}job template has no named --gpus-per-node{Ansi.RESET}")
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
         switch_of: ByHost[str] = {}
@@ -137,16 +125,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"Submitting 1 job on any {args.any} free node(s)")
     else:
         # The nodes the template's jobs can run on
-        directives = sbatch_directives()
-        constraint = directives.get("constraint", "")
-        if re.search(r"[|\[\]*()]", constraint):
-            raise SystemExit(f"{Ansi.RED}Only AND constraints (a&b) can select nodes, not {constraint}{Ansi.RESET}")
+        try:
+            features = script.constraint
+        except ValueError as error:
+            raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
         selected, skipped = selection.select_nodes(
-            selection.sinfo_nodes(directives.get("partition")),
-            f"gpu:{directives['gpus-per-node']}",
-            constraint.split("&") if constraint else [],
+            selection.sinfo_nodes(script.directives.get("partition")),
+            f"gpu:{gres}",
+            features,
             # A MAINT reservation's nodes show as maint; the template's --reservation can still run on them
-            selection.USABLE_STATES | ({"maint"} if "reservation" in directives else set()),
+            selection.USABLE_STATES | ({"maint"} if script.reservation else set()),
         )
         if skipped:
             states = Counter(node.state for node in skipped)
@@ -180,10 +168,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         options = [f"--nodes={len(members) or args.any}"]
         options += [f"--nodelist={members}"] if members else []
         options += [f"--dependency={args.dependency}"] if args.dependency else []
-        if job_id := submit('exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
+        if job_id := submit(script, 'exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
             job = {"job_id": job_id, "label": label, "nodes": members}
-            if stem := template_stem():  # report grades the run with this template, not whichever is current
-                job["template"] = stem
             jobs.append(job)
     if not jobs:
         print(f"Submitted 0/{len(groups)} jobs")
@@ -226,9 +212,21 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
         topo = node_switches()
         switch_of |= {node: topo.get(node, "unknown") for node in missing}
 
-    stem = next((job["template"] for job in jobs if job.get("template")), None)
-    report_cfg = cfg.model_copy(update={"gpu": gpu_from_template(stem=stem)}) if stem else cfg
-    result, exclude, include = report.write(run.root, report_cfg, switch_of, exclude_on)
+    try:
+        script = JobTemplate.load()
+    except ValueError as error:
+        raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
+    gres = script.gres
+    if gres is None or gres.name is None:
+        raise SystemExit(f"{Ansi.RED}job template has no named --gpus-per-node{Ansi.RESET}")
+    result, exclude, include = report.write(
+        run.root,
+        cfg,
+        switch_of,
+        exclude_on,
+        gpu_gres[gres.name],
+        gres.count,
+    )
     print(report.format_text(result))
     color = Ansi.RED if "--exclude" in exclude else Ansi.GREEN
     print(f"{color}{exclude}{Ansi.RESET}{include}")

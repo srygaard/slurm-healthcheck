@@ -5,27 +5,21 @@ calibrate them from the medians in report.txt after a first `--job-per switch` r
 """
 
 import os
-import re
 import socket
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from launcher.slurm import detect_cluster
 
 
 class Section(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-_SBATCH = re.compile(r"^#SBATCH\s+--([\w-]+)=(\S+)", re.MULTILINE)
-
-
 @dataclass(frozen=True, kw_only=True)
 class GpuLimits:
-    """The Gpu fields that describe the part rather than a measured floor. count comes from --gpus-per-node."""
+    """The GPU fields that describe the part rather than a measured floor. The count comes from JobTemplate."""
 
     require_ecc: bool
     min_pcie_gen: int  # max link gen (current gen drops at idle)
@@ -43,46 +37,6 @@ gpu_gres: dict[str, GpuLimits] = {
     "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
     "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0),
 }
-
-
-def directives(text: str) -> dict[str, str]:
-    """`#SBATCH --option=value` lines. The value ends at the first space, so a trailing comment is left out.
-
-    >>> directives("#SBATCH --gpus-per-node=b200:8\\n#SBATCH --time=00:30:00\\n")
-    {'gpus-per-node': 'b200:8', 'time': '00:30:00'}
-    """
-    return dict(_SBATCH.findall(text))
-
-
-def gpu_count(gpus_per_node: str) -> int:
-    """Trailing GPU count of a `--gpus-per-node` value.
-
-    >>> gpu_count("b200:8"), gpu_count("h100:4"), gpu_count("l40s:4"), gpu_count("4")
-    (8, 4, 4, 4)
-    """
-    return int(gpus_per_node.rsplit(":", 1)[-1])
-
-
-def chip_limits(gpus_per_node: str) -> GpuLimits | None:
-    """The named chip's limits. A bare count, or an unknown name, has none."""
-    name, sep, _count = gpus_per_node.partition(":")
-    return gpu_gres.get(name) if sep else None
-
-
-_H100 = gpu_gres["h100"]
-
-
-class Gpu(Section):
-    """Defaults are the h100 GRES. Another `--gpus-per-node` type, such as l40s, replaces them from gpu_gres."""
-
-    count: int = 4  # also the nccl-tests ranks per node
-    require_ecc: bool = _H100.require_ecc
-    max_volatile_uncorrected_ecc: int = _H100.max_volatile_uncorrected_ecc
-    max_remap_failures: int = _H100.max_remap_failures
-    max_remap_pending: int = _H100.max_remap_pending
-    min_pcie_gen: int = _H100.min_pcie_gen  # max link gen (current gen drops at idle)
-    min_pcie_width: int = _H100.min_pcie_width
-    min_nvlinks: int = _H100.min_nvlinks
 
 
 class Nic(Section):
@@ -358,56 +312,7 @@ class Paths(Section):
         return self.root / "logs" / "dcgm" / host
 
 
-TEMPLATES = Path(__file__).resolve().parents[1] / "slurm" / "templates"
-
-
-def gpu_for(gpus_per_node: str | None) -> Gpu:
-    """GPU settings for one `--gpus-per-node` value.
-
-    Gpu() is the h100 GRES. A known chip replaces those limits; a missing directive keeps Gpu().
-
-    >>> gpu_for("b200:8").count
-    8
-    >>> gpu_for("h100:4").count
-    4
-    >>> gpu_for("l40s:4").min_nvlinks
-    0
-    >>> gpu_for(None) == Gpu()
-    True
-    """
-    if not gpus_per_node:
-        return Gpu()
-    limits = chip_limits(gpus_per_node)
-    fields = asdict(limits) if limits else {}
-    return Gpu(count=gpu_count(gpus_per_node), **fields)
-
-
-def template_stem() -> str | None:
-    """`$HC_TEMPLATE` (for example trillium.b200), or else the cluster name."""
-    if name := os.environ.get("HC_TEMPLATE", "").strip():
-        return name
-    return detect_cluster()
-
-
-def template_file(directory: Path = TEMPLATES, stem: str | None = None) -> Path | None:
-    """The template path for stem, or for template_stem() when stem is omitted. None if that file is absent."""
-    name = template_stem() if stem is None else stem
-    if not name:
-        return None
-    path = directory / f"{name}.sh"
-    return path if path.is_file() else None
-
-
-def gpu_from_template(directory: Path = TEMPLATES, stem: str | None = None) -> Gpu:
-    """That template's `--gpus-per-node`, or Gpu() when this host has no such template."""
-    path = template_file(directory, stem)
-    if path is None:
-        return Gpu()
-    return gpu_for(directives(path.read_text()).get("gpus-per-node"))
-
-
 class Config(Section):
-    gpu: Gpu = Gpu()
     nic: Nic = Nic()
     scratch: Scratch = Scratch()
     project: Project = Project()
@@ -421,4 +326,4 @@ class Config(Section):
     paths: Paths = Paths()
 
 
-cfg = Config(gpu=gpu_from_template())
+cfg = Config()

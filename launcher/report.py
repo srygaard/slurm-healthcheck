@@ -8,14 +8,20 @@ from typing import Any
 
 from healthcheck import nccl
 from healthcheck.check import Finding
-from healthcheck.config import Config, Paths
+from healthcheck.config import Config, GpuLimits, Paths
 from healthcheck.node import STEPS
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 
 
-def evaluate(run: Path, cfg: Config, switch_of: ByHost[str]) -> dict[str, Any]:
-    """switch_of maps every node the run targeted to its leaf switch."""
+def evaluate(
+    run: Path,
+    cfg: Config,
+    switch_of: ByHost[str],
+    gpu: GpuLimits,
+    gpus: int,
+) -> dict[str, Any]:
+    """switch_of maps every node the run targeted to its leaf switch. gpu and gpus come from its template."""
     layout = Paths(root=run)
     jobs = read_json(layout.jobs) or []
     job_of = {node: job for job in jobs for node in job["nodes"]}
@@ -54,9 +60,9 @@ def evaluate(run: Path, cfg: Config, switch_of: ByHost[str]) -> dict[str, Any]:
 
     medians: dict[str, float | None] = {}
     for name, check in STEPS.items():
-        # sysinfo reads the GPU, NIC, and homogeneity sections; every other step's section is named after it
+        # sysinfo reads the template's GPU limits, plus the NIC and homogeneity sections
         if name == "sysinfo":
-            result = check.report(results[name], cfg.gpu, cfg.nic, cfg.homogeneity)
+            result = check.report(results[name], gpu, cfg.nic, cfg.homogeneity, gpus)
         else:
             result = check.report(results[name], getattr(cfg, name), name)
         medians |= result.medians
@@ -146,9 +152,11 @@ def write(
     cfg: Config,
     switch_of: ByHost[str],
     exclude_on: list[str],
+    gpu: GpuLimits,
+    gpus: int,
 ) -> tuple[dict[str, Any], str, str]:
-    """Returns the report and the exclude and include headers."""
-    report = evaluate(run, cfg, switch_of)
+    """Returns the report and the exclude and include headers. gpu and gpus come from the run's template."""
+    report = evaluate(run, cfg, switch_of, gpu, gpus)
     exclude = exclude_header(report, exclude_on)
     include = include_header(report, exclude_on)
     (run / "report.json").write_text(json.dumps(report, indent=1))

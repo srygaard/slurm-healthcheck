@@ -4,7 +4,7 @@ import pytest
 
 from healthcheck import dcgm, nccl, sysinfo
 from healthcheck.check import Finding
-from healthcheck.config import Config, Project, Scratch
+from healthcheck.config import Config, Project, Scratch, gpu_gres
 from launcher import report
 
 
@@ -118,7 +118,7 @@ def switches(run):
 
 
 def evaluate(run, cfg=None):
-    return report.evaluate(run, cfg or Config(), switches(run))
+    return report.evaluate(run, cfg or Config(), switches(run), gpu_gres["h100"], 4)
 
 
 def statuses(run, cfg=None):
@@ -127,7 +127,7 @@ def statuses(run, cfg=None):
 
 def test_all_healthy(run):
     assert set(statuses(run).values()) == {"pass"}
-    _, exclude, include = report.write(run, Config(), switches(run), ["fail"])
+    _, exclude, include = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
     assert exclude == "# no nodes to exclude\n"
     assert include == "#SBATCH --nodelist=rg[1-6]\n"
 
@@ -287,10 +287,10 @@ def test_bad_pair_node_fails_neighbours_warn(run):
     assert by_host["rg3"] == "fail"
     assert by_host["rg2"] == by_host["rg4"] == "warn"
     assert by_host["rg1"] == "pass"
-    _, exclude, include = report.write(run, Config(), switches(run), ["fail"])
+    _, exclude, include = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
     assert exclude == "#SBATCH --exclude=rg3\n"
     assert include == "#SBATCH --nodelist=rg[1-2,4-6]\n"
-    _, exclude, include = report.write(run, Config(), switches(run), ["fail", "warn"])
+    _, exclude, include = report.write(run, Config(), switches(run), ["fail", "warn"], gpu_gres["h100"], 4)
     assert exclude == "#SBATCH --exclude=rg[2-4]\n"
     assert include == "#SBATCH --nodelist=rg[1,5-6]\n"
     assert (run / "include.sbatch").read_text() == include
@@ -407,7 +407,7 @@ def test_slow_alltoall_warns_every_node(run):
 def test_group_timeout_without_culprit_excludes_the_group(run):
     set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "group" else None)
     assert set(statuses(run).values()) == {"fail"}
-    _, exclude, include = report.write(run, Config(), switches(run), ["fail"])
+    _, exclude, include = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
     assert exclude == "#SBATCH --exclude=rg[1-6]\n"
     assert include == "# no nodes to include\n"
 
@@ -415,7 +415,7 @@ def test_group_timeout_without_culprit_excludes_the_group(run):
 def test_alltoall_timeout_warns_every_node(run):
     set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "alltoall" else None)
     assert set(statuses(run).values()) == {"warn"}
-    _, exclude, _ = report.write(run, Config(), switches(run), ["fail"])
+    _, exclude, _ = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
     assert exclude == "# no nodes to exclude\n"
 
 
