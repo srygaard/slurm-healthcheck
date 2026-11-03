@@ -9,7 +9,7 @@ from typing import Any
 import pynvml
 
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, per_host
-from healthcheck.config import Gpu, Homogeneity, Nic
+from healthcheck.config import GpuLimits, Homogeneity, Nic
 from healthcheck.sysinfo import bios, cpu_power, gpu, job, nic, software, topology
 from healthcheck.util.file import JsonDict, read_sys
 from healthcheck.util.hostlist import ByHost
@@ -68,14 +68,14 @@ class HealthCheck(HealthCheckBase):
         }
 
     @staticmethod
-    def report(results: ByHost[JsonDict], gpu: Gpu, nic: Nic, homogeneity: Homogeneity) -> Report:
-        """Sysinfo reads three sections: the GPU and NIC thresholds, and the homogeneity key paths."""
+    def report(results: ByHost[JsonDict], gpu: GpuLimits, nic: Nic, homogeneity: Homogeneity, gpus: int) -> Report:
+        """Sysinfo reads the GPU and NIC thresholds, the expected GPU count, and the homogeneity key paths."""
         usable = {
             host: data
             for host, data in results.items()
             if data.get("status") != Status.SKIPPED
         }
-        findings = per_host(usable, gpu, "sysinfo", lambda data, _gpu: _findings(data, gpu, nic))
+        findings = per_host(usable, gpu, "sysinfo", lambda data, _gpu: _findings(data, gpu, nic, gpus))
         for host, extra in _homogeneity(usable, homogeneity).items():
             findings.setdefault(host, []).extend(extra)
         return Report(findings, {})
@@ -100,11 +100,11 @@ def resolve(data: Any, path: str) -> Any:
     return resolve(value, rest) if rest else value
 
 
-def _findings(data: JsonDict, gpu_cfg: Gpu, nic_cfg: Nic) -> Iterator[Finding]:
-    gpus = data["gpu"]
-    if gpus["count"] != gpu_cfg.count:
-        yield Finding("fail", "gpu.count", f"{gpus['count']} GPUs, expected {gpu_cfg.count}")
-    for device in gpus["devices"]:
+def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> Iterator[Finding]:
+    devices = data["gpu"]
+    if devices["count"] != gpus:
+        yield Finding("fail", "gpu.count", f"{devices['count']} GPUs, expected {gpus}")
+    for device in devices["devices"]:
         index = device["index"]
         if gpu_cfg.require_ecc and device["ecc_enabled"] is False:
             yield Finding("fail", "gpu.ecc", f"GPU{index} ECC disabled")

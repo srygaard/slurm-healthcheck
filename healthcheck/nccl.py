@@ -23,6 +23,7 @@ from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict, write_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.status import Status, ok
+from launcher.slurm import JobTemplate
 
 
 class Run(NamedTuple):
@@ -449,7 +450,13 @@ def start(check: HealthCheck) -> JsonDict:
 
 
 def main() -> int:
-    start(HealthCheck(cfg.nccl, cfg.paths, cfg.gpu.count))
+    try:
+        gres = JobTemplate.load().gres
+        if gres is None:
+            raise ValueError("job template has no --gpus-per-node")
+    except ValueError as error:
+        raise SystemExit(error) from error
+    start(HealthCheck(cfg.nccl, cfg.paths, gres.count))
     return 0
 
 

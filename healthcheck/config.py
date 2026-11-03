@@ -6,25 +6,50 @@ calibrate them from the medians in report.txt after a first `--job-per switch` r
 
 import os
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from launcher.slurm import Gres
 
 
 class Section(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class Gpu(Section):
-    count: int = 4  # also the nccl-tests ranks per node
-    require_ecc: bool = True
+@dataclass(frozen=True, kw_only=True)
+class GpuLimits:
+    """The GPU fields that describe the part rather than a measured floor. The count comes from JobTemplate."""
+
+    require_ecc: bool
+    min_pcie_gen: int  # max link gen (current gen drops at idle)
+    min_pcie_width: int
+    min_nvlinks: int
     max_volatile_uncorrected_ecc: int = 0
     max_remap_failures: int = 0
     max_remap_pending: int = 0
-    min_pcie_gen: int = 5  # max link gen (current gen drops at idle)
-    min_pcie_width: int = 16
-    min_nvlinks: int = 18
+
+
+# Keyed by the Slurm GRES type in --gpus-per-node. H100 and B200 are PCIe Gen5 x16 with 18 NVLinks.
+# L40S is a PCIe card: Gen4 x16, no NVLink. ECC is on; row remap is an HBM counter and stays at zero.
+gpu_gres: dict[str, GpuLimits] = {
+    "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
+    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
+    "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0),
+}
+
+
+def gpu_limits(gres: Gres | None) -> tuple[Gres, GpuLimits]:
+    """The named `--gpus-per-node` and its limits. ValueError when it is missing or not a known chip."""
+    if gres is None or gres.name is None:
+        raise ValueError("job template has no named --gpus-per-node")
+    try:
+        return gres, gpu_gres[gres.name]
+    except KeyError:
+        known = ", ".join(sorted(gpu_gres))
+        raise ValueError(f"unknown GPU type {gres.name}; expected one of {known}") from None
 
 
 class Nic(Section):
@@ -301,7 +326,6 @@ class Paths(Section):
 
 
 class Config(Section):
-    gpu: Gpu = Gpu()
     nic: Nic = Nic()
     scratch: Scratch = Scratch()
     project: Project = Project()

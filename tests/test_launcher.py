@@ -174,3 +174,68 @@ def test_sbatch_without_slurm(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
     result = slurm.sbatch("#!/bin/bash\n", [], tmp_path, {})
     assert (result.job_id, result.returncode) == (None, ExitCode.NOT_FOUND)
+
+
+def test_job_template_from_sh(tmp_path):
+    script = """#!/bin/bash
+#SBATCH --account=rrg-bengioy-ad
+#SBATCH --gpus-per-node=h100:4
+#SBATCH --time=00:15:00
+#SBATCH --reservation=maint
+#SBATCH --constraint=h100&nvlink  # full nodes
+"""
+    path = tmp_path / "rorqual.sh"
+    path.write_text(script)
+    template = slurm.JobTemplate.from_sh(path)
+    assert template.text == script
+    assert template.gres == slurm.Gres("h100", 4)
+    assert str(template.gres) == "h100:4"
+    assert template.time == "00:15:00"
+    assert template.account == "rrg-bengioy-ad"
+    assert template.reservation == "maint"
+    assert template.constraint == ["h100", "nvlink"]
+    assert template.directives == {
+        "account": "rrg-bengioy-ad",
+        "gpus-per-node": "h100:4",
+        "time": "00:15:00",
+        "reservation": "maint",
+        "constraint": "h100&nvlink",
+    }
+
+
+def test_job_template_load(monkeypatch, tmp_path):
+    (tmp_path / "trillium.sh").write_text("#SBATCH --gpus-per-node=h100:4\n")
+    (tmp_path / "rorqual.sh").write_text("#SBATCH --gpus-per-node=b200:8\n")
+    monkeypatch.setenv("CC_CLUSTER", "trillium")
+    assert slurm.JobTemplate.load(tmp_path).gres == slurm.Gres("h100", 4)
+    monkeypatch.setenv("CC_CLUSTER", "rorqual")
+    assert slurm.JobTemplate.load(tmp_path).gres == slurm.Gres("b200", 8)
+    monkeypatch.setenv("CC_CLUSTER", "missing")
+    with pytest.raises(ValueError, match="no job template"):
+        slurm.JobTemplate.load(tmp_path)
+    monkeypatch.delenv("CC_CLUSTER")
+    with pytest.raises(ValueError, match="no job template"):
+        slurm.JobTemplate.load(tmp_path)
+
+
+def test_job_template_gres_count_must_be_int():
+    with pytest.raises(ValueError, match="invalid --gpus-per-node count in h100:abc"):
+        slurm.JobTemplate("#SBATCH --gpus-per-node=h100:abc\n").gres
+    with pytest.raises(ValueError, match="invalid --gpus-per-node count in abc"):
+        slurm.JobTemplate("#SBATCH --gpus-per-node=abc\n").gres
+
+
+def test_job_template_constraint_must_be_and():
+    with pytest.raises(ValueError, match="Only AND constraints"):
+        slurm.JobTemplate("#SBATCH --constraint=h100|b200\n").constraint
+
+
+def test_job_template_without_account_or_reservation(tmp_path):
+    path = tmp_path / "mila.sh"
+    path.write_text("#SBATCH --gpus-per-node=l40s:4\n#SBATCH --time=00:15:00\n")
+    template = slurm.JobTemplate.from_sh(path)
+    assert template.account is None
+    assert template.reservation is None
+    assert template.gres == slurm.Gres("l40s", 4)
+    assert template.time == "00:15:00"
+    assert template.constraint == []

@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 from collections import Counter
@@ -14,12 +13,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from healthcheck.config import Paths, cfg
+from healthcheck.config import Paths, cfg, gpu_limits
 from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 from healthcheck.util.switches import node_switches
 from launcher import report, selection
-from launcher.slurm import detect_cluster, sacct_states, sbatch, squeue
+from launcher.slurm import JobTemplate, detect_cluster, sacct_states, sbatch, squeue
 
 REPO = Path(__file__).parent
 
@@ -70,38 +69,21 @@ def sbatch_options(base: Path, label: str, run_id: int | None) -> list[str]:
     return [f"--job-name=hc-{label}", f"--output={logs}/%j-stdout.txt", f"--error={logs}/%j-stderr.txt"]
 
 
-def template() -> str:
-    """slurm/templates/<cluster>.sh."""
-    cluster = detect_cluster()
-    templates = REPO / "slurm" / "templates"
-    path = templates / f"{cluster}.sh"
-    if not cluster or not path.is_file():
-        known = ", ".join(sorted(found.stem for found in templates.glob("*.sh")))
-        raise SystemExit(
-            f"{Ansi.RED}No job template for cluster {cluster or '?'}: set $CC_CLUSTER to one of {known}{Ansi.RESET}"
-        )
-    return path.read_text()
-
-
-def sbatch_directives() -> dict[str, str]:
-    """The healthcheck template's `#SBATCH --option=value` lines as {option: value}."""
-    return dict(re.findall(r"^#SBATCH\s+--([\w-]+)=(\S+)", template(), re.MULTILINE))
-
-
 def submit(
+    script: JobTemplate,
     command: str,
     base: Path,
     label: str,
     options: Sequence[str] = (),
     run_id: int | None = None,
 ) -> int | None:
-    """sbatch the cluster's template followed by command, printing why a submission failed.
+    """sbatch script followed by command, printing why a submission failed.
 
     The job logs to results/<run_id or its own job id>/jobs/.
     """
     options = [*sbatch_options(base, label, run_id), *options]
-    script = f"{template().rstrip()}\n\n{command}\n"
-    result = sbatch(script, options, cwd=base, env=job_env(base, run_id))
+    body = f"{script.text.rstrip()}\n\n{command}\n"
+    result = sbatch(body, options, cwd=base, env=job_env(base, run_id))
     if not result.job_id:
         print(f"{Ansi.RED}{result.stderr or result.stdout}{Ansi.RESET}")
         return None
@@ -129,6 +111,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not venv.is_dir():
         raise SystemExit(f"{Ansi.RED}Missing {venv}: run `uv run healthcheck.py setup` first{Ansi.RESET}")
 
+    try:
+        script = JobTemplate.load()
+        gres, _limits = gpu_limits(script.gres)
+    except ValueError as error:
+        raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
     if args.any:
         # Slurm picks the nodes, so the job starts on the first free ones; the report learns them from sacct
         switch_of: ByHost[str] = {}
@@ -136,16 +123,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"Submitting 1 job on any {args.any} free node(s)")
     else:
         # The nodes the template's jobs can run on
-        directives = sbatch_directives()
-        constraint = directives.get("constraint", "")
-        if re.search(r"[|\[\]*()]", constraint):
-            raise SystemExit(f"{Ansi.RED}Only AND constraints (a&b) can select nodes, not {constraint}{Ansi.RESET}")
+        try:
+            features = script.constraint
+        except ValueError as error:
+            raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
         selected, skipped = selection.select_nodes(
-            selection.sinfo_nodes(directives.get("partition")),
-            f"gpu:{directives['gpus-per-node']}",
-            constraint.split("&") if constraint else [],
+            selection.sinfo_nodes(script.directives.get("partition")),
+            f"gpu:{gres}",
+            features,
             # A MAINT reservation's nodes show as maint; the template's --reservation can still run on them
-            selection.USABLE_STATES | ({"maint"} if "reservation" in directives else set()),
+            selection.USABLE_STATES | ({"maint"} if script.reservation else set()),
         )
         if skipped:
             states = Counter(node.state for node in skipped)
@@ -179,8 +166,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         options = [f"--nodes={len(members) or args.any}"]
         options += [f"--nodelist={members}"] if members else []
         options += [f"--dependency={args.dependency}"] if args.dependency else []
-        if job_id := submit('exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
-            jobs.append({"job_id": job_id, "label": label, "nodes": members})
+        if job_id := submit(script, 'exec "$HC_VENV/bin/python" -m healthcheck.batch', base, label, options, run_id):
+            job = {"job_id": job_id, "label": label, "nodes": members}
+            jobs.append(job)
     if not jobs:
         print(f"Submitted 0/{len(groups)} jobs")
         return 1
@@ -222,7 +210,18 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
         topo = node_switches()
         switch_of |= {node: topo.get(node, "unknown") for node in missing}
 
-    result, exclude, include = report.write(run.root, cfg, switch_of, exclude_on)
+    try:
+        gres, limits = gpu_limits(JobTemplate.load().gres)
+    except ValueError as error:
+        raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
+    result, exclude, include = report.write(
+        run.root,
+        cfg,
+        switch_of,
+        exclude_on,
+        limits,
+        gres.count,
+    )
     print(report.format_text(result))
     color = Ansi.RED if "--exclude" in exclude else Ansi.GREEN
     print(f"{color}{exclude}{Ansi.RESET}{include}")
