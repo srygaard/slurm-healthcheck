@@ -9,7 +9,7 @@ from healthcheck.util.file import Json, JsonDict
 from healthcheck.util.hostlist import ByHost
 from healthcheck.util.status import Status, ok
 
-type Severity = Literal["fail", "warn"]
+type Severity = Literal["fail", "warn", "info"]
 
 
 class Finding(NamedTuple):

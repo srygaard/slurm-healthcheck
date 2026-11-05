@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from healthcheck import dcgm
@@ -26,6 +28,31 @@ def test_choose_mode(monkeypatch):
     assert dcgm.choose_mode(timeout_s) == dcgm.Mode.HOST_SELF
     state["ok"] = True
     assert dcgm.choose_mode(timeout_s) == dcgm.Mode.HOST
+
+
+def test_parse_keeps_every_gpus_tflops_and_only_the_failure_line():
+    # Three info lines per GPU. They are not stored; the TFLOPS are.
+    results = [
+        {
+            "entity_id": gpu,
+            "status": "Fail" if gpu == 7 else "Pass",
+            "info": [
+                f"Allocated space for GPU {gpu}",
+                "Running with precisions: FP16 1",
+                f"GPU {gpu} calculated at approximately 1294968.00 gigaflops during this test",
+            ],
+            "warnings": [{"warning": "slow"}] if gpu == 7 else [],
+            "errors": [{"error": "mismatch"}] if gpu == 7 else [],
+        }
+        for gpu in range(8)
+    ]
+    test = {"name": "diagnostic", "results": results}
+    report = {"DCGM Diagnostic": {"test_categories": [{"category": "Stress", "tests": [test]}]}}
+    parsed = dcgm.parse("banner\n" + json.dumps(report))["tests"]["diagnostic"]
+    assert "messages" not in parsed
+    assert parsed["detail"] == "mismatch"
+    assert sorted(int(gpu) for gpu in parsed["tflops"]) == list(range(8))
+    assert sorted(dcgm.diagnostic_tflops({"tests": {"diagnostic": parsed}})) == list(range(8))
 
 
 def test_step_skips_when_disabled(monkeypatch, tmp_path):
@@ -65,6 +92,21 @@ def test_diag_times_out(monkeypatch, tmp_path):
     with pytest.raises(dcgm.DiagError, match=f"timeout after {timeout_s}s"):
         dcgm.diag(dcgm.Mode.HOST, "memory", 5556, tmp_path, timeout_s)
     assert seen == {"timeout": timeout_s}
+    assert (tmp_path / "diag.txt").read_text() == ""
+    assert (tmp_path / "diag.stderr.txt").read_text() == f"timeout after {timeout_s}s"
+
+
+def test_diag_writes_stdout_and_stderr(monkeypatch, tmp_path):
+    result_row = {"entity_id": 0, "status": "Pass", "info": ["GPU to Host bandwidth: 55 GB/s"]}
+    test = {"name": "memory", "results": [result_row]}
+    stdout = json.dumps({"DCGM Diagnostic": {"test_categories": [{"category": "Hardware", "tests": [test]}]}})
+    monkeypatch.setattr(dcgm, "run", lambda cmd, timeout, **kwargs: Cmd(0, stdout, "nvvs: note"))
+    result = dcgm.diag(dcgm.Mode.HOST, "memory", 5556, tmp_path, 10)
+    assert (tmp_path / "diag.txt").read_text() == stdout
+    assert (tmp_path / "diag.stderr.txt").read_text() == "nvvs: note"
+    assert result["tests"]["memory"]["status"] == "Pass"
+    assert "messages" not in result["tests"]["memory"]
+    assert "detail" not in result["tests"]["memory"]
 
 
 def test_self_hosted_diag_does_not_use_shared_run(monkeypatch, tmp_path):

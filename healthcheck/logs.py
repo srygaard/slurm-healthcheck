@@ -157,6 +157,25 @@ def _findings(data: JsonDict, cfg: Logs) -> Iterator[Finding]:
             f"{data['nccl']['count']} NCCL log matches, e.g. {data['nccl']['matches'][0][-160:]}",
         )
     for source, result in data["kernel"].items():
-        if result.get("matches"):
-            example = result["matches"][0][-160:]
-            yield Finding("fail", f"logs.{source}", f"{len(result['matches'])} matches, e.g. {example}")
+        yield from _kernel_findings(source, result.get("matches") or [], cfg.kernel_warn)
+
+
+def _kernel_findings(source: str, matches: list[str], warn: list[str]) -> Iterator[Finding]:
+    """A line matching kernel_warn warns. Any other matched line fails the node.
+
+    >>> list(_kernel_findings("dmesg", ["Failed to send inband data: 0", "NVRM: Xid 79"], ["inband data: 0"]))
+    [Finding(severity='warn', check='logs.dmesg', detail='1 matches, e.g. Failed to send inband data: 0'), \
+Finding(severity='fail', check='logs.dmesg', detail='1 matches, e.g. NVRM: Xid 79')]
+    """
+    failed: list[str] = []
+    warned: dict[str, list[str]] = {}
+    for line in matches:
+        pattern = next((item for item in warn if item in line), None)
+        if pattern is None:
+            failed.append(line)
+        else:
+            warned.setdefault(pattern, []).append(line)
+    for lines in warned.values():
+        yield Finding("warn", f"logs.{source}", f"{len(lines)} matches, e.g. {lines[0][-160:]}")
+    if failed:
+        yield Finding("fail", f"logs.{source}", f"{len(failed)} matches, e.g. {failed[0][-160:]}")

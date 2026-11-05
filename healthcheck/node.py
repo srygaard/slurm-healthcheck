@@ -30,7 +30,7 @@ STEPS: dict[str, type[HealthCheckBase]] = {
 }
 
 
-def _check(name: str, host: str, gpus_done: threading.Event) -> HealthCheckBase:
+def _check(name: str, host: str, stop_event: threading.Event) -> HealthCheckBase:
     """An instance of one phase A step. logs is built in finalize, where its inputs exist."""
     if name == "sysinfo":
         return STEPS[name](host, cfg.nic.link_layer)
@@ -43,7 +43,7 @@ def _check(name: str, host: str, gpus_done: threading.Event) -> HealthCheckBase:
     if name == "dcgm":
         return STEPS[name](cfg.dcgm, cfg.paths.dcgm_logs(host))
     if name == "cpu_load":
-        return STEPS[name](cfg.cpu_load, gpus_done, sorted(os.sched_getaffinity(0)))
+        return STEPS[name](cfg.cpu_load, stop_event, sorted(os.sched_getaffinity(0)))
     raise KeyError(name)
 
 
@@ -58,15 +58,15 @@ def local() -> None:
     }
 
     # cpu_load holds its CPU load until dcgm returns
-    gpus_done = threading.Event()
+    dcgm_done = threading.Event()
     checks = {
-        name: _check(name, host, gpus_done)
+        name: _check(name, host, dcgm_done)
         for name in STEPS
         if name != "logs"
     }
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {name: pool.submit(step, check) for name, check in checks.items()}
-        futures["dcgm"].add_done_callback(lambda _: gpus_done.set())
+        futures["dcgm"].add_done_callback(lambda _: dcgm_done.set())
         for name, future in futures.items():
             out[name] = future.result()
             print(f"{host} {name}: {out[name]['status']} in {out[name]['elapsed_s']}s")

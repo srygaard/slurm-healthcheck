@@ -100,7 +100,12 @@ def resolve(data: Any, path: str) -> Any:
     return resolve(value, rest) if rest else value
 
 
-def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> Iterator[Finding]:
+def _findings(
+    data: JsonDict,
+    gpu_cfg: GpuLimits,
+    nic_cfg: Nic,
+    gpus: int,
+) -> Iterator[Finding]:
     devices = data["gpu"]
     if devices["count"] != gpus:
         yield Finding("fail", "gpu.count", f"{devices['count']} GPUs, expected {gpus}")
@@ -127,6 +132,11 @@ def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> It
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap failure")
             if rows["pending"] > gpu_cfg.max_remap_pending:
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap pending (needs reset)")
+            if (rows["corrected"] or 0) > gpu_cfg.max_remap_corrected:
+                yield Finding("warn", "gpu.remap", f"GPU{index} {rows['corrected']} corrected row remaps")
+        corrected = counters["ecc_aggregate"]["corrected"] or 0
+        if corrected > gpu_cfg.max_aggregate_corrected_ecc:
+            yield Finding("warn", "gpu.ecc", f"GPU{index} {corrected} corrected ECC errors (aggregate)")
 
     active = [
         (dev["name"], port)
@@ -139,10 +149,6 @@ def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> It
         yield Finding(
             "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
         )
-    for nic_name, port in active:
-        if (port["rate_gbps"] or 0) < nic_cfg.min_rate_Gbps:
-            rate = f"{nic_name}/{port['port']} {port['rate']} < {nic_cfg.min_rate_Gbps} Gb/s"
-            yield Finding("fail", "nic.rate", rate)
 
 
 def _homogeneity(sysinfos: ByHost[JsonDict], cfg: Homogeneity) -> ByHost[list[Finding]]:

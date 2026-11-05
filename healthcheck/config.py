@@ -30,6 +30,9 @@ class GpuLimits:
     max_volatile_uncorrected_ecc: int = 0
     max_remap_failures: int = 0
     max_remap_pending: int = 0
+    # Only warn when increased during the run.
+    max_aggregate_corrected_ecc: int = 0
+    max_remap_corrected: int = 0
 
 
 # Keyed by the Slurm GRES type in --gpus-per-node. H100 and B200 are PCIe Gen5 x16 with 18 NVLinks.
@@ -53,8 +56,9 @@ def gpu_limits(gres: Gres | None) -> tuple[Gres, GpuLimits]:
 
 
 class Nic(Section):
+    """Port rates are compared to the other nodes and may fail on homogeneity."""
+
     min_active_ib_ports: int = 1
-    min_rate_Gbps: float = 200
     link_layer: str = "InfiniBand"
 
 
@@ -149,10 +153,7 @@ class CpuLoad(Section):
     interval_s: float = 5
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
     min_full_power_s: float = 240  # bare minimum amount of time needed to detect power throttle
-    low_frac: float = 0.10  # a busy-core reading at full GPU power this far below the run's highest counts as low
-    fail_low_share: float = 0.2  # fail above
-    warn_low_share: float = 0.05  # warn above
-    min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
+    min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median
 
 
 class NcclTest(Section):
@@ -166,7 +167,8 @@ class NcclTest(Section):
     # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip phase C.
     timeout_s: float = 120
     min_busbw_GBps: float = 0
-    min_frac_of_median: float | None = None  # None: the absolute floor only
+    min_frac_of_median: float | None = 0.9
+    warn_frac_of_median: float | None = 0.95
     # Severity of an unblamed timeout of a whole-job test. A slow result still warns.
     timeout_severity: Literal["fail", "warn"] = "fail"
 
@@ -195,8 +197,8 @@ class Nccl(Section):
         timeout_s=90,
         min_busbw_GBps=3,  # single-node ~6.4; the same 65-node run sat near 3.7, lowest 3.22
     )
-    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20, min_frac_of_median=0.7)
-    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20, min_frac_of_median=0.8)
+    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20)
+    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20)
     alltoall: NcclTest = NcclTest(
         name="alltoall",
         # Off: a 65-node alltoall was still starting at 180 s, and this 600 s timeout does not fit in the template's
@@ -210,7 +212,6 @@ class Nccl(Section):
         # A 64-node run, one 1 GB size: 1.97 GB/s. The floor is about half of that. A leaf was ~6.8; a leaf slow
         # against the other jobs in the run is caught by min_frac_of_median. Such a timeout names no node, so it warns.
         min_busbw_GBps=1.0,
-        min_frac_of_median=0.8,
         timeout_severity="warn",
     )
 
@@ -225,6 +226,11 @@ class Logs(Section):
     ]
     nccl_fail_patterns: list[str] = ["NCCL WARN", "completion with error", "Timeout", "remote process exited"]
     kernel_patterns: list[str] = ["NVRM", "Xid", "mlx5", "nvidia-peermem", "EDAC", "I/O error", "nvme"]
+    # Matched kernel lines that warn instead of failing the node. Other kernel_patterns matches still fail.
+    kernel_warn: list[str] = [
+        "Failed to send inband data: 0",  # NVRM knvlink teardown at the end of each NCCL round; status 0
+        "query_mcia_reg failed",  # mlx5 module query; on these nodes it was the disabled port 0000:d8:00.1
+    ]
     max_nvlink_error_delta: int = 0
 
 

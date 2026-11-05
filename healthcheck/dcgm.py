@@ -93,7 +93,14 @@ def choose_mode(discovery_timeout_s: float) -> Mode:
     return Mode.NONE
 
 
-def diag(mode: Mode, suite: str, port: int, log_dir: Path, timeout_s: float, parameters: str = "") -> dict[str, Any]:
+def diag(
+    mode: Mode, 
+    suite: str, 
+    port: int, 
+    log_dir: Path, 
+    timeout_s: float, 
+    parameters: str = ""
+) -> dict[str, Any]:
     """Run and parse `dcgmi diag`; suite is a level ("1"-"4") or comma-separated test names, and parameters is
     the `-p` argument, ";"-separated.
 
@@ -101,7 +108,13 @@ def diag(mode: Mode, suite: str, port: int, log_dir: Path, timeout_s: float, par
     """
     # DCGM 4 refuses to run when dcgmi and the hostengine see different CUDA_VISIBLE_DEVICES, and Slurm sets it
     # for the job. Jobs hold whole nodes, so testing every GPU is what we want anyway.
-    env = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
+    env = {
+        name: value 
+        for name, value 
+        in os.environ.items() 
+        if name != "CUDA_VISIBLE_DEVICES"
+    }
+    log_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="hc-dcgm-", dir=os.environ.get("SLURM_TMPDIR")) as tmp:
         # DCGM 4.4.2+: the hostengine stops nvvs when this client dies. Without it, a cancelled job
         # leaves the diagnostic holding the GPUs and the next dcgmi diag exits 222 (resource in use).
@@ -109,12 +122,17 @@ def diag(mode: Mode, suite: str, port: int, log_dir: Path, timeout_s: float, par
         if mode == Mode.HOST_SELF:
             # Our hostengine runs as us and logs to the working directory, which all nodes of a job share. The host's
             # runs as another user that can't write to our directories, and logs outside them anyway.
-            log_dir.mkdir(parents=True, exist_ok=True)
             args += ["--debugLogFile", str(log_dir / "nvvs.log"), "--statspath", str(log_dir)]
         args += ["-p", parameters] if parameters else []
         cmd = command(mode, args, port, tmp)
         # The shell backgrounds nv-hostengine, so a plain timeout would kill the shell and leave the engine.
         out = run_hostengine(cmd, env, timeout_s) if mode == Mode.HOST_SELF else run(cmd, timeout=timeout_s, env=env)
+    
+    # The node JSON keeps only what the report grades; the raw stdout and any stderr are the log.
+    (log_dir / "diag.txt").write_text(out.stdout)
+    if out.stderr:
+        (log_dir / "diag.stderr.txt").write_text(out.stderr)
+    
     try:
         tests = parse(out.stdout)["tests"]
     except ValueError:  # no JSON at all
@@ -137,28 +155,61 @@ def _find_categories(report: Any) -> list[dict[str, Any]]:
 
 
 def parse(stdout: str) -> dict[str, Any]:
-    """Reduce `dcgmi diag -j` output to the worst status per test, with per-GPU statuses and messages."""
+    """Reduce `dcgmi diag -j` output to the worst status per test and its per-GPU statuses.
+
+    The lines themselves stay in diag.txt. A Fail or Warn keeps its first error line, or its first warning when it
+    logged no error, and diagnostic keeps each GPU's TFLOPS.
+    """
     severity = {"Fail": 3, "Warn": 2, "Pass": 1}  # anything else (Skip, Not Run) ranks 0
     report = json.loads(stdout[stdout.index("{") :])  # some versions print a banner first
     tests = {}
     for category in _find_categories(report):
         for test in category.get("tests", []):
             entities = {}
-            messages = []
+            error = warning = None
+            tflops: dict[int, float] = {}
             for result in test.get("results", []):
                 entity = result.get("entity_id", result.get("gpu_ids", "all"))
                 entities[str(entity)] = result.get("status", "Unknown")
-                for key in ("warnings", "info", "errors"):
-                    for msg in result.get(key) or []:
-                        messages.append(msg.get("warning") or msg.get("message") if isinstance(msg, dict) else msg)
+                for key in ("errors", "warnings", "info"):
+                    for message in result.get(key) or []:
+                        if not (text := _text(message)):
+                            continue
+                        if key == "errors":
+                            error = error or text
+                        elif key == "warnings":
+                            warning = warning or text
+                        tflops.update(_tflops([text]))
             statuses = list(entities.values()) or [test.get("test_summary", {}).get("status", "Unknown")]
-            tests[test["name"]] = {
-                "category": category.get("category"),
-                "status": max(statuses, key=lambda status: severity.get(status, 0)),
-                "entities": entities,
-                "messages": [message for message in messages if message][:20],
-            }
+            status = max(statuses, key=lambda item: severity.get(item, 0))
+            record: JsonDict = {"category": category.get("category"), "status": status, "entities": entities}
+            if status in ("Fail", "Warn") and (line := error or warning):
+                record["detail"] = line
+            if tflops:
+                record["tflops"] = {str(gpu): value for gpu, value in tflops.items()}
+            tests[test["name"]] = record
     return {"tests": tests}
+
+
+def _text(message: Any) -> str:
+    """One error, warning, or info entry. A string is itself; a dict carries it under error, warning, or message."""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        return message.get("error") or message.get("warning") or message.get("message") or ""
+    return ""
+
+
+_GFLOPS = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops")
+
+
+def _tflops(lines: list[str]) -> dict[int, float]:
+    return {
+        int(gpu): round(float(gflops) / 1000, 2) 
+        for line in lines 
+            for gpu, gflops 
+            in _GFLOPS.findall(line)
+    }
 
 
 class HealthCheck(HealthCheckBase):
@@ -240,21 +291,22 @@ def parameters(cfg: Dcgm) -> str:
 
 def diagnostic_tflops(data: JsonDict) -> dict[int, float]:
     """
-    Each GPU's TFLOPS from the dcgm diagnostic test's messages.
+    Each GPU's TFLOPS. A new run stores them; a run from before that keeps them in the diagnostic messages.
 
     >>> message = "GPU 1 calculated at approximately 160231.80 gigaflops"
     >>> diagnostic_tflops({"tests": {"diagnostic": {"messages": [message]}}})
     {1: 160.23}
+    >>> diagnostic_tflops({"tests": {"diagnostic": {"tflops": {"1": 160.23}}}})
+    {1: 160.23}
     """
-    messages = data.get("tests", {}).get("diagnostic", {}).get("messages", [])
-    pattern = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops")
-    return {
-        int(gpu): round(float(gflops) / 1000, 2) 
-        for message 
-        in messages 
-            for gpu, gflops 
-            in pattern.findall(message)
-    }
+    diagnostic = data.get("tests", {}).get("diagnostic", {})
+    if stored := diagnostic.get("tflops"):
+        return {
+            int(gpu): float(value) 
+            for gpu, value 
+            in stored.items()
+        }
+    return _tflops(diagnostic.get("messages", []))
 
 
 def _skipped(data: JsonDict, cfg: Dcgm, name: str) -> Iterator[Finding]:
@@ -275,7 +327,9 @@ def _findings(data: JsonDict, cfg: Dcgm) -> Iterator[Finding]:
         found = True
         bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
         detail = f"{test_name} {test['status']} on {','.join(bad)}"
-        message = f"{detail}: {test['messages'][0]}" if test["messages"] else detail
+        # A new run stores one line as detail. An older run stored the list under messages.
+        quote = test.get("detail") or next(iter(test.get("messages") or []), None)
+        message = f"{detail}: {quote}" if quote else detail
         yield Finding(severity, "dcgm", message)
     if not found and data.get("returncode"):
         yield Finding("fail", "dcgm", f"dcgmi diag exited {data['returncode']} with no failed test")
