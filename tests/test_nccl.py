@@ -1,11 +1,13 @@
+import json
 import sys
 import time
 from pathlib import Path
 
 from healthcheck import nccl
 from healthcheck.check import Availability
-from healthcheck.config import Nccl, NcclTest, Paths
+from healthcheck.config import Config, Nccl, NcclTest, Paths
 from healthcheck.util.cmd import Cmd
+from launcher.slurm import JobTemplate
 
 ALL_REDUCE = r"""
 # nThread 1 nGpus 1 minBytes 134217728 maxBytes 1073741824 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0
@@ -222,7 +224,7 @@ def test_write_unavailable_keeps_mpi_none(monkeypatch, tmp_path):
     assert (tmp_path / "run" / "groups" / "9.json").is_file()
 
 
-def test_start_skips_when_disabled(monkeypatch, tmp_path):
+def test_main_skips_when_disabled(monkeypatch, tmp_path):
     build = tmp_path / "build"
     build.mkdir()
     (build / "all_reduce_perf").write_bytes(b"")
@@ -235,7 +237,10 @@ def test_start_skips_when_disabled(monkeypatch, tmp_path):
         raise AssertionError("probed")
 
     monkeypatch.setattr(nccl, "mpi_plugin", probed)
-    written = nccl.start(nccl.HealthCheck(_off(), Paths(root=tmp_path / "run"), 4))
+    monkeypatch.setattr(nccl, "cfg", Config(nccl=_off(), paths=Paths(root=tmp_path / "run")))
+    monkeypatch.setattr(nccl.JobTemplate, "load", lambda: JobTemplate("#SBATCH --gpus-per-node=h100:4\n"))
+    assert nccl.main() == 0
+    written = json.loads((tmp_path / "run" / "groups" / "9.json").read_text())
     assert written["tests"] == []
     assert "status" not in written
     assert "mpi" not in written

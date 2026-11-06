@@ -34,9 +34,12 @@ def healthy(host):
     counter = {
         "index": 0,
         "ecc_volatile": {"uncorrected": 0, "corrected": 0},
+        "ecc_aggregate": {"uncorrected": 0, "corrected": 0},
         "remapped_rows": {"corrected": 0, "uncorrected": 0, "pending": 0, "failure": 0},
         "nvlink_errors": {"replay": 0},
         "hw_throttle": [],
+        "power_limit_w": 700.0,
+        "default_power_limit_w": 700.0,
     }
     sysinfo = {
         "kernel": "5.14.0",
@@ -77,7 +80,7 @@ def healthy(host):
         "scratch": ok(scratch),
         "project": ok(dict(scratch)),
         "local_tmp": ok(local_tmp),
-        "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}, "messages": []}}}),
+        "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}}}}),
         "cpu_load": ok({"status": "skipped"}),
         "logs": ok(logs),
     }
@@ -150,11 +153,45 @@ def test_node_without_result_is_no_report(run, lose):
 def test_gpu_and_nic_checks(run):
     def bad(node):
         node["sysinfo"]["data"]["gpu"]["devices"][2]["nvlinks_active"] = 12
-        node["sysinfo"]["data"]["nic"]["ib"][1]["ports"][0]["rate_gbps"] = 100.0
+        port = node["sysinfo"]["data"]["nic"]["ib"][1]["ports"][0]
+        port.update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
 
     edit(run, "rg2", bad)
     checks = {finding["check"] for finding in evaluate(run)["nodes"]["rg2"]["findings"]}
-    assert checks == {"gpu.nvlink", "nic.rate"}
+    assert checks == {"gpu.nvlink", "homogeneity"}
+
+
+def test_gpu_capped_below_its_default_power_limit_fails(run):
+    def capped(node):
+        node["sysinfo"]["data"]["counters"][3]["power_limit_w"] = 200.0
+
+    edit(run, "rg2", capped)
+    result = evaluate(run)["nodes"]["rg2"]
+    assert [(f["severity"], f["check"], f["detail"]) for f in result["findings"]] == [
+        ("fail", "gpu.power_limit", "GPU3 power limit 200 W < default 700 W")
+    ]
+
+
+def test_port_slower_than_its_peers_fails_that_node(run):
+    def slow(node):
+        node["sysinfo"]["data"]["nic"]["ib"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
+
+    edit(run, "rg6", slow)
+    nodes = evaluate(run)["nodes"]
+    assert nodes["rg6"]["status"] == "fail"
+    assert "nic.ib[*].ports[*].rate" in nodes["rg6"]["findings"][0]["detail"]
+    assert nodes["rg1"]["status"] == "pass"
+
+
+def test_port_slow_on_every_node_is_not_flagged(run):
+    """Peers-only grading: a fleet-wide rate is the baseline, so it passes. Only a node that differs is flagged."""
+
+    def slow(node):
+        node["sysinfo"]["data"]["nic"]["ib"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
+
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
+        edit(run, host, slow)
+    assert set(statuses(run).values()) == {"pass"}
 
 
 def test_homogeneity_flags_minority(run):
@@ -181,33 +218,96 @@ def test_bios_mismatch_warns(run):
     assert "bios.bios_version" in findings[0]["detail"]
 
 
-def cpu_load(top, full_power, low_share=0.0, throttles=0):
+def cpu_load(*packages):
+    """A cpu_load record with one package per (full_power_mhz, thermal, power_limit) tuple."""
     return ok(
         {
             "status": "ok",
-            "max_mhz": top,
-            "full_power_mhz": full_power,
-            "low_share": low_share,
-            "throttle_delta": throttles,
+            "packages": {
+                str(socket): {
+                    "busy_cpus": "0-3",
+                    "throttle_delta": {"thermal": thermal, "power_limit": power_limit},
+                    "full_power_mhz": mhz,
+                }
+                for socket, (mhz, thermal, power_limit) in enumerate(packages)
+            },
             "samples": [],
         }
     )
 
 
-def test_cpu_load_low_clocks_median_and_throttle(run):
-    for host, share in (("rg1", 0.05), ("rg2", 0.125), ("rg3", 0.3), ("rg4", 0.0), ("rg5", 0.0)):
-        edit(run, host, lambda node, share=share: node.update(cpu_load=cpu_load(3700, 3690, low_share=share)))
-    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load(3700, 2560, low_share=0.48, throttles=2)))
+def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
+        edit(run, host, lambda node: node.update(cpu_load=cpu_load((2300, 0, 0), (2300, 0, 0))))
+    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load((2300, 0, 0), (1500, 0, 3))))
     report_ = evaluate(run)
-    assert {host: report_["nodes"][host]["status"] for host in ("rg1", "rg2", "rg3")} == {
-        "rg1": "pass",
-        "rg2": "warn",
-        "rg3": "fail",
+    assert report_["nodes"]["rg1"]["status"] == "pass"
+    findings = report_["nodes"]["rg6"]["findings"]
+    assert [(finding["severity"], finding["check"]) for finding in findings] == [
+        ("warn", "cpu_load.throttle"),
+        ("warn", "cpu_load.median"),
+    ]
+    assert findings[0]["detail"] == "package 1: 0 thermal and 3 power-limit throttle events"
+    assert findings[1]["detail"].startswith("package 1: busy-core clock 1500 < ")
+    assert report_["nodes"]["rg6"]["status"] == "warn"
+    assert report_["medians"]["cpu_load_busy_mhz"] == 2300
+
+
+def test_a_run_where_every_package_drops_together_is_not_flagged(run):
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
+        edit(run, host, lambda node: node.update(cpu_load=cpu_load((1700, 0, 0), (1750, 0, 0))))
+    assert set(statuses(run).values()) == {"pass"}
+
+
+def test_a_record_from_before_packages_still_grades(run):
+    old = {"status": "ok", "full_power_mhz": 2300, "low_share": 0.9, "throttle_delta": 0, "samples": []}
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
+        edit(run, host, lambda node: node.update(cpu_load=ok(dict(old))))
+    edit(run, "rg6", lambda node: node.update(cpu_load=ok({**old, "full_power_mhz": 1500, "throttle_delta": 2})))
+    findings = evaluate(run)["nodes"]["rg6"]["findings"]
+    assert [finding["check"] for finding in findings] == ["cpu_load.throttle", "cpu_load.median"]
+    assert findings[0]["detail"] == "2 thermal and 0 power-limit throttle events"
+    assert statuses(run)["rg1"] == "pass"
+
+
+def test_unreadable_throttle_counters_are_not_findings(run):
+    package = {"busy_cpus": "0-3", "throttle_delta": None, "full_power_mhz": 2300}
+    edit(run, "rg1", lambda node: node.update(cpu_load=ok({"status": "ok", "packages": {"0": package}, "samples": []})))
+    assert statuses(run)["rg1"] == "pass"
+
+
+def test_historical_corrected_ecc_does_not_warn(run):
+    """Lifetime corrected counters that did not rise during the run are not findings; logs grades increases."""
+
+    def corrected(node):
+        node["sysinfo"]["data"]["counters"][1]["ecc_aggregate"]["corrected"] = 177903
+        node["sysinfo"]["data"]["counters"][1]["remapped_rows"]["corrected"] = 2
+
+    edit(run, "rg2", corrected)
+    result = evaluate(run)["nodes"]["rg2"]
+    assert not [finding for finding in result["findings"] if finding["check"] in ("gpu.ecc", "gpu.remap")]
+
+
+def test_known_kernel_lines_warn_and_other_lines_fail(run):
+    dmesg = {
+        "status": "ok",
+        "matches": [
+            "NVRM: knvlinkSendInbandData_IMPL: Failed to send inband data: 0",
+            "mlx5_core 0000:d8:00.1: mlx5_query_module_id:314: query_mcia_reg failed: status: 0x3",
+            "NVRM: Xid (PCI:0000:19:00): 79, GPU has fallen off the bus",
+        ],
     }
-    severities = {finding["check"]: finding["severity"] for finding in report_["nodes"]["rg6"]["findings"]}
-    assert severities == {"cpu_load.low_clocks": "fail", "cpu_load.median": "warn", "cpu_load.throttle": "warn"}
-    assert report_["nodes"]["rg6"]["status"] == "fail"
-    assert report_["medians"]["cpu_load_busy_mhz"] == 3690
+    edit(run, "rg1", lambda node: node["logs"]["data"].update(kernel={"dmesg": dict(dmesg)}))
+    findings = evaluate(run)["nodes"]["rg1"]["findings"]
+    assert [(finding["severity"], finding["check"]) for finding in findings] == [
+        ("warn", "logs.dmesg"),
+        ("warn", "logs.dmesg"),
+        ("fail", "logs.dmesg"),
+    ]
+    assert "inband data: 0" in findings[0]["detail"]
+    assert "query_mcia_reg failed" in findings[1]["detail"]
+    assert "Xid" in findings[2]["detail"]
+    assert evaluate(run)["nodes"]["rg1"]["status"] == "fail"
 
 
 def test_cpu_load_skipped_or_absent_passes(run):
@@ -217,18 +317,15 @@ def test_cpu_load_skipped_or_absent_passes(run):
 
 
 def test_dcgm_tflops_relative_to_median(run):
-    def diagnostic(gflops):
-        messages = [
-            f"GPU {gpu} calculated at approximately {value} gigaflops during this test"
-            for gpu, value in enumerate(gflops)
-        ]
+    def diagnostic(tflops):
+        stored = {str(gpu): value for gpu, value in enumerate(tflops)}
         return lambda node: node["dcgm"]["data"]["tests"].update(
-            diagnostic={"status": "Pass", "entities": {}, "messages": messages}
+            diagnostic={"status": "Pass", "entities": {}, "tflops": stored}
         )
 
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
-        edit(run, host, diagnostic([160231.80, 164944.50, 160231.80, 164944.50]))
-    edit(run, "rg6", diagnostic([160231.80, 150000.0, 140000.0, 160231.80]))
+        edit(run, host, diagnostic([160.23, 164.94, 160.23, 164.94]))
+    edit(run, "rg6", diagnostic([160.23, 150.0, 140.0, 160.23]))
     result = evaluate(run)
     assert [(finding["severity"], finding["detail"]) for finding in result["nodes"]["rg6"]["findings"]] == [
         ("warn", "GPU1 150.0 < 152.2 TFLOPS (frac of median)"),
@@ -296,6 +393,57 @@ def test_bad_pair_node_fails_neighbours_warn(run):
     assert (run / "include.sbatch").read_text() == include
 
 
+def test_intra_below_fail_fraction_fails_and_the_warn_band_warns(run):
+    """350 GB/s median: 300 is under the 0.9 line (315) and over the 120 GB/s floor; 320 is in the 0.95 warn band."""
+
+    def set_intra(busbw):
+        def change(test, busbw=busbw):
+            if test["kind"] == "intra" and test["nodes"] == ["rg3"]:
+                test["peak_busbw"] = busbw
+
+        set_tests(run, lambda test: True, change)
+
+    set_intra(300)
+    findings = evaluate(run)["nodes"]["rg3"]["findings"]
+    assert findings[0] == {"severity": "fail", "check": "nccl.intra", "detail": "busbw 300 < 315.0"}
+    set_intra(320)
+    findings = evaluate(run)["nodes"]["rg3"]["findings"]
+    assert findings[0] == {"severity": "warn", "check": "nccl.intra", "detail": "busbw 320 < 332.5"}
+    set_intra(None)  # an ok result with no bandwidth is graded as 0, and the message says 0
+    findings = evaluate(run)["nodes"]["rg3"]["findings"]
+    assert findings[0]["detail"] == "busbw 0 < 315.0"
+
+
+def test_pair_below_fail_fraction_fails_that_node(run):
+    """86% of a 45 GB/s median is under the 0.9 fail line and over the 20 GB/s floor."""
+    group = json.loads((run / "groups" / "1.json").read_text())
+    for test in group["tests"]:
+        if test["kind"] == "pair" and "rg3" in test["nodes"]:
+            test["peak_busbw"] = 38.7
+    (run / "groups" / "1.json").write_text(json.dumps(group))
+    by_host = statuses(run)
+    assert by_host["rg3"] == "fail"
+    assert by_host["rg2"] == by_host["rg4"] == "warn"
+    assert by_host["rg1"] == "pass"
+    detail = evaluate(run)["nodes"]["rg3"]["findings"][0]["detail"]
+    assert detail.startswith("2/2 slow pairs (< 40.5)")
+
+
+def test_pair_between_warn_and_fail_warns_both_nodes(run):
+    """92% of a 45 GB/s median is under the 0.95 warn line and over the 0.9 fail line."""
+    group = json.loads((run / "groups" / "1.json").read_text())
+    for test in group["tests"]:
+        if test["kind"] == "pair" and "rg3" in test["nodes"]:
+            test["peak_busbw"] = 41.4
+    (run / "groups" / "1.json").write_text(json.dumps(group))
+    by_host = statuses(run)
+    assert by_host["rg3"] == by_host["rg2"] == by_host["rg4"] == "warn"
+    assert by_host["rg1"] == "pass"
+    findings = evaluate(run)["nodes"]["rg3"]["findings"]
+    assert findings[0]["check"] == "nccl.pair"
+    assert findings[0]["detail"].startswith("2/2 slow pairs (< 42.8)")
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -339,7 +487,8 @@ def test_dcgm_parse_v4_layout():
     )
     tests = dcgm.parse("banner\n" + out)["tests"]
     assert tests["memory"]["status"] == "Fail"
-    assert tests["memory"]["messages"] == ["DBE detected"]
+    assert tests["memory"]["detail"] == "DBE detected"
+    assert "messages" not in tests["memory"]
     assert tests["software"]["status"] == "Pass"
 
 
@@ -385,6 +534,7 @@ def test_two_node_pair_timeout_excludes_both(run):
     by_host = statuses(run)
     assert by_host["rg1"] == by_host["rg2"] == "fail"
     assert by_host["rg3"] == "pass"
+    assert "timeout 0" in evaluate(run)["nodes"]["rg1"]["findings"][0]["detail"]
 
 
 def test_group_timeout_blames_the_pair_culprit_only(run):
@@ -407,6 +557,7 @@ def test_slow_alltoall_warns_every_node(run):
 def test_group_timeout_without_culprit_excludes_the_group(run):
     set_tests(run, lambda test: True, lambda test: time_out(test) if test["kind"] == "group" else None)
     assert set(statuses(run).values()) == {"fail"}
+    assert "busbw 0 " in evaluate(run)["nodes"]["rg1"]["findings"][0]["detail"]
     _, exclude, include = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
     assert exclude == "#SBATCH --exclude=rg[1-6]\n"
     assert include == "# no nodes to include\n"

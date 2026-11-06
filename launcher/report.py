@@ -78,7 +78,13 @@ def evaluate(
     nodes = {}
     for host in sorted(set(findings) | set(switch_of)):
         fs = findings.get(host, [])
-        status = "fail" if any(finding.severity == "fail" for finding in fs) else "warn" if fs else "pass"
+        status = (
+            "fail"
+            if any(finding.severity == "fail" for finding in fs)
+            else "warn"
+            if any(finding.severity == "warn" for finding in fs)
+            else "pass"
+        )
         nodes[host] = {
             "status": status,
             "switch": switch_of.get(host),

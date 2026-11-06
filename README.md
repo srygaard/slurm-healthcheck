@@ -60,12 +60,13 @@ Each node runs three phases:
    - **sysinfo**: GPU, NIC, NUMA, software, BIOS, and CPU power. The NUMA layout goes to `<run>/numa/<host>.json`.
    - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and `setup` skips its files too.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
-   - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
-     node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
-     (`dcgm.diagnostic_precision`) and warns below 95%.
-   - **cpu_load**: busy loops on `cpu_load.busy_frac` of the CPUs until dcgm returns. Over 4 min or more at full
-     GPU power ([Power limit](#power-limit)), it fails a node with over 20% of busy-core readings more than 10% below
-     its highest and warns over 5%.
+   - **dcgm**: `dcgmi diag` with `dcgm.tests`, through the node's hostengine or one the job starts. A sh template
+   drops tests with `HC_DCGM_SKIP_TESTS`.
+   - **cpu_load**: busy loops on `cpu_load.busy_frac` of each CPU package's CPUs until dcgm returns. It warns a
+     package with any thermal or power-limit throttle event during the run (`thermal_throttle` counters; none are
+     recorded on a kernel that does not expose them). Over 4 min or more at full GPU power
+     ([Power limit](#power-limit)), it also warns a package whose median busy-core clock is under 90% of the median of
+     the run's packages.
 2. **Phase B**, `all_reduce_perf` with 4 ranks per node:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
@@ -102,17 +103,20 @@ results/<job_id>/
   nodes/<host>.json                  per-node results
   groups/<job_id>.json               NCCL results; raw output in groups/<job_id>/
   logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log), kept only if a rank wrote one
+  logs/dcgm/<host>/diag.txt          dcgmi diag stdout; diag.stderr.txt when the command wrote any
   numa/<host>.json                   per-node NUMA layout table
   xid/<host>.jsonl                   Xid events
 ```
 
 ## Finding the slow node of a pair
 A bad node slows both of its ring pairs, so in a larger run it fails `nccl.pair` with `2/2 slow pairs` while its
-neighbours only warn with `1/2`. Two nodes form a single pair, so a slow pair fails both with `1/1 slow pairs`. To
+neighbours only warn with `1/2`. Every NCCL kind fails below 0.9 of its median and warns below 0.95. On pairs the
+fail line is what counts as slow, and a pair between the two lines warns both nodes. Two nodes form a single pair, so
+a slow pair fails both with `1/1 slow pairs`. To
 tell which one is slow:
 
 1. Look at each node's own NCCL tests in the same report: a node that also fails `nccl.loopback` (its NIC alone) or
-   `nccl.intra`, or has `nic.rate` or `nic.ports` findings, is the slow one. Their bandwidths are in
+   `nccl.intra`, or has a `homogeneity` finding on `nic.ib[*].ports[*].rate` or a `nic.ports` finding, is the slow one. Their bandwidths are in
    `groups/<job_id>.json`.
 2. If neither stands out, run the two again with a node that just passed (from a recent `include.sbatch`):
    ```bash
@@ -125,8 +129,8 @@ tell which one is slow:
    `WARN` naming the failing connection.
 
 ## Node Power Limit
-cpu_load judges the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
-default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s).
+cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
+default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). Throttle events are counted over the whole run.
 
 | setting | default | longer |
 |---|---|---|
@@ -134,8 +138,9 @@ default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s).
 | `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:15:00 | 00:20:00 |
 | job time, one node / a switch | ~7 / ~8 min | ~13 / ~15 min |
 
-The clock can drop without thermal throttling: rg21701's busy cores sagged to ~2,600 MHz with its throttle counters
-at 0 and its CPUs at ~65 °C, so only `cpu_load.low_clocks` flags it, not `cpu_load.throttle`.
+The clock can drop without a throttle event: rg21701's busy cores sagged to ~2,600 MHz with its throttle counters
+at 0 and its CPUs at ~65 °C, so only `cpu_load.median` can flag it, not `cpu_load.throttle`. It does so only against
+the run's other packages; a drop every package shares is not flagged.
 
 ## Tools Used
 

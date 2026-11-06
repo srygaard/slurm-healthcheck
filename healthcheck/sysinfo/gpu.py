@@ -5,7 +5,7 @@ import hashlib
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 
 import pynvml
 
@@ -67,9 +67,37 @@ def watts() -> float | None:
         return None
 
 
+class PowerLimits(NamedTuple):
+    """A GPU's power limits in watts. Floats, so finalize's counter deltas leave them out."""
+
+    enforced_w: float | None  # the lowest of every limit set: by an admin, the BMC or the driver
+    default_w: float | None  # the board's default
+
+    def power_capped(self, frac: float) -> bool:
+        """
+        Whether the enforced limit is under frac of the default; False when either can't be read.
+
+        >>> PowerLimits(enforced_w=200.0, default_w=1000.0).power_capped(0.95)
+        True
+        >>> PowerLimits(enforced_w=None, default_w=1000.0).power_capped(0.95)
+        False
+        """
+        return bool(self.enforced_w and self.default_w and self.enforced_w < frac * self.default_w)
+
+
+def _power_limits(handle: Any) -> PowerLimits:
+    enforced = query(pynvml.nvmlDeviceGetEnforcedPowerLimit, handle)
+    default = query(pynvml.nvmlDeviceGetPowerManagementDefaultLimit, handle)
+    return PowerLimits(
+        enforced_w=enforced / 1000 if enforced else None,
+        default_w=default / 1000 if default else None,
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
-class GpuCounters:
-    """One GPU's error counters at a point in time; finalize compares a second snapshot against step 1's."""
+class GpuState:
+    """One GPU's error counters and power limits at a point in time; finalize compares a second snapshot against
+    sysinfo's."""
 
     index: int
     ecc_volatile: dict[str, int | None]
@@ -77,10 +105,13 @@ class GpuCounters:
     remapped_rows: dict[str, int] | None
     nvlink_errors: dict[str, int]
     hw_throttle: list[str]  # Unknown bits are ignored, so this lists only the hardware reasons
+    power_limit_w: float | None  # enforced
+    default_power_limit_w: float | None
 
     @classmethod
     def from_nvml(cls, index: int, handle: Any) -> Self:
         throttle = HwThrottle(_throttle_reasons(handle) or 0)
+        limits = _power_limits(handle)
         return cls(
             index=index,
             ecc_volatile=_ecc_errors(handle, pynvml.NVML_VOLATILE_ECC),
@@ -88,15 +119,21 @@ class GpuCounters:
             remapped_rows=_remapped_rows(handle),
             nvlink_errors=nvlink.errors(handle),
             hw_throttle=[name.lower() for name, reason in HwThrottle.__members__.items() if reason in throttle],
+            power_limit_w=limits.enforced_w,
+            default_power_limit_w=limits.default_w,
         )
+
+    @property
+    def power_limits(self) -> PowerLimits:
+        return PowerLimits(enforced_w=self.power_limit_w, default_w=self.default_power_limit_w)
 
     def to_json(self) -> JsonDict:
         return asdict(self)
 
 
-def counters() -> list[GpuCounters]:
+def states() -> list[GpuState]:
     with session():
-        return [GpuCounters.from_nvml(index, handle) for index, handle in _handles()]
+        return [GpuState.from_nvml(index, handle) for index, handle in _handles()]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -114,7 +151,6 @@ class Gpu(PciDevice):
     pcie_gen_max: int | None
     pcie_width: int | None
     pcie_width_max: int | None
-    power_limit_w: float | None
     max_sm_clock_mhz: int | None
     max_mem_clock_mhz: int | None
     temperature_c: int | None
@@ -127,7 +163,6 @@ class Gpu(PciDevice):
         ecc = query(pynvml.nvmlDeviceGetEccMode, handle)
         mig = query(pynvml.nvmlDeviceGetMigMode, handle)
         memory = query(pynvml.nvmlDeviceGetMemoryInfo, handle)
-        power = query(pynvml.nvmlDeviceGetEnforcedPowerLimit, handle)
         bus_id = pci.busId if pci else None
         return cls.from_sysfs(
             BusId.parse(bus_id.decode() if isinstance(bus_id, bytes) else bus_id),
@@ -144,7 +179,6 @@ class Gpu(PciDevice):
             pcie_gen_max=query(pynvml.nvmlDeviceGetMaxPcieLinkGeneration, handle),
             pcie_width=query(pynvml.nvmlDeviceGetCurrPcieLinkWidth, handle),
             pcie_width_max=query(pynvml.nvmlDeviceGetMaxPcieLinkWidth, handle),
-            power_limit_w=power / 1000 if power else None,
             max_sm_clock_mhz=query(pynvml.nvmlDeviceGetMaxClockInfo, handle, pynvml.NVML_CLOCK_SM),
             max_mem_clock_mhz=query(pynvml.nvmlDeviceGetMaxClockInfo, handle, pynvml.NVML_CLOCK_MEM),
             temperature_c=query(pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_GPU),

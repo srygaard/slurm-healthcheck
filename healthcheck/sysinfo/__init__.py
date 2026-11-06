@@ -43,10 +43,10 @@ class HealthCheck(HealthCheckBase):
         total = topology.total_bytes()
         placements = topology.placements()
         nodes = topology.numa_nodes(placements)
-        with session():  # one NVML init for devices(), info() and counters(): slow without persistence mode
+        with session():  # one NVML init for devices(), info() and states(): slow without persistence mode
             gpus = gpu.devices()
             gpu_info = gpu.info()
-            counters = gpu.counters()
+            counters = gpu.states()
         hcas = nic.hcas()
         return {
             "host": self.host,
@@ -100,7 +100,12 @@ def resolve(data: Any, path: str) -> Any:
     return resolve(value, rest) if rest else value
 
 
-def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> Iterator[Finding]:
+def _findings(
+    data: JsonDict,
+    gpu_cfg: GpuLimits,
+    nic_cfg: Nic,
+    gpus: int,
+) -> Iterator[Finding]:
     devices = data["gpu"]
     if devices["count"] != gpus:
         yield Finding("fail", "gpu.count", f"{devices['count']} GPUs, expected {gpus}")
@@ -120,6 +125,13 @@ def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> It
             yield Finding("fail", "gpu.nvlink", f"GPU{index} {active_links} NVLinks < {gpu_cfg.min_nvlinks}")
     for counters in data.get("counters", []):
         index = counters["index"]
+        limits = gpu.PowerLimits(
+            enforced_w=counters.get("power_limit_w"),
+            default_w=counters.get("default_power_limit_w"),
+        )
+        if limits.power_capped(gpu_cfg.min_power_limit_frac):
+            detail = f"GPU{index} power limit {limits.enforced_w:.0f} W < default {limits.default_w:.0f} W"
+            yield Finding("fail", "gpu.power_limit", detail)
         if (counters["ecc_volatile"]["uncorrected"] or 0) > gpu_cfg.max_volatile_uncorrected_ecc:
             yield Finding("fail", "gpu.ecc", f"GPU{index} {counters['ecc_volatile']['uncorrected']} uncorrected ECC")
         if rows := counters["remapped_rows"]:
@@ -139,10 +151,6 @@ def _findings(data: JsonDict, gpu_cfg: GpuLimits, nic_cfg: Nic, gpus: int) -> It
         yield Finding(
             "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
         )
-    for nic_name, port in active:
-        if (port["rate_gbps"] or 0) < nic_cfg.min_rate_Gbps:
-            rate = f"{nic_name}/{port['port']} {port['rate']} < {nic_cfg.min_rate_Gbps} Gb/s"
-            yield Finding("fail", "nic.rate", rate)
 
 
 def _homogeneity(sysinfos: ByHost[JsonDict], cfg: Homogeneity) -> ByHost[list[Finding]]:

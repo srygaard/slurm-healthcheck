@@ -388,49 +388,83 @@ class HealthCheck(HealthCheckBase):
             for kind, kind_tests in by_kind.items()
         }
         for spec in (cfg.intra, cfg.loopback):
+            fail_floor = _floor(spec, kind_medians)
+            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
             for test in by_kind[spec.name]:
+                busbw = test["peak_busbw"] or 0
                 if not ok(test):
                     detail = f"{test['status']} ({test['log']})"
-                    out[test["nodes"][0]].append(Finding("fail", f"{name}.{spec.name}", detail))
-                elif test["peak_busbw"] < spec.min_busbw_GBps:
-                    detail = f"busbw {test['peak_busbw']} < {spec.min_busbw_GBps}"
-                    out[test["nodes"][0]].append(Finding("fail", f"{name}.{spec.name}", detail))
+                    severity: Severity = "fail"
+                elif busbw < fail_floor:
+                    detail = f"busbw {busbw} < {fail_floor:.1f}"
+                    severity = "fail"
+                elif warn_floor is not None and busbw < warn_floor:
+                    detail = f"busbw {busbw} < {warn_floor:.1f}"
+                    severity = "warn"
+                else:
+                    continue
+                out[test["nodes"][0]].append(Finding(severity, f"{name}.{spec.name}", detail))
 
         # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
-        # bad fails too: with two nodes there is one pair, and nothing tells the two apart.
-        pair_floor = _floor(cfg.pair, kind_medians)
-        slow: ByHost[list[str]] = defaultdict(list)
+        # bad fails too: with two nodes there is one pair, and nothing tells the two apart. A pair under the warn
+        # floor but over the fail floor warns both nodes and fails neither.
+        fail_floor = _floor(cfg.pair, kind_medians)
+        warn_floor = _warn_floor(cfg.pair, kind_medians, fail_floor)
+        failed: ByHost[list[str]] = defaultdict(list)
+        warned: ByHost[list[str]] = defaultdict(list)
         pairs_of: Counter[str] = Counter()
         for test in by_kind[cfg.pair.name]:
             pairs_of.update(test["nodes"])
-            if not ok(test) or test["peak_busbw"] < pair_floor:
-                for node in test["nodes"]:
-                    other = next(peer for peer in test["nodes"] if peer != node)
-                    slow[node].append(f"{other}: {test['status']} {test['peak_busbw']}")
-        for node, partners in slow.items():
-            severity: Severity = "fail" if len(partners) >= 2 or len(partners) == pairs_of[node] else "warn"
-            detail = f"{len(partners)}/{pairs_of[node]} slow pairs (< {pair_floor:.1f}): {'; '.join(partners)}"
+            busbw = test["peak_busbw"] or 0
+            if not ok(test) or busbw < fail_floor:
+                bucket = failed
+            elif warn_floor is not None and busbw < warn_floor:
+                bucket = warned
+            else:
+                continue
+            for node in test["nodes"]:
+                other = next(peer for peer in test["nodes"] if peer != node)
+                bucket[node].append(f"{other}: {test['status']} {busbw}")
+        for node in set(failed) | set(warned):
+            bad = failed[node]
+            if len(bad) >= 2 or (bad and len(bad) == pairs_of[node]):
+                severity: Severity = "fail"
+                partners, floor = bad, fail_floor
+            elif bad:
+                severity = "warn"
+                partners, floor = bad, fail_floor
+            else:
+                severity = "warn"
+                partners, floor = warned[node], warn_floor or fail_floor
+            detail = f"{len(partners)}/{pairs_of[node]} slow pairs (< {floor:.1f}): {'; '.join(partners)}"
             out[node].append(Finding(severity, f"{name}.{cfg.pair.name}", detail))
 
         for spec in (cfg.group, cfg.alltoall):
-            floor = _floor(spec, kind_medians)
+            # A slow whole-job result warns at either floor: it names no node. An unblamed timeout uses
+            # timeout_severity.
+            fail_floor = _floor(spec, kind_medians)
+            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
+            slow_below = warn_floor if warn_floor is not None else fail_floor
             op = spec.binary.removesuffix("_perf")
             for test in by_kind[spec.name]:
-                if not ok(test) or test["peak_busbw"] < floor:
-                    # A hung group test with no node already failing for it can't be blamed on one, so every node fails.
-                    # Alltoall's timeout_severity is warn: a full-cluster timeout names no node.
-                    blamed = any(
-                        finding.severity == "fail"
-                        for node in test["nodes"]
-                        for finding in out.get(node, [])
-                    )
-                    severity = spec.timeout_severity if test["status"] == Status.TIMEOUT and not blamed else "warn"
-                    detail = (
-                        f"{len(test['nodes'])}-node {op} {test['status']} "
-                        f"busbw {test['peak_busbw']} (floor {floor:.1f})"
-                    )
-                    for node in test["nodes"]:
-                        out[node].append(Finding(severity, f"{name}.{spec.name}", detail))
+                busbw = test["peak_busbw"] or 0
+                if ok(test) and busbw >= slow_below:
+                    continue
+                # A hung group test with no node already failing for it can't be blamed on one, so every node fails.
+                # Alltoall's timeout_severity is warn: a full-cluster timeout names no node.
+                blamed = any(
+                    finding.severity == "fail"
+                    for node in test["nodes"]
+                    for finding in out.get(node, [])
+                )
+                severity = spec.timeout_severity if test["status"] == Status.TIMEOUT and not blamed else "warn"
+                floor = fail_floor if not ok(test) or busbw < fail_floor else warn_floor or fail_floor
+                detail = (
+                    f"{len(test['nodes'])}-node {op} {test['status']} "
+                    f"busbw {busbw} (floor {floor:.1f})"
+                )
+                for node in test["nodes"]:
+                    out[node].append(Finding(severity, f"{name}.{spec.name}", detail))
         prefixed = {f"nccl_{kind}_busbw_GBps": value for kind, value in kind_medians.items()}
         return Report(dict(out), prefixed)
 
@@ -439,24 +473,30 @@ def _floor(spec: NcclTest, kind_medians: dict[str, float | None]) -> float:
     return max(spec.min_busbw_GBps, (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
 
 
-def start(check: HealthCheck) -> JsonDict:
-    """Skip a disabled check, record a missing tool, or collect. Writes the group file either way."""
-    if not check.enabled:
-        return check.write_skipped()
-    found = check.available()
-    if not found.available:
-        return check.write_unavailable(found)
-    return check.collect()
+def _warn_floor(spec: NcclTest, kind_medians: dict[str, float | None], fail_floor: float) -> float | None:
+    """The warn line, or None when this kind has no warn fraction. It is never below the fail floor."""
+    if spec.warn_frac_of_median is None:
+        return None
+    return max(fail_floor, (kind_medians.get(spec.name) or 0) * spec.warn_frac_of_median)
 
 
 def main() -> int:
+    """Enabled, then available, then collect. Disabled or a missing tool writes the group file and does not launch."""
     try:
         gres = JobTemplate.load().gres
         if gres is None:
             raise ValueError("job template has no --gpus-per-node")
     except ValueError as error:
         raise SystemExit(error) from error
-    start(HealthCheck(cfg.nccl, cfg.paths, gres.count))
+    check = HealthCheck(cfg.nccl, cfg.paths, gres.count)
+    if not check.enabled:
+        check.write_skipped()
+    else:
+        found = check.available()
+        if not found.available:
+            check.write_unavailable(found)
+        else:
+            check.collect()
     return 0
 
 

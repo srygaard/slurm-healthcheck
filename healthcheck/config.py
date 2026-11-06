@@ -27,17 +27,23 @@ class GpuLimits:
     min_pcie_gen: int  # max link gen (current gen drops at idle)
     min_pcie_width: int
     min_nvlinks: int
+    # How long dcgmi diag may run before it counts as hung: the full dcgm.tests suite on a healthy node plus ~20-40%.
+    # The job template's --time must also fit NCCL after it.
+    dcgm_timeout_s: float
     max_volatile_uncorrected_ecc: int = 0
     max_remap_failures: int = 0
     max_remap_pending: int = 0
+    min_power_limit_frac: float = 0.95
 
 
 # Keyed by the Slurm GRES type in --gpus-per-node. H100 and B200 are PCIe Gen5 x16 with 18 NVLinks.
 # L40S is a PCIe card: Gen4 x16, no NVLink. ECC is on; row remap is an HBM counter and stays at zero.
 gpu_gres: dict[str, GpuLimits] = {
-    "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
-    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18),
-    "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0),
+    # 4x H100: 367 s on Trillium, ~7 min on Rorqual
+    "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=540),
+    # 8x B200 without pcie, which trillium.sh skips: ~510 s estimated from each test alone.
+    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=650),
+    "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=600),
 }
 
 
@@ -53,8 +59,9 @@ def gpu_limits(gres: Gres | None) -> tuple[Gres, GpuLimits]:
 
 
 class Nic(Section):
+    """Port rates are compared to the other nodes and may fail on homogeneity."""
+
     min_active_ib_ports: int = 1
-    min_rate_Gbps: float = 200
     link_layer: str = "InfiniBand"
 
 
@@ -97,14 +104,14 @@ class LocalTmp(Section):
 
 class Dcgm(Section):
     enabled: bool = True
-    level: int = 2  # dcgmi diag -r: 1 software; 2 adds memory, pcie; 3 and 4 add long stress tests
     # Test names to run instead of level (DCGM 4.7); software (~1 s) always runs first and can't be named.
     # Times measured alone on rg32401, 4x H100, with the test_duration parameters below.
     tests: list[str] = [
         "memory",  # 27 s: allocates ~98% of each GPU's memory and checks it
         "pcie",  # 21 s: host<->GPU bandwidth and PCIe replay errors
-        # 53 s: GEMM stress at diagnostic_precision, checks results and throttling. fp16 alone takes as long as DCGM's
-        # default of all three precisions: this dcgm step ran 127 s either way on rg31603.
+        # 53 s at test_duration=30: GEMM stress at diagnostic_precision, checks results and throttling. fp16 alone
+        # takes as long as DCGM's default of all three precisions: this dcgm step ran 127 s either way on rg31603.
+        # 74 s at test_duration=30 on trig0123, 8x B200; 323 s at test_duration=270.
         "diagnostic",
         "targeted_stress",  # 38 s at test_duration=30: holds a target SM load
         "targeted_power",  # 39 s at test_duration=30: holds a target power draw (~610 W average, 700 W peak)
@@ -113,9 +120,8 @@ class Dcgm(Section):
     ]
     port: int = 5556  # for a hostengine we start ourselves
     discovery_timeout_s: float = 15  # a missing hostengine errors at once; a hung discovery must not stall phase A
-    # The configured suite is about 7 min (targeted_power ~280 s, the other tests ~2 min). 10 min leaves the template's
-    # 15 min enough for NCCL after a hang.
-    diag_timeout_s: float = 600
+    # Tests dropped when a GPU's enforced power limit is under GpuLimits.min_power_limit_frac of its default.
+    skip_when_power_capped: list[str] = ["memory", "pcie"]
     parameters: list[str] = [  # dcgmi diag -p, joined with ";"
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
@@ -131,6 +137,19 @@ class Dcgm(Section):
     # diagnostic's per-GPU TFLOPS against the run's median GPU. DCGM's estimate is coarse: at fp16, 640.9 or 659.8.
     diagnostic_min_frac_of_median: float = 0.90  # fail below
     diagnostic_warn_frac_of_median: float = 0.95  # warn below
+
+    @property
+    def suite(self) -> list[str]:
+        """`tests` without those in $HC_DCGM_SKIP_TESTS, comma separated, which a job template sets (trillium.sh: these
+        hang on its B200s). Without targeted_power, dcgm returns well before cpu_load.min_full_power_s, so cpu_load
+        records throttle events but not the full-power clock.
+        """
+        skipped = {test for test in os.environ.get("HC_DCGM_SKIP_TESTS", "").split(",") if test}
+        if unknown := skipped - set(self.tests):
+            # A misspelt name would leave its test in and could push a healthy node past GpuLimits.dcgm_timeout_s
+            known = ", ".join(self.tests)
+            raise ValueError(f"$HC_DCGM_SKIP_TESTS names {', '.join(sorted(unknown))}, not in dcgm.tests ({known})")
+        return [test for test in self.tests if test not in skipped]
 
     @property
     def diagnostic_precision_letter(self) -> str:
@@ -149,10 +168,13 @@ class CpuLoad(Section):
     interval_s: float = 5
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
     min_full_power_s: float = 240  # bare minimum amount of time needed to detect power throttle
-    low_frac: float = 0.10  # a busy-core reading at full GPU power this far below the run's highest counts as low
-    fail_low_share: float = 0.2  # fail above
-    warn_low_share: float = 0.05  # warn above
-    min_frac_of_median: float = 0.9  # busy-core clock at full GPU power, against the median of the run's nodes
+    min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median
+    # A package's busy-core clock at full GPU power, against its own clock while the GPUs draw under
+    # baseline_power_frac of their peak. trig0151 (8x B200, job 1248549) went from 3200 to ~2350 MHz at 7.97 kW with
+    # no throttle event; the run's median can't see that on one node, or when every node sags alike.
+    baseline_power_frac: float = 0.5
+    warn_freq_frac_of_baseline: float = 0.85
+    fail_freq_frac_of_baseline: float = 0.6
 
 
 class NcclTest(Section):
@@ -166,7 +188,8 @@ class NcclTest(Section):
     # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip phase C.
     timeout_s: float = 120
     min_busbw_GBps: float = 0
-    min_frac_of_median: float | None = None  # None: the absolute floor only
+    min_frac_of_median: float | None = 0.9
+    warn_frac_of_median: float | None = 0.95
     # Severity of an unblamed timeout of a whole-job test. A slow result still warns.
     timeout_severity: Literal["fail", "warn"] = "fail"
 
@@ -195,8 +218,8 @@ class Nccl(Section):
         timeout_s=90,
         min_busbw_GBps=3,  # single-node ~6.4; the same 65-node run sat near 3.7, lowest 3.22
     )
-    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20, min_frac_of_median=0.7)
-    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20, min_frac_of_median=0.8)
+    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20)
+    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20)
     alltoall: NcclTest = NcclTest(
         name="alltoall",
         # Off: a 65-node alltoall was still starting at 180 s, and this 600 s timeout does not fit in the template's
@@ -210,7 +233,6 @@ class Nccl(Section):
         # A 64-node run, one 1 GB size: 1.97 GB/s. The floor is about half of that. A leaf was ~6.8; a leaf slow
         # against the other jobs in the run is caught by min_frac_of_median. Such a timeout names no node, so it warns.
         min_busbw_GBps=1.0,
-        min_frac_of_median=0.8,
         timeout_severity="warn",
     )
 
@@ -225,6 +247,11 @@ class Logs(Section):
     ]
     nccl_fail_patterns: list[str] = ["NCCL WARN", "completion with error", "Timeout", "remote process exited"]
     kernel_patterns: list[str] = ["NVRM", "Xid", "mlx5", "nvidia-peermem", "EDAC", "I/O error", "nvme"]
+    # Matched kernel lines that warn instead of failing the node. Other kernel_patterns matches still fail.
+    kernel_warn: list[str] = [
+        "Failed to send inband data: 0",  # NVRM knvlink teardown at the end of each NCCL round; status 0
+        "query_mcia_reg failed",  # mlx5 module query; on these nodes it was the disabled port 0000:d8:00.1
+    ]
     max_nvlink_error_delta: int = 0
 
 
