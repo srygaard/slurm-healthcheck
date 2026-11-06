@@ -14,9 +14,10 @@ from typing import Any
 
 from healthcheck import cpu_load, dcgm, local_tmp, logs, share, sysinfo, xid
 from healthcheck.check import HealthCheckBase, step
-from healthcheck.config import cfg
+from healthcheck.config import cfg, gpu_limits
 from healthcheck.util.file import read_json, write_json
 from healthcheck.util.status import ok
+from launcher.slurm import JobTemplate
 
 # Node steps in report order. logs is phase C; local() runs the rest.
 STEPS: dict[str, type[HealthCheckBase]] = {
@@ -41,7 +42,7 @@ def _check(name: str, host: str, stop_event: threading.Event) -> HealthCheckBase
     if name == "local_tmp":
         return STEPS[name](cfg.local_tmp, host)
     if name == "dcgm":
-        return STEPS[name](cfg.dcgm, cfg.paths.dcgm_logs(host))
+        return STEPS[name](cfg.dcgm, cfg.paths.dcgm_logs(host), lambda: gpu_limits(JobTemplate.load().gres)[1])
     if name == "cpu_load":
         return STEPS[name](cfg.cpu_load, stop_event, sorted(os.sched_getaffinity(0)))
     raise KeyError(name)

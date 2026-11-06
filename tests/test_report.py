@@ -38,6 +38,8 @@ def healthy(host):
         "remapped_rows": {"corrected": 0, "uncorrected": 0, "pending": 0, "failure": 0},
         "nvlink_errors": {"replay": 0},
         "hw_throttle": [],
+        "power_limit_w": 700.0,
+        "default_power_limit_w": 700.0,
     }
     sysinfo = {
         "kernel": "5.14.0",
@@ -78,7 +80,7 @@ def healthy(host):
         "scratch": ok(scratch),
         "project": ok(dict(scratch)),
         "local_tmp": ok(local_tmp),
-        "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}, "messages": []}}}),
+        "dcgm": ok({"status": "ok", "tests": {"memory": {"status": "Pass", "entities": {}}}}),
         "cpu_load": ok({"status": "skipped"}),
         "logs": ok(logs),
     }
@@ -157,6 +159,17 @@ def test_gpu_and_nic_checks(run):
     edit(run, "rg2", bad)
     checks = {finding["check"] for finding in evaluate(run)["nodes"]["rg2"]["findings"]}
     assert checks == {"gpu.nvlink", "homogeneity"}
+
+
+def test_gpu_capped_below_its_default_power_limit_fails(run):
+    def capped(node):
+        node["sysinfo"]["data"]["counters"][3]["power_limit_w"] = 200.0
+
+    edit(run, "rg2", capped)
+    result = evaluate(run)["nodes"]["rg2"]
+    assert [(f["severity"], f["check"], f["detail"]) for f in result["findings"]] == [
+        ("fail", "gpu.power_limit", "GPU3 power limit 200 W < default 700 W")
+    ]
 
 
 def test_port_slower_than_its_peers_fails_that_node(run):
@@ -263,18 +276,16 @@ def test_unreadable_throttle_counters_are_not_findings(run):
     assert statuses(run)["rg1"] == "pass"
 
 
-def test_historical_corrected_ecc_warns(run):
+def test_historical_corrected_ecc_does_not_warn(run):
+    """Lifetime corrected counters that did not rise during the run are not findings; logs grades increases."""
+
     def corrected(node):
         node["sysinfo"]["data"]["counters"][1]["ecc_aggregate"]["corrected"] = 177903
         node["sysinfo"]["data"]["counters"][1]["remapped_rows"]["corrected"] = 2
 
     edit(run, "rg2", corrected)
     result = evaluate(run)["nodes"]["rg2"]
-    assert [(finding["severity"], finding["check"]) for finding in result["findings"]] == [
-        ("warn", "gpu.remap"),
-        ("warn", "gpu.ecc"),
-    ]
-    assert result["status"] == "warn"
+    assert not [finding for finding in result["findings"] if finding["check"] in ("gpu.ecc", "gpu.remap")]
 
 
 def test_known_kernel_lines_warn_and_other_lines_fail(run):
@@ -306,18 +317,15 @@ def test_cpu_load_skipped_or_absent_passes(run):
 
 
 def test_dcgm_tflops_relative_to_median(run):
-    def diagnostic(gflops):
-        messages = [
-            f"GPU {gpu} calculated at approximately {value} gigaflops during this test"
-            for gpu, value in enumerate(gflops)
-        ]
+    def diagnostic(tflops):
+        stored = {str(gpu): value for gpu, value in enumerate(tflops)}
         return lambda node: node["dcgm"]["data"]["tests"].update(
-            diagnostic={"status": "Pass", "entities": {}, "messages": messages}
+            diagnostic={"status": "Pass", "entities": {}, "tflops": stored}
         )
 
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
-        edit(run, host, diagnostic([160231.80, 164944.50, 160231.80, 164944.50]))
-    edit(run, "rg6", diagnostic([160231.80, 150000.0, 140000.0, 160231.80]))
+        edit(run, host, diagnostic([160.23, 164.94, 160.23, 164.94]))
+    edit(run, "rg6", diagnostic([160.23, 150.0, 140.0, 160.23]))
     result = evaluate(run)
     assert [(finding["severity"], finding["detail"]) for finding in result["nodes"]["rg6"]["findings"]] == [
         ("warn", "GPU1 150.0 < 152.2 TFLOPS (frac of median)"),

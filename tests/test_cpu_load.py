@@ -20,14 +20,14 @@ def fake_sysfs(root: Path, packages: dict[int, list[int]], counters: dict[int, d
     return root
 
 
-def test_skipped_when_dcgm_returns_early():
+def test_short_hold_keeps_throttle_deltas_but_no_clock():
     cpu_0 = min(os.sched_getaffinity(0))
     stop_event = threading.Event()
     stop_event.set()  # dcgm skipped: its future is done before the load starts
     out = cpu_load.HealthCheck(CpuLoad(enabled=True), stop_event, [cpu_0]).collect()
-    assert out["status"] == "skipped"
-    assert out["reason"].startswith("dcgm returned after")
-    assert "packages" not in out  # nothing for the report's median
+    assert out["status"] == "ok"
+    assert out["packages"]  # throttle events are still counted
+    assert all(package["full_power_mhz"] is None for package in out["packages"].values())  # too short for a clock
 
 
 def test_packages_split_the_jobs_cpus_by_socket_and_burn_a_share_of_each(tmp_path):
@@ -100,3 +100,25 @@ def test_burner_is_pinned_and_idle_priority():
     finally:
         burner.kill()
         burner.wait()
+
+
+def test_clock_sag_against_own_baseline_warns_then_fails():
+    cfg = CpuLoad()  # warn under 85%, fail under 60% of the baseline
+
+    def sag(mhz):
+        package = {"throttle_delta": {"thermal": 0, "power_limit": 0}, "full_power_mhz": mhz, "baseline_mhz": 3200}
+        return [(f.severity, f.check) for f in cpu_load.CpuPackage.judge("0", package, 0, cfg)]
+
+    assert sag(3100) == []
+    assert sag(2350) == [("warn", "cpu_load.sag")]  # trig0151 at 7.97 kW
+    assert sag(1800) == [("fail", "cpu_load.sag")]
+
+
+def test_unreadable_gpu_power_is_left_out_of_the_baseline():
+    rows = [(0, 3200, 300), (5, 3200, 1000), (10, 3200, 2000)]  # ramp: the baseline
+    rows += [(15 + 5 * k, 2300, 8000) for k in range(4)]  # full power
+    rows += [(35 + 5 * k, 2300, None) for k in range(4)]  # full power, but NVML failed
+    samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
+    summary = cpu_load.summarize(samples, CpuLoad(min_full_power_s=15))
+    assert summary["baseline_mhz"] == {"0": 3200}
+    assert summary["full_power_mhz"] == {"0": 2300}

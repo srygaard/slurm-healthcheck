@@ -9,12 +9,15 @@ import shutil
 import signal
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import pynvml
+
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median, per_host
-from healthcheck.config import Dcgm
+from healthcheck.config import Dcgm, GpuLimits
+from healthcheck.sysinfo import gpu
 from healthcheck.util.cmd import Cmd, ExitCode, run
 from healthcheck.util.file import JsonDict
 from healthcheck.util.hostlist import ByHost
@@ -42,18 +45,29 @@ class DiagError(RuntimeError):
     """dcgmi diag printed no test results."""
 
 
+def _report(stdout: str) -> Any:
+    """The JSON of `dcgmi diag -j`, which some versions print after a banner. ValueError when there is none.
+
+    >>> _report('Successfully ran diagnostic.\\n{"DCGM Diagnostic": {}}')
+    {'DCGM Diagnostic': {}}
+    """
+    return json.loads(stdout[stdout.index("{") :])
+
+
 def _runtime_error(out: Cmd) -> str | None:
     """The "runtime_error" of a `dcgmi diag -j` that refused to run, on one line."""
     try:
-        report = json.loads(out.stdout[out.stdout.index("{") :])
+        report = _report(out.stdout)
     except ValueError:
         return None
     error = report.get("DCGM Diagnostic", {}).get("runtime_error") if isinstance(report, dict) else None
     return " ".join(error.split()) if isinstance(error, str) else None
 
 
-def run_hostengine(cmd: list[str], env: dict[str, str], timeout_s: float) -> Cmd:
-    """Run the self-hosted script in its own session, so a timeout kills nv-hostengine as well as the shell."""
+def run_group(cmd: list[str], env: dict[str, str], timeout_s: float) -> Cmd:
+    """Run cmd in its own session, so a timeout kills everything it started: the self-hosted script's nv-hostengine as
+    well as its shell. With the host's hostengine that is dcgmi alone; the test process belongs to the hostengine, and
+    --enable-heartbeat is meant to stop it, which no run has confirmed."""
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env
@@ -94,24 +108,24 @@ def choose_mode(discovery_timeout_s: float) -> Mode:
 
 
 def diag(
-    mode: Mode, 
-    suite: str, 
-    port: int, 
-    log_dir: Path, 
-    timeout_s: float, 
+    mode: Mode,
+    suite: str,
+    port: int,
+    log_dir: Path,
+    timeout_s: float,
     parameters: str = ""
 ) -> dict[str, Any]:
-    """Run and parse `dcgmi diag`; suite is a level ("1"-"4") or comma-separated test names, and parameters is
-    the `-p` argument, ";"-separated.
+    """Run and parse `dcgmi diag`; suite is comma-separated test names for `-r`, and parameters is the `-p` argument,
+    ";"-separated.
 
     dcgmi exits nonzero when a test fails, so the exit code alone isn't an error: only a run that reported no tests is.
     """
     # DCGM 4 refuses to run when dcgmi and the hostengine see different CUDA_VISIBLE_DEVICES, and Slurm sets it
     # for the job. Jobs hold whole nodes, so testing every GPU is what we want anyway.
     env = {
-        name: value 
-        for name, value 
-        in os.environ.items() 
+        name: value
+        for name, value
+        in os.environ.items()
         if name != "CUDA_VISIBLE_DEVICES"
     }
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -124,15 +138,13 @@ def diag(
             # runs as another user that can't write to our directories, and logs outside them anyway.
             args += ["--debugLogFile", str(log_dir / "nvvs.log"), "--statspath", str(log_dir)]
         args += ["-p", parameters] if parameters else []
-        cmd = command(mode, args, port, tmp)
-        # The shell backgrounds nv-hostengine, so a plain timeout would kill the shell and leave the engine.
-        out = run_hostengine(cmd, env, timeout_s) if mode == Mode.HOST_SELF else run(cmd, timeout=timeout_s, env=env)
-    
+        out = run_group(command(mode, args, port, tmp), env, timeout_s)
+
     # The node JSON keeps only what the report grades; the raw stdout and any stderr are the log.
     (log_dir / "diag.txt").write_text(out.stdout)
     if out.stderr:
         (log_dir / "diag.stderr.txt").write_text(out.stderr)
-    
+
     try:
         tests = parse(out.stdout)["tests"]
     except ValueError:  # no JSON at all
@@ -161,7 +173,7 @@ def parse(stdout: str) -> dict[str, Any]:
     logged no error, and diagnostic keeps each GPU's TFLOPS.
     """
     severity = {"Fail": 3, "Warn": 2, "Pass": 1}  # anything else (Skip, Not Run) ranks 0
-    report = json.loads(stdout[stdout.index("{") :])  # some versions print a banner first
+    report = _report(stdout)
     tests = {}
     for category in _find_categories(report):
         for test in category.get("tests", []):
@@ -205,17 +217,19 @@ _GFLOPS = re.compile(r"GPU (\d+) calculated at approximately ([\d.]+) gigaflops"
 
 def _tflops(lines: list[str]) -> dict[int, float]:
     return {
-        int(gpu): round(float(gflops) / 1000, 2) 
-        for line in lines 
-            for gpu, gflops 
+        int(gpu): round(float(gflops) / 1000, 2)
+        for line in lines
+            for gpu, gflops
             in _GFLOPS.findall(line)
     }
 
 
 class HealthCheck(HealthCheckBase):
-    def __init__(self, cfg: Dcgm, log_dir: Path) -> None:
+    def __init__(self, cfg: Dcgm, log_dir: Path, load_limits: Callable[[], GpuLimits]) -> None:
         self.cfg = cfg
         self.log_dir = log_dir
+        # The job's GPU type's limits. Loaded in collect(), so a bad job template fails this step and not phase A.
+        self.load_limits = load_limits
         self._mode: Mode | None = None
 
     @property
@@ -236,15 +250,31 @@ class HealthCheck(HealthCheckBase):
         mode = self._mode
         if mode is None or mode == Mode.NONE:
             raise RuntimeError("available() did not find a hostengine")
-        tests = ",".join(self.cfg.tests) or str(
-            self.cfg.level
-        )  # the `dcgmi diag -r` argument: the listed tests if any, else the level
+        limits = self.load_limits()
+        capped = self._power_capped_gpus(limits.min_power_limit_frac)
+        skipped = self.cfg.skip_when_power_capped if capped else []
+        suite = [test for test in self.cfg.suite if test not in skipped]
+        if not suite:
+            raise ValueError("dcgm.tests and $HC_DCGM_SKIP_TESTS leave no diagnostic test to run")
+        dropped = [test for test in self.cfg.suite if test in skipped]
+        tests = ",".join(suite)  # dcgmi diag -r
         return {
             "status": Status.OK,
             "mode": mode,
             "suite": tests,
-            **diag(mode, tests, self.cfg.port, self.log_dir, self.cfg.diag_timeout_s, parameters(self.cfg)),
+            **({"power_capped_gpus": capped} if capped else {}),
+            **({"skipped_for_power_cap": dropped} if dropped else {}),
+            **diag(mode, tests, self.cfg.port, self.log_dir, limits.dcgm_timeout_s, parameters(self.cfg)),
         }
+
+    @staticmethod
+    def _power_capped_gpus(frac: float) -> list[int]:
+        """GPUs under frac of their default power limit, as sysinfo's gpu.power_limit grades them; none when NVML
+        can't be read."""
+        try:
+            return [state.index for state in gpu.states() if state.power_limits.power_capped(frac)]
+        except pynvml.NVMLError:  # an unreadable limit must not stop the diagnostic: run the full suite
+            return []
 
     @staticmethod
     def report(results: ByHost[JsonDict], cfg: Dcgm, name: str) -> Report:
@@ -291,22 +321,13 @@ def parameters(cfg: Dcgm) -> str:
 
 def diagnostic_tflops(data: JsonDict) -> dict[int, float]:
     """
-    Each GPU's TFLOPS. A new run stores them; a run from before that keeps them in the diagnostic messages.
+    Each GPU's TFLOPS, as parse() stored them.
 
-    >>> message = "GPU 1 calculated at approximately 160231.80 gigaflops"
-    >>> diagnostic_tflops({"tests": {"diagnostic": {"messages": [message]}}})
-    {1: 160.23}
     >>> diagnostic_tflops({"tests": {"diagnostic": {"tflops": {"1": 160.23}}}})
     {1: 160.23}
     """
-    diagnostic = data.get("tests", {}).get("diagnostic", {})
-    if stored := diagnostic.get("tflops"):
-        return {
-            int(gpu): float(value) 
-            for gpu, value 
-            in stored.items()
-        }
-    return _tflops(diagnostic.get("messages", []))
+    stored = data.get("tests", {}).get("diagnostic", {}).get("tflops", {})
+    return {int(gpu): float(value) for gpu, value in stored.items()}
 
 
 def _skipped(data: JsonDict, cfg: Dcgm, name: str) -> Iterator[Finding]:
@@ -327,8 +348,7 @@ def _findings(data: JsonDict, cfg: Dcgm) -> Iterator[Finding]:
         found = True
         bad = [entity for entity, status in test["entities"].items() if status == test["status"]]
         detail = f"{test_name} {test['status']} on {','.join(bad)}"
-        # A new run stores one line as detail. An older run stored the list under messages.
-        quote = test.get("detail") or next(iter(test.get("messages") or []), None)
+        quote = test.get("detail")
         message = f"{detail}: {quote}" if quote else detail
         yield Finding(severity, "dcgm", message)
     if not found and data.get("returncode"):

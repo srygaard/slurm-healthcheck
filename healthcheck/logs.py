@@ -122,7 +122,7 @@ class HealthCheck(HealthCheckBase):
         return Availability(True)
 
     def collect(self) -> JsonDict:
-        after = [snapshot.to_json() for snapshot in gpu.counters()]
+        after = [snapshot.to_json() for snapshot in gpu.states()]
         return {
             "kernel": kernel(self.cfg.kernel_patterns, self.since),
             "nccl": nccl_logs(self.run.nccl_logs, self.host, self.cfg.nccl_fail_patterns),

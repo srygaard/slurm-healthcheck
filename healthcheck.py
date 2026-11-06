@@ -131,8 +131,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             selection.sinfo_nodes(script.directives.get("partition")),
             f"gpu:{gres}",
             features,
-            # A reservation's idle nodes show as resv, and a MAINT reservation's as maint
-            selection.USABLE_STATES | ({"maint", "resv"} if script.reservation else set()),
+            # A reservation's idle nodes show as resv. Nodes in maint (a MAINT reservation) are never selected.
+            selection.USABLE_STATES | ({"resv"} if script.reservation else set()),
         )
         if skipped:
             states = Counter(node.state for node in skipped)

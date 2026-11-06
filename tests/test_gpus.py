@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from healthcheck.config import GpuLimits, gpu_gres, gpu_limits
@@ -5,11 +7,16 @@ from launcher.slurm import Gres
 
 
 def test_sxm_link_and_ecc_limits():
-    expected = GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18)
-    assert gpu_gres["h100"] == expected
-    assert gpu_gres["b200"] == expected
-    assert expected.max_volatile_uncorrected_ecc == expected.max_remap_failures == expected.max_remap_pending == 0
-    assert gpu_gres["l40s"] == GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0)
+    """The hardware fields. dcgm_timeout_s is tuned from measured suite times, so it is left out."""
+
+    def part(name):
+        return replace(gpu_gres[name], dcgm_timeout_s=0)
+
+    sxm = GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=0)
+    assert part("h100") == part("b200") == sxm
+    assert sxm.max_volatile_uncorrected_ecc == sxm.max_remap_failures == sxm.max_remap_pending == 0
+    pcie = GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=0)
+    assert part("l40s") == pcie
 
 
 def test_gpu_limits_rejects_a_missing_or_unknown_chip():

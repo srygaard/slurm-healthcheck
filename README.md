@@ -60,9 +60,8 @@ Each node runs three phases:
    - **sysinfo**: GPU, NIC, NUMA, software, BIOS, and CPU power. The NUMA layout goes to `<run>/numa/<host>.json`.
    - **scratch**: `$SCRATCH` read; `scratch.enabled: false` skips it, and `setup` skips its files too.
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
-   - **dcgm**: `dcgmi diag` with `dcgm.tests` (~6 min; `targeted_power` 260 s, the others 15–30 s), through the
-     node's hostengine or one the job starts. A GPU fails below 90% of the run's median `diagnostic` TFLOPS
-     (`dcgm.diagnostic_precision`) and warns below 95%.
+   - **dcgm**: `dcgmi diag` with `dcgm.tests`, through the node's hostengine or one the job starts. A sh template
+   drops tests with `HC_DCGM_SKIP_TESTS`.
    - **cpu_load**: busy loops on `cpu_load.busy_frac` of each CPU package's CPUs until dcgm returns. It warns a
      package with any thermal or power-limit throttle event during the run (`thermal_throttle` counters; none are
      recorded on a kernel that does not expose them). Over 4 min or more at full GPU power

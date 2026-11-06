@@ -43,10 +43,10 @@ class HealthCheck(HealthCheckBase):
         total = topology.total_bytes()
         placements = topology.placements()
         nodes = topology.numa_nodes(placements)
-        with session():  # one NVML init for devices(), info() and counters(): slow without persistence mode
+        with session():  # one NVML init for devices(), info() and states(): slow without persistence mode
             gpus = gpu.devices()
             gpu_info = gpu.info()
-            counters = gpu.counters()
+            counters = gpu.states()
         hcas = nic.hcas()
         return {
             "host": self.host,
@@ -125,6 +125,13 @@ def _findings(
             yield Finding("fail", "gpu.nvlink", f"GPU{index} {active_links} NVLinks < {gpu_cfg.min_nvlinks}")
     for counters in data.get("counters", []):
         index = counters["index"]
+        limits = gpu.PowerLimits(
+            enforced_w=counters.get("power_limit_w"),
+            default_w=counters.get("default_power_limit_w"),
+        )
+        if limits.power_capped(gpu_cfg.min_power_limit_frac):
+            detail = f"GPU{index} power limit {limits.enforced_w:.0f} W < default {limits.default_w:.0f} W"
+            yield Finding("fail", "gpu.power_limit", detail)
         if (counters["ecc_volatile"]["uncorrected"] or 0) > gpu_cfg.max_volatile_uncorrected_ecc:
             yield Finding("fail", "gpu.ecc", f"GPU{index} {counters['ecc_volatile']['uncorrected']} uncorrected ECC")
         if rows := counters["remapped_rows"]:
@@ -132,11 +139,6 @@ def _findings(
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap failure")
             if rows["pending"] > gpu_cfg.max_remap_pending:
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap pending (needs reset)")
-            if (rows["corrected"] or 0) > gpu_cfg.max_remap_corrected:
-                yield Finding("warn", "gpu.remap", f"GPU{index} {rows['corrected']} corrected row remaps")
-        corrected = counters["ecc_aggregate"]["corrected"] or 0
-        if corrected > gpu_cfg.max_aggregate_corrected_ecc:
-            yield Finding("warn", "gpu.ecc", f"GPU{index} {corrected} corrected ECC errors (aggregate)")
 
     active = [
         (dev["name"], port)

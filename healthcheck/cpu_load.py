@@ -83,24 +83,24 @@ class CpuPackage:
         """One package per socket the job's cpus sit on, each with its own frac of them busy. A CPU with no topology
         (a container, a VM) counts under socket 0."""
         socket_of = {
-            placement.cpu: placement.socket 
-            for placement 
+            placement.cpu: placement.socket
+            for placement
             in placements(sys_root)
         }
         by_socket: dict[int, list[int]] = {}
         for cpu in sorted(cpus):
             by_socket.setdefault(socket_of.get(cpu, 0), []).append(cpu)
         return [
-            cls(socket, mine, cls.spread(mine, frac), sys_root) 
-            for socket, mine 
+            cls(socket, mine, cls.spread(mine, frac), sys_root)
+            for socket, mine
             in sorted(by_socket.items())
         ]
 
-    def burn(self) -> None:
+    def burn_start(self) -> None:
         for cpu in self.busy:
             self.burners.append(self.start_burner(cpu))
 
-    def stop(self) -> None:
+    def burn_stop(self) -> None:
         for burner in self.burners:
             burner.kill()
         for burner in self.burners:
@@ -124,9 +124,9 @@ class CpuPackage:
         """
         cpu_root = self.sys_root / "devices/system/cpu"
         dirs = [
-            path 
-            for cpu 
-            in self.cpus 
+            path
+            for cpu
+            in self.cpus
             if (path := cpu_root / f"cpu{cpu}/thermal_throttle").is_dir()
         ]
         if not dirs:
@@ -159,8 +159,8 @@ class CpuPackage:
         if None in (before, after):
             return None
         return {
-            cause: after[cause] - before[cause] 
-            for cause 
+            cause: after[cause] - before[cause]
+            for cause
             in after
         }
 
@@ -168,12 +168,18 @@ class CpuPackage:
         """The events since a throttles() read taken before the burn."""
         return self.delta(before, self.throttles())
 
-    def record(self, before: dict[str, int] | None, full_power_mhz: float | None) -> JsonDict:
+    def record(
+        self,
+        before: dict[str, int] | None,
+        full_power_mhz: float | None,
+        baseline_mhz: float | None
+    ) -> JsonDict:
         """This package's part of the node JSON."""
         return {
             "busy_cpus": cpulist(self.busy),
             "throttle_delta": self.throttle_delta(before),
             "full_power_mhz": full_power_mhz,
+            "baseline_mhz": baseline_mhz,
         }
 
     @staticmethod
@@ -182,8 +188,10 @@ class CpuPackage:
         return "" if socket == "all" else f"package {socket}: "
 
     @classmethod
-    def judge(cls, socket: str, package: JsonDict, floor: float) -> Iterator[Finding]:
-        """This package's findings, each a warning: a throttle event, or a clock under the run's floor."""
+    def judge(cls, socket: str, package: JsonDict, floor: float, cfg: CpuLoad) -> Iterator[Finding]:
+        """This package's findings: a throttle event or a clock under the run's floor warns. A clock under a share of
+        the package's own clock before the GPUs loaded up warns below cfg.warn_freq_frac_of_baseline and fails below
+        cfg.fail_freq_frac_of_baseline."""
         counts = package.get("throttle_delta")
         if counts and any(counts.values()):
             events = f"{counts['thermal']} thermal and {counts['power_limit']} power-limit throttle events"
@@ -192,6 +200,15 @@ class CpuPackage:
         if mhz is not None and mhz < floor:
             detail = f"{cls.label(socket)}busy-core clock {mhz} < {floor:.0f} MHz"
             yield Finding("warn", "cpu_load.median", detail)
+        baseline = package.get("baseline_mhz")
+        if mhz is None or not baseline:
+            return
+        for severity, frac in (("fail", cfg.fail_freq_frac_of_baseline), ("warn", cfg.warn_freq_frac_of_baseline)):
+            if mhz < frac * baseline:
+                clock = f"busy-core clock {mhz} MHz at full GPU power < {frac:.0%} of {baseline} MHz"
+                detail = f"{cls.label(socket)}{clock}"
+                yield Finding(severity, "cpu_load.sag", detail)
+                break
 
 
 def _clocks(sample: JsonDict) -> dict[str, float | None]:
@@ -202,29 +219,43 @@ def _clocks(sample: JsonDict) -> dict[str, float | None]:
 def summarize(samples: list[JsonDict], cfg: CpuLoad) -> JsonDict:
     """
     Each package's median busy-core clock at full GPU power: the samples drawing at least full_power_frac of the run's
-    peak GPU power, if they span min_full_power_s. The median keeps a few halted 200 MHz readings from setting the
-    clock. The first sample is left out: it is taken as the burners start, so it can still read idle clocks.
+    peak GPU power, if they span min_full_power_s. Its baseline is the median over the samples under
+    baseline_power_frac of that peak, the ramp before and after; none when there are fewer than two. The median keeps
+    a few halted 200 MHz readings from setting either clock. The first sample is left out: it is taken as the burners
+    start, so it can still read idle clocks.
 
-    >>> rows = ((0, 3900, 300), (5, 3000, 7000), (10, 3000, 7000), (15, 200, 7000), (20, 3000, 7000))
+    >>> rows = ((0, 3900, 300), (5, 3200, 1000), (10, 3200, 2000), (15, 2400, 7000), (20, 200, 7000), (25, 2400, 7000))
     >>> samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
     >>> summarize(samples, CpuLoad(min_full_power_s=15))
-    {'full_power_samples': 4, 'full_power_mhz': {'0': 3000}}
+    {'full_power_samples': 3, 'full_power_mhz': {'0': 2400}, 'baseline_mhz': {'0': 3200}}
     >>> summarize(samples, CpuLoad(min_full_power_s=25))
-    {'full_power_samples': 4, 'full_power_mhz': {}}
+    {'full_power_samples': 3, 'full_power_mhz': {}, 'baseline_mhz': {}}
     """
     samples = samples[1:]  # the first reading is taken as the burners start, before the cores settle to the burn clock
     peak = max((sample["gpu_w"] or 0 for sample in samples), default=0)
     loaded = [sample for sample in samples if peak and (sample["gpu_w"] or 0) >= cfg.full_power_frac * peak]
     if len(loaded) * cfg.interval_s < cfg.min_full_power_s:
-        return {"full_power_samples": len(loaded), "full_power_mhz": {}}
-    clocks = [_clocks(sample) for sample in loaded]
-    sockets = sorted({socket for sample in clocks for socket in sample})
+        return {"full_power_samples": len(loaded), "full_power_mhz": {}, "baseline_mhz": {}}
+    # A sample whose GPU power couldn't be read is in neither group: it may have been taken at full power
+    unloaded = [
+        sample
+        for sample in samples
+        if sample["gpu_w"] is not None and sample["gpu_w"] < cfg.baseline_power_frac * peak
+    ]
     return {
         "full_power_samples": len(loaded),
-        "full_power_mhz": {
-            socket: CpuPackage.median_mhz([sample[socket] for sample in clocks if sample.get(socket) is not None])
-            for socket in sockets
-        },
+        "full_power_mhz": _median_clocks(loaded),
+        "baseline_mhz": _median_clocks(unloaded) if len(unloaded) >= 2 else {},
+    }
+
+
+def _median_clocks(samples: list[JsonDict]) -> dict[str, int | None]:
+    """Each package's median clock over these samples."""
+    clocks = [_clocks(sample) for sample in samples]
+    sockets = sorted({socket for sample in clocks for socket in sample})
+    return {
+        socket: CpuPackage.median_mhz([sample[socket] for sample in clocks if sample.get(socket) is not None])
+        for socket in sockets
     }
 
 
@@ -250,18 +281,18 @@ class HealthCheck(HealthCheckBase):
         """Hold the load until stop_event is set; cpus are the job's, os.sched_getaffinity(0).
 
         The burners run at SCHED_IDLE, so the other phase A steps, DCGM and the Xid watcher never wait for a CPU.
-        They stop when dcgm returns; its own timeout ends a hang.
+        They stop when dcgm returns and, if it failed, its test lets go of the GPUs; both are bounded by timeouts.
         """
         before = {
-            package.socket: package.throttles() 
-            for package 
+            package.socket: package.throttles()
+            for package
             in self.packages
         }
         samples = []
         start = time.monotonic()
         try:
             for package in self.packages:
-                package.burn()
+                package.burn_start()
             with contextlib.ExitStack() as nvml:
                 with contextlib.suppress(pynvml.NVMLError):  # gpu_w is None without a driver
                     nvml.enter_context(session())
@@ -272,7 +303,7 @@ class HealthCheck(HealthCheckBase):
                             "t_s": round(time.monotonic() - start, 1),
                             "gpu_w": watts(),
                             "mhz": {
-                                str(package.socket): package.busy_mhz(clocks) 
+                                str(package.socket): package.busy_mhz(clocks)
                                 for package in self.packages
                             },
                         }
@@ -280,10 +311,10 @@ class HealthCheck(HealthCheckBase):
                     self.stop_event.wait(self.cfg.interval_s)
         finally:
             for package in self.packages:
-                package.stop()
+                package.burn_stop()
         held_s = round(time.monotonic() - start, 1)
-        if held_s < self.cfg.min_full_power_s:  # dcgm skipped or failed early: too short to judge
-            return {"status": Status.SKIPPED, "held_s": held_s, "reason": f"dcgm returned after {held_s} s"}
+        # A short hold (dcgm skipped, failed early, or ran without targeted_power) still counts throttle events;
+        # summarize leaves each package's clock None when full GPU power didn't span min_full_power_s.
         summary = summarize(samples, self.cfg)
         return {
             "status": Status.OK,
@@ -291,7 +322,9 @@ class HealthCheck(HealthCheckBase):
             "full_power_samples": summary["full_power_samples"],
             "packages": {
                 str(package.socket): package.record(
-                    before[package.socket], summary["full_power_mhz"].get(str(package.socket))
+                    before[package.socket],
+                    summary["full_power_mhz"].get(str(package.socket)),
+                    summary["baseline_mhz"].get(str(package.socket)),
                 )
                 for package in self.packages
             },
@@ -318,7 +351,7 @@ class HealthCheck(HealthCheckBase):
             found = [
                 finding
                 for socket, package in data["packages"].items()
-                for finding in CpuPackage.judge(socket, package, floor)
+                for finding in CpuPackage.judge(socket, package, floor, cfg)
             ]
             if found:
                 findings[host] = found
@@ -340,6 +373,13 @@ def _packages(data: JsonDict, cfg: CpuLoad) -> dict[str, JsonDict]:
         throttles = {"thermal": legacy, "power_limit": 0} if legacy is not None else None
         packages = {"all": {"full_power_mhz": data.get("full_power_mhz"), "throttle_delta": throttles}}
     if data.get("samples"):
-        clocks = summarize(data["samples"], cfg)["full_power_mhz"]
-        packages = {socket: {**package, "full_power_mhz": clocks.get(socket)} for socket, package in packages.items()}
+        summary = summarize(data["samples"], cfg)
+        packages = {
+            socket: {
+                **package,
+                "full_power_mhz": summary["full_power_mhz"].get(socket),
+                "baseline_mhz": summary["baseline_mhz"].get(socket),
+            }
+            for socket, package in packages.items()
+        }
     return packages
