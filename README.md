@@ -62,11 +62,12 @@ Each node runs three phases:
    - **local_tmp**: `/tmp` free space and write/read, and SMART health (usually root-only).
    - **dcgm**: `dcgmi diag` with `dcgm.tests`, through the node's hostengine or one the job starts. A sh template
    drops tests with `HC_DCGM_SKIP_TESTS`.
-   - **cpu_load**: busy loops on `cpu_load.busy_frac` of each CPU package's CPUs until dcgm returns. It warns a
-     package with any thermal or power-limit throttle event during the run (`thermal_throttle` counters; none are
-     recorded on a kernel that does not expose them). Over 4 min or more at full GPU power
-     ([Power limit](#power-limit)), it also warns a package whose median busy-core clock is under 90% of the median of
-     the run's packages.
+   - **cpu_load**: busy loops on `cpu_load.busy_frac` of each CPU package's CPUs until dcgm returns. Per package:
+     - **throttle**: warns on any thermal throttling episode during the full load.
+     - **median**: warns if loaded CPU clock at full GPU power is under 90% of the run's median.
+     - **sag**: warns if the median CPU clocks drop by 15% during full load. Fails when dropped by more than 40%.
+
+     The clocks are graded only after 4 min at full GPU power ([Node Power Limit](#node-power-limit)).
 2. **Phase B**, `all_reduce_perf` with 4 ranks per node:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
@@ -130,7 +131,7 @@ tell which one is slow:
 
 ## Node Power Limit
 cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
-default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). Throttle events are counted over the whole run.
+default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). Throttling events are counted over the whole burn.
 
 | setting | default | longer |
 |---|---|---|
@@ -138,9 +139,7 @@ default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). Throttle ev
 | `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:15:00 | 00:20:00 |
 | job time, one node / a switch | ~7 / ~8 min | ~13 / ~15 min |
 
-The clock can drop without a throttle event: rg21701's busy cores sagged to ~2,600 MHz with its throttle counters
-at 0 and its CPUs at ~65 °C, so only `cpu_load.median` can flag it, not `cpu_load.throttle`. It does so only against
-the run's other packages; a drop every package shares is not flagged.
+The CPU clocks may drop without a throttle event. The `cpu_load.sag` compares each package with its own clock before the stress test.
 
 ## Tools Used
 

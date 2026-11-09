@@ -11,7 +11,7 @@ from healthcheck.check import step
 from healthcheck.config import Dcgm, GpuLimits
 from healthcheck.util.cmd import Cmd, ExitCode
 
-SXM = dict(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18)
+SXM = {"require_ecc": True, "min_pcie_gen": 5, "min_pcie_width": 16, "min_nvlinks": 18}
 
 
 def limits(timeout_s: float = 600):
@@ -196,4 +196,4 @@ def test_bad_job_template_fails_only_the_dcgm_step(monkeypatch, tmp_path):
 def test_misspelt_skip_name_is_rejected(monkeypatch):
     monkeypatch.setenv("HC_DCGM_SKIP_TESTS", "PCIe")
     with pytest.raises(ValueError, match="PCIe, not in dcgm.tests"):
-        Dcgm().suite
+        _ = Dcgm().suite

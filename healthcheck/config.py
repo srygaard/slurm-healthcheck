@@ -165,12 +165,12 @@ class CpuLoad(Section):
 
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
-    interval_s: float = 5
+    interval_s: float = 1  # at 5 s the median of a ~4 min full-power window shifted with the sampling phase
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
-    min_full_power_s: float = 240  # bare minimum amount of time needed to detect power throttle
+    min_full_power_s: float = 240  # time at full GPU power needed before the clocks are graded
     min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median
     # A package's busy-core clock at full GPU power, against its own clock while the GPUs draw under
-    # baseline_power_frac of their peak. trig0151 (8x B200, job 1248549) went from 3200 to ~2350 MHz at 7.97 kW with
+    # baseline_power_frac of their peak. trig0151 (8x B200) went from 3200 to ~2350 MHz at 7.97 kW with
     # no throttle event; the run's median can't see that on one node, or when every node sags alike.
     baseline_power_frac: float = 0.5
     warn_freq_frac_of_baseline: float = 0.85

@@ -6,18 +6,27 @@ from healthcheck import cpu_load
 from healthcheck.config import CpuLoad
 
 
-def fake_sysfs(root: Path, packages: dict[int, list[int]], counters: dict[int, dict[str, int]] | None = None) -> Path:
-    """cpu<N>/topology/physical_package_id for each CPU, and a thermal_throttle directory with its counters."""
+def fake_sysfs(root: Path, packages: dict[int, list[int]]) -> Path:
+    """cpu<N>/topology/physical_package_id for each CPU."""
     for socket, cpus in packages.items():
         for cpu in cpus:
-            directory = root / "devices/system/cpu" / f"cpu{cpu}"
-            (directory / "topology").mkdir(parents=True)
-            (directory / "topology/physical_package_id").write_text(f"{socket}\n")
-            if counters and cpu in counters:
-                (directory / "thermal_throttle").mkdir()
-                for name, value in counters[cpu].items():
-                    (directory / "thermal_throttle" / name).write_text(f"{value}\n")
+            directory = root / "devices/system/cpu" / f"cpu{cpu}/topology"
+            directory.mkdir(parents=True)
+            (directory / "physical_package_id").write_text(f"{socket}\n")
     return root
+
+
+def fake_counter(monkeypatch, *reads: str | None) -> list[Path]:
+    """Stand in for sysfs: each read_sys() call returns the next of reads. The paths read are collected."""
+    paths: list[Path] = []
+    values = iter(reads)
+
+    def read_sys(path: Path) -> str | None:
+        paths.append(path)
+        return next(values)
+
+    monkeypatch.setattr(cpu_load, "read_sys", read_sys)
+    return paths
 
 
 def test_short_hold_keeps_throttle_deltas_but_no_clock():
@@ -50,45 +59,32 @@ def test_package_mhz_is_the_mean_of_its_busy_cores_only():
     assert package.busy_mhz({2: 200.0}) is None
 
 
-def test_throttles_sum_core_counters_and_read_the_package_counter_once(tmp_path):
-    counters = {
-        cpu: {
-            "core_throttle_count": 1 if cpu < 2 else 0,
-            "package_throttle_count": 5,  # the same package-wide value in every CPU's directory
-            "core_power_limit_count": 0,
-            "package_power_limit_count": 2 if cpu else 0,
-        }
-        for cpu in range(4)
-    }
-    root = fake_sysfs(tmp_path, {0: [0, 1, 2, 3]}, counters)
-    (package,) = cpu_load.CpuPackage.of_job([0, 1, 2, 3], 1.0, root)
-    assert package.throttles() == {"thermal": 2 + 5, "power_limit": 0 + 2}
+def test_thermal_throttles_read_only_the_package_counter_of_the_first_cpu(tmp_path):
+    for cpu in (48, 49):
+        directory = tmp_path / f"cpu{cpu}/thermal_throttle"
+        directory.mkdir(parents=True)
+        (directory / "core_throttle_count").write_text("1\n")  # per core: not counted
+        (directory / "package_power_limit_count").write_text("2\n")  # not counted
+        (directory / "package_throttle_count").write_text(f"{cpu}\n")  # the same in every CPU's directory, but not here
+    assert cpu_load.CpuPackage(socket=1, cpus=[48, 49], busy=[]).thermal_throttles(tmp_path) == 48
 
 
-def test_throttles_are_none_without_counters(tmp_path):
-    root = fake_sysfs(tmp_path, {0: [0, 1]})
-    (package,) = cpu_load.CpuPackage.of_job([0, 1], 1.0, root)
-    assert package.throttles() is None
+def test_thermal_throttles_read_sysfs_by_default(monkeypatch):
+    paths = fake_counter(monkeypatch, "5")
+    assert cpu_load.CpuPackage(socket=1, cpus=[48, 49], busy=[]).thermal_throttles() == 5
+    assert paths == [Path("/sys/devices/system/cpu/cpu48/thermal_throttle/package_throttle_count")]
 
 
-def test_missing_power_limit_files_count_as_zero(tmp_path):
-    root = fake_sysfs(tmp_path, {0: [0]}, {0: {"core_throttle_count": 3, "package_throttle_count": 1}})
-    (package,) = cpu_load.CpuPackage.of_job([0], 1.0, root)
-    assert package.throttles() == {"thermal": 4, "power_limit": 0}
-
-
-def test_the_full_power_clock_is_the_median_so_halted_readings_do_not_set_it():
-    # Eight readings at 2300 MHz under full GPU power, two halted at 200 MHz, after a 3200 MHz start-up reading.
-    rows = [(0, 3200, 300)] + [(5 * i, 2300, 7000) for i in range(1, 9)] + [(45, 200, 7000), (50, 200, 7000)]
-    samples = [{"t_s": t, "mhz": {"0": mhz, "1": 2300}, "gpu_w": w} for t, mhz, w in rows]
-    summary = cpu_load.summarize(samples, CpuLoad(min_full_power_s=15))
-    assert summary["full_power_mhz"] == {"0": 2300, "1": 2300}
-
-
-def test_old_samples_with_one_busy_mhz_summarize_as_package_all():
-    rows = [(0, 3200, 300)] + [(5 * i, 2300, 7000) for i in range(1, 5)]
-    samples = [{"t_s": t, "busy_mhz": mhz, "gpu_w": w} for t, mhz, w in rows]
-    assert cpu_load.summarize(samples, CpuLoad(min_full_power_s=15))["full_power_mhz"] == {"all": 2300}
+def test_thermal_throttles_count_only_the_episodes_during_the_burn(monkeypatch):
+    fake_counter(monkeypatch, "10", "12", "12", None, None)  # one burn, then a burn and a read without the counter
+    package = cpu_load.CpuPackage(socket=0, cpus=[0], busy=[])  # no busy CPUs, so no burners start
+    with package.burning():
+        pass
+    assert package.burn_throttles == 2
+    with package.burning():
+        pass
+    assert package.burn_throttles is None  # the last burn's episodes are dropped
+    assert package.thermal_throttles() is None
 
 
 def test_burner_is_pinned_and_idle_priority():
@@ -103,15 +99,33 @@ def test_burner_is_pinned_and_idle_priority():
 
 
 def test_clock_sag_against_own_baseline_warns_then_fails():
-    cfg = CpuLoad()  # warn under 85%, fail under 60% of the baseline
-
     def sag(mhz):
-        package = {"throttle_delta": {"thermal": 0, "power_limit": 0}, "full_power_mhz": mhz, "baseline_mhz": 3200}
-        return [(f.severity, f.check) for f in cpu_load.CpuPackage.judge("0", package, 0, cfg)]
+        record = cpu_load.PackageRecord("0", 0, mhz, 3200)
+        return [(f.severity, f.check) for f in record.findings(0, fail_frac=0.6, warn_frac=0.85)]
 
     assert sag(3100) == []
     assert sag(2350) == [("warn", "cpu_load.sag")]  # trig0151 at 7.97 kW
     assert sag(1800) == [("fail", "cpu_load.sag")]
+
+
+def test_a_package_record_reads_back_as_written():
+    record = cpu_load.PackageRecord("1", 3, 2300, 3200, "48-53,55-60")
+    data = {"packages": {record.socket: record.to_json()}}  # no samples, so the clocks are read as written
+    assert cpu_load.PackageRecord.of_node(data, CpuLoad()) == [record]
+
+
+def test_an_older_record_with_a_throttle_delta_still_reads():
+    data = {"packages": {"0": {"throttle_delta": {"thermal": 1, "power_limit": 0}, "full_power_mhz": 2300}}}
+    (record,) = cpu_load.PackageRecord.of_node(data, CpuLoad())
+    assert record.thermal_throttles == 1
+
+
+def test_time_at_full_power_comes_from_the_runs_own_sampling_interval():
+    # An older run sampled every 5 s, though interval_s is now 1: 6 readings at full power are 30 s, not 6 s
+    rows = [(0, 3200, 300), (5, 3200, 1000), (10, 3200, 2000)] + [(15 + 5 * k, 2300, 8000) for k in range(6)]
+    samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
+    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=30)).of("0").full_power_mhz == 2300
+    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=35)).of("0").full_power_mhz is None
 
 
 def test_unreadable_gpu_power_is_left_out_of_the_baseline():
@@ -119,6 +133,5 @@ def test_unreadable_gpu_power_is_left_out_of_the_baseline():
     rows += [(15 + 5 * k, 2300, 8000) for k in range(4)]  # full power
     rows += [(35 + 5 * k, 2300, None) for k in range(4)]  # full power, but NVML failed
     samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
-    summary = cpu_load.summarize(samples, CpuLoad(min_full_power_s=15))
-    assert summary["baseline_mhz"] == {"0": 3200}
-    assert summary["full_power_mhz"] == {"0": 2300}
+    summary = cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=15))
+    assert summary.of("0") == cpu_load.Clocks(full_power_mhz=2300, baseline_mhz=3200)
