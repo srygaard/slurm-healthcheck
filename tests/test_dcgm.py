@@ -2,7 +2,6 @@ import json
 import os
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -143,9 +142,7 @@ def test_step_unavailable_does_not_collect(monkeypatch, tmp_path):
     assert "data" not in result
 
 
-@pytest.fixture
-def collect(monkeypatch, tmp_path):
-    """collect() on 4 GPUs, the given ones capped at the GpuLimits default 0.95; diag records its timeout."""
+def test_collect_runs_every_test_under_the_gpu_types_timeout(monkeypatch, tmp_path):
     timeouts = []
 
     def diag(mode, suite, port, log_dir, timeout_s, *args):
@@ -153,27 +150,10 @@ def collect(monkeypatch, tmp_path):
         return {}
 
     monkeypatch.setattr(dcgm, "diag", diag)
-
-    def run(capped):
-        def power_limits(i):
-            return SimpleNamespace(power_capped=lambda frac: frac == 0.95 and i in capped)
-
-        states = [SimpleNamespace(index=i, power_limits=power_limits(i)) for i in range(4)]
-        monkeypatch.setattr(dcgm.gpu, "states", lambda: states)
-        check = dcgm.HealthCheck(Dcgm(), tmp_path, limits(900))
-        check._mode = dcgm.Mode.HOST
-        return check.collect() | {"timeout_s": timeouts[-1]}
-
-    return run
-
-
-def test_memory_is_dropped_only_on_power_capped_gpus(collect):
-    healthy = collect([])
-    assert "memory" in healthy["suite"].split(",") and "power_capped_gpus" not in healthy
-    capped = collect([0, 1])
-    assert capped["suite"].split(",") == ["pcie", "diagnostic", "targeted_stress", "targeted_power"]
-    assert capped["skipped_for_power_cap"] == ["memory"] and capped["power_capped_gpus"] == [0, 1]
-    assert healthy["timeout_s"] == capped["timeout_s"] == 900  # the GPU type's timeout, not a global one
+    check = dcgm.HealthCheck(Dcgm(), tmp_path, limits(900))
+    check._mode = dcgm.Mode.HOST
+    assert check.collect()["suite"] == ",".join(Dcgm().tests)
+    assert timeouts == [900]  # the GPU type's timeout, not a global one
 
 
 def test_bad_job_template_fails_only_the_dcgm_step(monkeypatch, tmp_path):

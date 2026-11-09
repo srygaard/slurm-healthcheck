@@ -128,9 +128,6 @@ class Dcgm(Section):
     ]
     port: int = 5556  # for a hostengine we start ourselves
     discovery_timeout_s: float = 15  # a missing hostengine errors at once; a hung discovery must not stall phase A
-    # Tests dropped when a GPU's enforced power limit is under GpuLimits.min_power_limit_frac of its default: memory
-    # hangs to the dcgm timeout on a B200 capped at 200 W.
-    skip_when_power_capped: list[str] = ["memory"]
     parameters: list[str] = [  # dcgmi diag -p, joined with ";"
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each

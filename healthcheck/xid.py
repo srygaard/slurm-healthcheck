@@ -28,7 +28,12 @@ class EmitFn(Protocol):
     """
 
     def __call__(
-        self, *, event: Event, gpu: int | None = None, xid: int | None = None, error: str | None = None
+        self,
+        *,
+        event: Event,
+        gpu: int | None = None,
+        xid: int | None = None,
+        error: str | None = None
     ) -> None: ...
 
 
