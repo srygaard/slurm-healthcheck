@@ -13,11 +13,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import pynvml
-
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median, per_host
 from healthcheck.config import Dcgm, GpuLimits
-from healthcheck.sysinfo import gpu
 from healthcheck.util.cmd import Cmd, ExitCode, run
 from healthcheck.util.file import JsonDict
 from healthcheck.util.hostlist import ByHost
@@ -250,31 +247,16 @@ class HealthCheck(HealthCheckBase):
         mode = self._mode
         if mode is None or mode == Mode.NONE:
             raise RuntimeError("available() did not find a hostengine")
+        if not self.cfg.tests:
+            raise ValueError("dcgm.tests has no diagnostic test to run")
         limits = self.load_limits()
-        capped = self._power_capped_gpus(limits.min_power_limit_frac)
-        skipped = self.cfg.skip_when_power_capped if capped else []
-        suite = [test for test in self.cfg.suite if test not in skipped]
-        if not suite:
-            raise ValueError("dcgm.tests and $HC_DCGM_SKIP_TESTS leave no diagnostic test to run")
-        dropped = [test for test in self.cfg.suite if test in skipped]
-        tests = ",".join(suite)  # dcgmi diag -r
+        tests = ",".join(self.cfg.tests)  # dcgmi diag -r
         return {
             "status": Status.OK,
             "mode": mode,
             "suite": tests,
-            **({"power_capped_gpus": capped} if capped else {}),
-            **({"skipped_for_power_cap": dropped} if dropped else {}),
             **diag(mode, tests, self.cfg.port, self.log_dir, limits.dcgm_timeout_s, parameters(self.cfg)),
         }
-
-    @staticmethod
-    def _power_capped_gpus(frac: float) -> list[int]:
-        """GPUs under frac of their default power limit, as sysinfo's gpu.power_limit grades them; none when NVML
-        can't be read."""
-        try:
-            return [state.index for state in gpu.states() if state.power_limits.power_capped(frac)]
-        except pynvml.NVMLError:  # an unreadable limit must not stop the diagnostic: run the full suite
-            return []
 
     @staticmethod
     def report(results: ByHost[JsonDict], cfg: Dcgm, name: str) -> Report:
@@ -336,14 +318,12 @@ def _skipped(data: JsonDict, cfg: Dcgm, name: str) -> Iterator[Finding]:
         yield Finding("warn", name, f"not run (dcgm={data.get('mode')})")
 
 
-def _findings(data: JsonDict, cfg: Dcgm) -> Iterator[Finding]:
+def _findings(data: JsonDict, _cfg: Dcgm) -> Iterator[Finding]:
     found = False
     for test_name, test in data["tests"].items():
-        if test["status"] in cfg.fail_on:
-            severity: Severity = "fail"
-        elif test["status"] in cfg.warn_on:
-            severity = "warn"
-        else:
+        # A test's status is its worst GPU's (parse()), so Skip or Not Run is the status only when no GPU passed
+        severity = test["status"].lower()  # dcgmi's Fail and Warn are our fail and warn
+        if severity not in ("fail", "warn"):
             continue
         found = True
         bad = [entity for entity, status in test["entities"].items() if status == test["status"]]

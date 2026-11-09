@@ -2,7 +2,8 @@
 # nccl-tests, the shared venv and $SCRATCH and $PROJECT read-test files.
 set -euo pipefail
 
-type module &>/dev/null || source /etc/profile  # Lmod
+# Lmod; an exported module() may lack its helper. Trillium's /etc/profile reads unset variables.
+module --version &>/dev/null || { set +u; source /etc/profile; set -u; }
 if [[ $HC_CLUSTER == mila ]]; then source "$HC_CODE/slurm/scripts/.mila.env"; else source "$HC_CODE/slurm/scripts/.drac.env"; fi
 module load $HC_MODULES
 HC_PYTHON=$("$HC_UV" python find --project "$HC_CODE")  # .python-version's, from a module or uv's own installs

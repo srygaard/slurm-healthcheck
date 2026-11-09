@@ -1,4 +1,7 @@
+import contextlib
 import json
+import os
+import signal
 
 from healthcheck import xid
 from healthcheck.util.status import Status
@@ -18,7 +21,7 @@ def test_events_drops_ignored_xids_and_keeps_errors(tmp_path):
             ]
         )
     )
-    result = xid.events(path, ignore=[43])
+    result = xid.events(path, ignore={43})
     assert result["status"] == Status.OK
     assert result["events"] == [{"event": "xid", "gpu": 0, "xid": 79, "time": "t2"}]
     assert result["ignored"] == [{"event": "xid", "gpu": 1, "xid": 43, "time": "t1"}]
@@ -26,11 +29,11 @@ def test_events_drops_ignored_xids_and_keeps_errors(tmp_path):
 
 
 def test_events_when_the_watcher_wrote_nothing(tmp_path):
-    assert xid.events(tmp_path / "missing.jsonl", ignore=[])["status"] == Status.UNAVAILABLE
+    assert xid.events(tmp_path / "missing.jsonl", ignore=set())["status"] == Status.UNAVAILABLE
 
 
-def test_stop_joins_the_watcher(monkeypatch, tmp_path):
-    """stop() sets the event the NVML loop waits on and joins the thread, with no GPU."""
+def test_watch_logs_until_sigusr1(monkeypatch, tmp_path):
+    """The batch step's SIGUSR1 ends the loop and the log closes with "stopped", with no GPU."""
 
     class Paths:
         def xid(self, host):
@@ -47,16 +50,23 @@ def test_stop_joins_the_watcher(monkeypatch, tmp_path):
         logs = Logs()
         host = Host()
 
-    def wait_for_stop(self):
-        self._stop.wait()
+    polls = []
+
+    def poll(events, emit, stop):
+        polls.append(events)
+        if len(polls) == 2:
+            os.kill(os.getpid(), signal.SIGUSR1)
 
     monkeypatch.setattr(xid, "cfg", Cfg())
-    monkeypatch.setattr(xid.Watcher, "_watch", wait_for_stop)
-    watcher = xid.Watcher()
-    watcher.start()
-    thread = watcher._thread
-    assert thread is not None
-    assert thread.is_alive()
-    watcher.stop()
-    assert not thread.is_alive()
-    assert watcher._log is None
+    monkeypatch.setattr(xid, "session", contextlib.nullcontext)
+    monkeypatch.setattr(xid, "event_set", contextlib.nullcontext)
+    monkeypatch.setattr(xid, "_register", lambda events, emit: None)
+    monkeypatch.setattr(xid, "_poll", poll)
+    handler = signal.getsignal(signal.SIGUSR1)
+    try:
+        xid.watch()
+    finally:
+        signal.signal(signal.SIGUSR1, handler)
+    assert len(polls) == 2
+    events = [json.loads(line)["event"] for line in (tmp_path / "n1.jsonl").read_text().splitlines()]
+    assert events == ["started", "stopped"]

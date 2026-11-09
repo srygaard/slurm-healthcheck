@@ -41,7 +41,7 @@ class GpuLimits:
 gpu_gres: dict[str, GpuLimits] = {
     # 4x H100: 367 s on Trillium, ~7 min on Rorqual
     "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=540),
-    # 8x B200 without pcie, which trillium.sh skips: ~510 s estimated from each test alone.
+    # 8x B200: 516 s on Trillium, ~35 s of it pcie
     "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=650),
     "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=600),
 }
@@ -104,32 +104,40 @@ class LocalTmp(Section):
 
 class Dcgm(Section):
     enabled: bool = True
-    # Test names to run instead of level (DCGM 4.7); software (~1 s) always runs first and can't be named.
-    # Times measured alone on rg32401, 4x H100, with the test_duration parameters below.
+    # DCGM test duration in seconds (test_duration parameter in parentheses)
+    #                    4x H100     8x B200
+    #   memory           27          129
+    #   pcie (P2P=on)    21          226
+    #   pcie (P2P=off)   ?           49
+    #   diagnostic       53 (30)     76 (30)
+    #   targeted_stress  38 (30)     31 (15)
+    #   targeted_power   39 (30)     276 (260)
+    #   nvbandwidth      227         ?
+    # software (~1 s) always runs first and can't be named here. Without targeted_power, dcgm returns before
+    # cpu_load.min_full_power_s and cpu_load grades no clocks.
     tests: list[str] = [
-        "memory",  # 27 s: allocates ~98% of each GPU's memory and checks it
-        "pcie",  # 21 s: host<->GPU bandwidth and PCIe replay errors
-        # 53 s at test_duration=30: GEMM stress at diagnostic_precision, checks results and throttling. fp16 alone
-        # takes as long as DCGM's default of all three precisions: this dcgm step ran 127 s either way on rg31603.
-        # 74 s at test_duration=30 on trig0123, 8x B200; 323 s at test_duration=270.
+        "memory",  # allocates ~98% of each GPU's memory and checks it
+        "pcie",  # host<->GPU bandwidth and PCIe replay errors
+        # GEMM stress at diagnostic_precision, checks results and throttling. fp16 alone takes as long as DCGM's
+        # default of all three precisions: this dcgm step ran 127 s either way on rg31603.
         "diagnostic",
-        "targeted_stress",  # 38 s at test_duration=30: holds a target SM load
-        "targeted_power",  # 39 s at test_duration=30: holds a target power draw (~610 W average, 700 W peak)
-        # "nvbandwidth",  # 227 s: GPU copy bandwidth; pcie and the NCCL intra test cover it
+        "targeted_stress",  # holds a target SM load
+        "targeted_power",  # holds a target power draw
+        # "nvbandwidth",  # GPU copy bandwidth; pcie and the NCCL intra test cover it
         # "nccl_tests",  # not timed; the NCCL step covers collectives
     ]
     port: int = 5556  # for a hostengine we start ourselves
     discovery_timeout_s: float = 15  # a missing hostengine errors at once; a hung discovery must not stall phase A
-    # Tests dropped when a GPU's enforced power limit is under GpuLimits.min_power_limit_frac of its default.
-    skip_when_power_capped: list[str] = ["memory", "pcie"]
     parameters: list[str] = [  # dcgmi diag -p, joined with ";"
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
         "targeted_stress.test_duration=15",
         "targeted_power.test_duration=260",  # ~280 s at full GPU power with diagnostic: over cpu_load.min_full_power_s
+        # pcie's GPU-to-GPU copies, with P2P on and off for every pair: 177 of its 226 s on 8x B200. NCCL intra covers
+        # the GPU-to-GPU bandwidth.
+        "pcie.test_p2p_on=false",
+        "pcie.test_p2p_off=false",
     ]
-    fail_on: list[str] = ["Fail"]
-    warn_on: list[str] = ["Warn"]
     # diagnostic's GEMM precision (DCGM 4.7 has no BF16 or TF32). On rg31603's H100s: fp16 641-660 TFLOPS, fp32 170,
     # fp64 52; DCGM's default runs all three and reports a blend (160-165). fp16 is closest to BF16 training: H100 runs
     # FP16 and BF16 on the same tensor cores at the same peak.
@@ -137,19 +145,6 @@ class Dcgm(Section):
     # diagnostic's per-GPU TFLOPS against the run's median GPU. DCGM's estimate is coarse: at fp16, 640.9 or 659.8.
     diagnostic_min_frac_of_median: float = 0.90  # fail below
     diagnostic_warn_frac_of_median: float = 0.95  # warn below
-
-    @property
-    def suite(self) -> list[str]:
-        """`tests` without those in $HC_DCGM_SKIP_TESTS, comma separated, which a job template sets (trillium.sh: these
-        hang on its B200s). Without targeted_power, dcgm returns well before cpu_load.min_full_power_s, so cpu_load
-        records throttle events but not the full-power clock.
-        """
-        skipped = {test for test in os.environ.get("HC_DCGM_SKIP_TESTS", "").split(",") if test}
-        if unknown := skipped - set(self.tests):
-            # A misspelt name would leave its test in and could push a healthy node past GpuLimits.dcgm_timeout_s
-            known = ", ".join(self.tests)
-            raise ValueError(f"$HC_DCGM_SKIP_TESTS names {', '.join(sorted(unknown))}, not in dcgm.tests ({known})")
-        return [test for test in self.tests if test not in skipped]
 
     @property
     def diagnostic_precision_letter(self) -> str:
@@ -239,12 +234,12 @@ class Nccl(Section):
 
 class Logs(Section):
     xid_watch: bool = True
-    xid_ignore: list[int] = [  # application-induced Xids
+    xid_ignore: set[int] = {  # application-induced Xids
         13,  # graphics engine exception: a kernel's illegal instruction or out-of-range access
         31,  # GPU memory page fault: an application's illegal memory access
         43,  # GPU stopped processing: the channel hit a software fault and was reset
         45,  # preemptive cleanup: channel torn down after a killed process or an earlier error
-    ]
+    }
     nccl_fail_patterns: list[str] = ["NCCL WARN", "completion with error", "Timeout", "remote process exited"]
     kernel_patterns: list[str] = ["NVRM", "Xid", "mlx5", "nvidia-peermem", "EDAC", "I/O error", "nvme"]
     # Matched kernel lines that warn instead of failing the node. Other kernel_patterns matches still fail.
@@ -344,9 +339,6 @@ class Paths(Section):
 
     def xid(self, host: str) -> Path:
         return self.root / "xid" / f"{host}.jsonl"
-
-    def xid_stop(self) -> Path:
-        return self.root / "xid" / f".stop-{os.environ['SLURM_JOB_ID']}"
 
     def dcgm_logs(self, host: str) -> Path:
         return self.root / "logs" / "dcgm" / host
