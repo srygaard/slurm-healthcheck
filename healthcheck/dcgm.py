@@ -295,7 +295,7 @@ class HealthCheck(HealthCheckBase):
         fail_floor = (mid or 0) * cfg.diagnostic_min_frac_of_median
         warn_floor = (mid or 0) * cfg.diagnostic_warn_frac_of_median
         for host, gpus in tflops_of.items():
-            for gpu, tflops in gpus.items():
+            for index, tflops in gpus.items():
                 if tflops < fail_floor:
                     severity: Severity = "fail"
                     floor = fail_floor
@@ -304,7 +304,7 @@ class HealthCheck(HealthCheckBase):
                     floor = warn_floor
                 else:
                     continue
-                detail = f"GPU{gpu} {tflops} < {floor:.1f} TFLOPS (frac of median)"
+                detail = f"GPU{index} {tflops} < {floor:.1f} TFLOPS (frac of median)"
                 findings.setdefault(host, []).append(Finding(severity, "dcgm.tflops", detail))
         return Report(findings, {"dcgm_diagnostic_tflops": mid})
 

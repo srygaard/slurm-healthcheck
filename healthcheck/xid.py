@@ -46,7 +46,7 @@ class Watcher:
             return
         path = cfg.paths.xid(cfg.host.name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._log = open(path, "a", buffering=1)
+        self._log = open(path, "a", buffering=1)  # noqa: SIM115 -- open until stop(), across the watcher thread
         self._stop.clear()
         self._thread = threading.Thread(target=self._watch, name="xid", daemon=True)
         self._thread.start()

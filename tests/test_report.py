@@ -219,17 +219,17 @@ def test_bios_mismatch_warns(run):
 
 
 def cpu_load(*packages):
-    """A cpu_load record with one package per (full_power_mhz, thermal, power_limit) tuple."""
+    """A cpu_load record with one package per (full_power_mhz, thermal) tuple."""
     return ok(
         {
             "status": "ok",
             "packages": {
                 str(socket): {
                     "busy_cpus": "0-3",
-                    "throttle_delta": {"thermal": thermal, "power_limit": power_limit},
+                    "thermal_throttles": thermal,
                     "full_power_mhz": mhz,
                 }
-                for socket, (mhz, thermal, power_limit) in enumerate(packages)
+                for socket, (mhz, thermal) in enumerate(packages)
             },
             "samples": [],
         }
@@ -238,8 +238,8 @@ def cpu_load(*packages):
 
 def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
-        edit(run, host, lambda node: node.update(cpu_load=cpu_load((2300, 0, 0), (2300, 0, 0))))
-    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load((2300, 0, 0), (1500, 0, 3))))
+        edit(run, host, lambda node: node.update(cpu_load=cpu_load((2300, 0), (2300, 0))))
+    edit(run, "rg6", lambda node: node.update(cpu_load=cpu_load((2300, 0), (1500, 3))))
     report_ = evaluate(run)
     assert report_["nodes"]["rg1"]["status"] == "pass"
     findings = report_["nodes"]["rg6"]["findings"]
@@ -247,7 +247,7 @@ def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
         ("warn", "cpu_load.throttle"),
         ("warn", "cpu_load.median"),
     ]
-    assert findings[0]["detail"] == "package 1: 0 thermal and 3 power-limit throttle events"
+    assert findings[0]["detail"] == "package 1: 3 thermal throttling episodes"
     assert findings[1]["detail"].startswith("package 1: busy-core clock 1500 < ")
     assert report_["nodes"]["rg6"]["status"] == "warn"
     assert report_["medians"]["cpu_load_busy_mhz"] == 2300
@@ -255,23 +255,12 @@ def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
 
 def test_a_run_where_every_package_drops_together_is_not_flagged(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
-        edit(run, host, lambda node: node.update(cpu_load=cpu_load((1700, 0, 0), (1750, 0, 0))))
+        edit(run, host, lambda node: node.update(cpu_load=cpu_load((1700, 0), (1750, 0))))
     assert set(statuses(run).values()) == {"pass"}
 
 
-def test_a_record_from_before_packages_still_grades(run):
-    old = {"status": "ok", "full_power_mhz": 2300, "low_share": 0.9, "throttle_delta": 0, "samples": []}
-    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
-        edit(run, host, lambda node: node.update(cpu_load=ok(dict(old))))
-    edit(run, "rg6", lambda node: node.update(cpu_load=ok({**old, "full_power_mhz": 1500, "throttle_delta": 2})))
-    findings = evaluate(run)["nodes"]["rg6"]["findings"]
-    assert [finding["check"] for finding in findings] == ["cpu_load.throttle", "cpu_load.median"]
-    assert findings[0]["detail"] == "2 thermal and 0 power-limit throttle events"
-    assert statuses(run)["rg1"] == "pass"
-
-
 def test_unreadable_throttle_counters_are_not_findings(run):
-    package = {"busy_cpus": "0-3", "throttle_delta": None, "full_power_mhz": 2300}
+    package = {"busy_cpus": "0-3", "thermal_throttles": None, "full_power_mhz": 2300}
     edit(run, "rg1", lambda node: node.update(cpu_load=ok({"status": "ok", "packages": {"0": package}, "samples": []})))
     assert statuses(run)["rg1"] == "pass"
 
