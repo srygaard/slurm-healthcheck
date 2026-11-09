@@ -247,8 +247,8 @@ def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
         ("warn", "cpu_load.throttle"),
         ("warn", "cpu_load.median"),
     ]
-    assert findings[0]["detail"] == "package 1: 3 thermal throttling episodes"
-    assert findings[1]["detail"].startswith("package 1: busy-core clock 1500 < ")
+    assert findings[0]["detail"] == "CPU Package 1: 3 thermal throttling episodes"
+    assert findings[1]["detail"].startswith("CPU Package 1: busy-core clock 1500 < ")
     assert report_["nodes"]["rg6"]["status"] == "warn"
     assert report_["medians"]["cpu_load_busy_mhz"] == 2300
 

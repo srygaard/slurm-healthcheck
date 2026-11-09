@@ -256,7 +256,7 @@ class PackageRecord:
     @property
     def label(self) -> str:
         """The prefix a finding uses."""
-        return f"package {self.socket}: "
+        return f"CPU Package {self.socket}: "
 
     def findings(self, floor: float, fail_frac: float, warn_frac: float) -> Iterator[Finding]:
         """
@@ -275,8 +275,8 @@ class PackageRecord:
         # Sag: the median against the package's own clock before the GPUs loaded up
         for severity, frac in (("fail", fail_frac), ("warn", warn_frac)):
             if mhz < frac * baseline:
-                clock = f"busy-core clock {mhz} MHz at full GPU power < {frac:.0%} of {baseline} MHz"
-                yield Finding(severity, "cpu_load.sag", f"{self.label}{clock}")
+                drop = f"median frequency degraded {1 - mhz / baseline:.0%} under system load ({baseline} -> {mhz} MHz)"
+                yield Finding(severity, "cpu_load.sag", f"{self.label}{drop}")
                 break
 
 

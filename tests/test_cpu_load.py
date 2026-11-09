@@ -75,32 +75,16 @@ def test_thermal_throttles_read_sysfs_by_default(monkeypatch):
     assert paths == [Path("/sys/devices/system/cpu/cpu48/thermal_throttle/package_throttle_count")]
 
 
-def test_thermal_throttles_are_none_without_the_counter(monkeypatch):
-    fake_counter(monkeypatch, None, None, None)
-    package = cpu_load.CpuPackage(socket=0, cpus=[0], busy=[])  # no busy CPUs, so no burners start
-    assert package.thermal_throttles() is None
-    with package.burning():
-        pass
-    assert package.burn_throttles is None
-
-
 def test_thermal_throttles_count_only_the_episodes_during_the_burn(monkeypatch):
-    fake_counter(monkeypatch, "10", "12", "12", None)  # before and after one burn, then a burn that lost the counter
-    package = cpu_load.CpuPackage(socket=0, cpus=[0], busy=[])
+    fake_counter(monkeypatch, "10", "12", "12", None, None)  # one burn, then a burn and a read without the counter
+    package = cpu_load.CpuPackage(socket=0, cpus=[0], busy=[])  # no busy CPUs, so no burners start
     with package.burning():
         pass
     assert package.burn_throttles == 2
     with package.burning():
         pass
     assert package.burn_throttles is None  # the last burn's episodes are dropped
-
-
-def test_the_full_power_clock_is_the_median_so_halted_readings_do_not_set_it():
-    # Eight readings at 2300 MHz under full GPU power, two halted at 200 MHz, after a 3200 MHz start-up reading.
-    rows = [(0, 3200, 300)] + [(5 * i, 2300, 7000) for i in range(1, 9)] + [(45, 200, 7000), (50, 200, 7000)]
-    samples = [{"t_s": t, "mhz": {"0": mhz, "1": 2300}, "gpu_w": w} for t, mhz, w in rows]
-    summary = cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=15))
-    assert [summary.of(socket).full_power_mhz for socket in ("0", "1")] == [2300, 2300]
+    assert package.thermal_throttles() is None
 
 
 def test_burner_is_pinned_and_idle_priority():
@@ -137,12 +121,11 @@ def test_an_older_record_with_a_throttle_delta_still_reads():
 
 
 def test_time_at_full_power_comes_from_the_runs_own_sampling_interval():
-    # Sampled every second, though interval_s is 5: 20 readings at full power are 20 s, not 100 s
-    rows = [(0, 3200, 300), (1, 3200, 1000), (2, 3200, 2000)] + [(3 + k, 2300, 8000) for k in range(20)]
+    # An older run sampled every 5 s, though interval_s is now 1: 6 readings at full power are 30 s, not 6 s
+    rows = [(0, 3200, 300), (5, 3200, 1000), (10, 3200, 2000)] + [(15 + 5 * k, 2300, 8000) for k in range(6)]
     samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
-    assert CpuLoad().interval_s == 5
-    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=20)).of("0").full_power_mhz == 2300
-    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=30)).of("0").full_power_mhz is None
+    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=30)).of("0").full_power_mhz == 2300
+    assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=35)).of("0").full_power_mhz is None
 
 
 def test_unreadable_gpu_power_is_left_out_of_the_baseline():

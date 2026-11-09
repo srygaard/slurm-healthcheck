@@ -165,7 +165,7 @@ class CpuLoad(Section):
 
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
-    interval_s: float = 5
+    interval_s: float = 1  # at 5 s the median of a ~4 min full-power window shifted with the sampling phase
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
     min_full_power_s: float = 240  # time at full GPU power needed before the clocks are graded
     min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median
