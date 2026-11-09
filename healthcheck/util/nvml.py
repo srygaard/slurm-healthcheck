@@ -17,6 +17,16 @@ def session() -> Generator[None]:
         pynvml.nvmlShutdown()
 
 
+@contextmanager
+def event_set() -> Generator[Any]:
+    """An NVML event set. Enter it inside session(), so free runs before nvmlShutdown."""
+    events = pynvml.nvmlEventSetCreate()
+    try:
+        yield events
+    finally:
+        pynvml.nvmlEventSetFree(events)
+
+
 def query(fn: Callable[..., Any], *args: Any) -> Any:
     """Call an NVML query, None if the device or driver doesn't support it."""
     try:

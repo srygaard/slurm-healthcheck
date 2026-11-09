@@ -146,7 +146,6 @@ def test_step_unavailable_does_not_collect(monkeypatch, tmp_path):
 @pytest.fixture
 def collect(monkeypatch, tmp_path):
     """collect() on 4 GPUs, the given ones capped at the GpuLimits default 0.95; diag records its timeout."""
-    monkeypatch.delenv("HC_DCGM_SKIP_TESTS", raising=False)
     timeouts = []
 
     def diag(mode, suite, port, log_dir, timeout_s, *args):
@@ -168,19 +167,13 @@ def collect(monkeypatch, tmp_path):
     return run
 
 
-def test_memory_and_pcie_are_dropped_only_on_power_capped_gpus(collect):
+def test_memory_is_dropped_only_on_power_capped_gpus(collect):
     healthy = collect([])
-    assert {"memory", "pcie"} <= set(healthy["suite"].split(",")) and "power_capped_gpus" not in healthy
+    assert "memory" in healthy["suite"].split(",") and "power_capped_gpus" not in healthy
     capped = collect([0, 1])
-    assert not {"memory", "pcie"} & set(capped["suite"].split(","))
-    assert capped["skipped_for_power_cap"] == ["memory", "pcie"] and capped["power_capped_gpus"] == [0, 1]
+    assert capped["suite"].split(",") == ["pcie", "diagnostic", "targeted_stress", "targeted_power"]
+    assert capped["skipped_for_power_cap"] == ["memory"] and capped["power_capped_gpus"] == [0, 1]
     assert healthy["timeout_s"] == capped["timeout_s"] == 900  # the GPU type's timeout, not a global one
-
-
-def test_cap_is_recorded_when_the_template_already_skips_the_tests(collect, monkeypatch):
-    monkeypatch.setenv("HC_DCGM_SKIP_TESTS", "memory,pcie")
-    capped = collect([2])
-    assert capped["power_capped_gpus"] == [2] and "skipped_for_power_cap" not in capped
 
 
 def test_bad_job_template_fails_only_the_dcgm_step(monkeypatch, tmp_path):
@@ -193,7 +186,13 @@ def test_bad_job_template_fails_only_the_dcgm_step(monkeypatch, tmp_path):
     assert result["status"] == "error" and "no job template" in result["error"]
 
 
-def test_misspelt_skip_name_is_rejected(monkeypatch):
-    monkeypatch.setenv("HC_DCGM_SKIP_TESTS", "PCIe")
-    with pytest.raises(ValueError, match="PCIe, not in dcgm.tests"):
-        _ = Dcgm().suite
+def test_only_fail_and_warn_statuses_are_findings():
+    tests = {
+        name: {"status": status, "entities": {"0": status, "1": "Pass"}}
+        for name, status in (("memory", "Fail"), ("pcie", "Warn"), ("diagnostic", "Pass"), ("targeted_power", "Skip"))
+    }
+    findings = list(dcgm._findings({"tests": tests, "returncode": 0}, Dcgm()))
+    assert [(finding.severity, finding.detail) for finding in findings] == [
+        ("fail", "memory Fail on 0"),
+        ("warn", "pcie Warn on 0"),
+    ]

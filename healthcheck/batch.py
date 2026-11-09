@@ -4,6 +4,7 @@ A failed phase is recorded in the node JSONs and the next one still runs.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import traceback
@@ -39,9 +40,9 @@ def main() -> int:
         traceback.print_exc()
         code = 1
 
-    stop_xid = cfg.paths.xid_stop()  # the watcher thread stops once this exists
-    stop_xid.parent.mkdir(parents=True, exist_ok=True)
-    stop_xid.touch()
+    # srun passes SIGUSR1 to every node's watcher without ending the step. A stop file on the shared filesystem was
+    # missed: NFS caches the lookup that found no file, and other nodes saw it only after the 20 s wait.
+    xid_watch.send_signal(signal.SIGUSR1)
     try:
         xid_watch.wait(timeout=20)
     except subprocess.TimeoutExpired:

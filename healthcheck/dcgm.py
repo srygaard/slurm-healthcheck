@@ -253,10 +253,10 @@ class HealthCheck(HealthCheckBase):
         limits = self.load_limits()
         capped = self._power_capped_gpus(limits.min_power_limit_frac)
         skipped = self.cfg.skip_when_power_capped if capped else []
-        suite = [test for test in self.cfg.suite if test not in skipped]
+        suite = [test for test in self.cfg.tests if test not in skipped]
         if not suite:
-            raise ValueError("dcgm.tests and $HC_DCGM_SKIP_TESTS leave no diagnostic test to run")
-        dropped = [test for test in self.cfg.suite if test in skipped]
+            raise ValueError("dcgm.tests leaves no diagnostic test to run")
+        dropped = [test for test in self.cfg.tests if test in skipped]
         tests = ",".join(suite)  # dcgmi diag -r
         return {
             "status": Status.OK,
@@ -336,14 +336,12 @@ def _skipped(data: JsonDict, cfg: Dcgm, name: str) -> Iterator[Finding]:
         yield Finding("warn", name, f"not run (dcgm={data.get('mode')})")
 
 
-def _findings(data: JsonDict, cfg: Dcgm) -> Iterator[Finding]:
+def _findings(data: JsonDict, _cfg: Dcgm) -> Iterator[Finding]:
     found = False
     for test_name, test in data["tests"].items():
-        if test["status"] in cfg.fail_on:
-            severity: Severity = "fail"
-        elif test["status"] in cfg.warn_on:
-            severity = "warn"
-        else:
+        # A test's status is its worst GPU's (parse()), so Skip or Not Run is the status only when no GPU passed
+        severity = test["status"].lower()  # dcgmi's Fail and Warn are our fail and warn
+        if severity not in ("fail", "warn"):
             continue
         found = True
         bad = [entity for entity, status in test["entities"].items() if status == test["status"]]

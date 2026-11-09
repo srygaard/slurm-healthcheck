@@ -11,4 +11,5 @@
 #SBATCH --time=00:15:00
 
 source "$HC_CODE/slurm/scripts/.mila.env"
+module --version &>/dev/null || source /etc/profile  # Lmod; an exported module() may lack its helper
 module load $HC_MODULES

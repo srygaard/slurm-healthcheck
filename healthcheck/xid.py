@@ -1,108 +1,93 @@
 """NVML Xid events for the whole job, standing in for the root-only kernel log's NVRM lines.
 
-A watcher thread appends one JSON object per line to <run>/xid/<host>.jsonl. Phase C reads it back after stop().
+watch() appends one JSON object per line to <run>/xid/<host>.jsonl. Phase C reads it back with events().
 """
 
 import json
+import signal
 import threading
 import traceback
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, Protocol
 
 import pynvml
 
 from healthcheck.config import cfg
 from healthcheck.util.file import JsonDict
-from healthcheck.util.nvml import session
+from healthcheck.util.nvml import event_set, session
 from healthcheck.util.status import Status
 
-
-@contextmanager
-def _event_set() -> Iterator[Any]:
-    """An NVML event set. Enter it inside session(), so free runs before nvmlShutdown."""
-    events = pynvml.nvmlEventSetCreate()
-    try:
-        yield events
-    finally:
-        pynvml.nvmlEventSetFree(events)
+type Event = Literal["started", "stopped", "xid", "error"]
 
 
-class Watcher:
-    """A thread that records Xid events until stop().
-
-    start() returns at once. With logs.xid_watch off, both calls do nothing.
+class EmitFn(Protocol):
+    """
+    Appends one event to the watcher's log. An xid has gpu and xid; an error has error, and gpu when one GPU's
+    registration failed.
     """
 
-    def __init__(self) -> None:
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._log: TextIO | None = None
+    def __call__(
+        self, *, event: Event, gpu: int | None = None, xid: int | None = None, error: str | None = None
+    ) -> None: ...
 
-    def start(self) -> None:
-        if not cfg.logs.xid_watch or self._thread is not None:
-            return
-        path = cfg.paths.xid(cfg.host.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._log = open(path, "a", buffering=1)  # noqa: SIM115 -- open until stop(), across the watcher thread
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._watch, name="xid", daemon=True)
-        self._thread.start()
 
-    def stop(self) -> None:
-        """Ask the thread to write "stopped" and wait for it. The NVML wait is 1s."""
-        thread = self._thread
-        if thread is None:
-            return
-        self._stop.set()
-        thread.join(timeout=5)
-        if self._log is not None:
-            self._log.close()
-            self._log = None
+def watch() -> None:
+    """Record Xid events to <run>/xid/<host>.jsonl until SIGUSR1, which the batch step sends after NCCL.
 
-    def _emit(self, **event: Any) -> None:
-        """Append one event. start() has opened the log; stop() closes it after the thread returns."""
-        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        if self._log is not None:
-            self._log.write(json.dumps({"time": stamp, **event}) + "\n")
+    Runs as its own srun step on every node, alongside the others. With logs.xid_watch off, it returns at once.
+    """
+    if not cfg.logs.xid_watch:
+        return
+    stop = threading.Event()
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: stop.set())
+    signal.siginterrupt(signal.SIGUSR1, False)  # NVML's 1 s wait finishes instead of failing with EINTR
+    path = cfg.paths.xid(cfg.host.name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", buffering=1) as log:
 
-    def _register(self, events: Any) -> None:
-        for index in range(pynvml.nvmlDeviceGetCount()):
-            try:
-                pynvml.nvmlDeviceRegisterEvents(
-                    pynvml.nvmlDeviceGetHandleByIndex(index), pynvml.nvmlEventTypeXidCriticalError, events
-                )
-            except pynvml.NVMLError as error:
-                self._emit(event="error", gpu=index, error=str(error))
+        def emit(*, event: Event, gpu: int | None = None, xid: int | None = None, error: str | None = None) -> None:
+            fields = {"gpu": gpu, "xid": xid, "error": error}
+            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            present = {key: value for key, value in fields.items() if value is not None}
+            log.write(json.dumps({"time": stamp, "event": event, **present}) + "\n")
 
-    def _poll(self, events: Any) -> None:
-        """One wait. A timeout returns so the caller can check stop; any other NVML error is logged."""
         try:
-            data = pynvml.nvmlEventSetWait_v2(events, 1000)
-        except pynvml.NVMLError_Timeout:
-            return
-        except pynvml.NVMLError as error:
-            self._emit(event="error", error=str(error))
-            self._stop.wait(1)
-            return
-        self._emit(event="xid", gpu=pynvml.nvmlDeviceGetIndex(data.device), xid=int(data.eventData))
-
-    def _watch(self) -> None:
-        try:
-            with session(), _event_set() as events:
-                self._register(events)
-                self._emit(event="started")
-                while not self._stop.is_set():
-                    self._poll(events)
-                self._emit(event="stopped")
-        except Exception as error:  # noqa: BLE001 - the log keeps it; the node steps keep running
-            self._emit(event="error", error=f"{type(error).__name__}: {error}")
+            with session(), event_set() as events:
+                _register(events, emit)
+                emit(event="started")
+                while not stop.is_set():
+                    _poll(events, emit, stop)
+                emit(event="stopped")
+        except Exception as error:  # noqa: BLE001 - the log keeps it; the other steps keep running
+            emit(event="error", error=f"{type(error).__name__}: {error}")
             traceback.print_exc()
 
 
-def events(path: Path, ignore: list[int]) -> JsonDict:
+def _register(events: Any, emit: EmitFn) -> None:
+    for index in range(pynvml.nvmlDeviceGetCount()):
+        try:
+            pynvml.nvmlDeviceRegisterEvents(
+                pynvml.nvmlDeviceGetHandleByIndex(index), pynvml.nvmlEventTypeXidCriticalError, events
+            )
+        except pynvml.NVMLError as error:
+            emit(event="error", gpu=index, error=str(error))
+
+
+def _poll(events: Any, emit: EmitFn, stop: threading.Event) -> None:
+    """One wait. A timeout returns so the caller can check stop; any other NVML error is logged."""
+    try:
+        data = pynvml.nvmlEventSetWait_v2(events, 1000)
+    except pynvml.NVMLError_Timeout:
+        return
+    except pynvml.NVMLError as error:
+        emit(event="error", error=str(error))
+        stop.wait(1)
+        return
+    emit(event="xid", gpu=pynvml.nvmlDeviceGetIndex(data.device), xid=int(data.eventData))
+
+
+def events(path: Path, ignore: set[int]) -> JsonDict:
     """The watcher's log: Xids, apart from ignore, and any errors it recorded."""
     try:
         recorded = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]

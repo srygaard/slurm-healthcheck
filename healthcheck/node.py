@@ -78,18 +78,6 @@ def local() -> None:
         write_json(cfg.paths.numa(host), numa_layout)
 
 
-def watch_xid() -> None:
-    """Record NVIDIA Xid errors, the GPU driver's fault codes, until the batch step touches the stop file after NCCL."""
-    if not cfg.logs.xid_watch:
-        return
-    watcher = xid.Watcher()
-    watcher.start()
-    stop_xid = cfg.paths.xid_stop()
-    while not stop_xid.exists():
-        time.sleep(1)
-    watcher.stop()
-
-
 def finalize() -> None:
     """Step 4, merged into the node's JSON from phase A."""
     host = cfg.host.name
@@ -112,7 +100,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     phase = parse_args().phase
     if phase == "watch_xid":
-        watch_xid()
+        xid.watch()
     elif phase == "local":
         local()
     elif phase == "finalize":
