@@ -1,27 +1,41 @@
 # slurm-healthcheck
 
 A pre-flight health check for full GPU nodes, run before a large multi-node training job.
-Each job takes about four minutes, and the result is an `#SBATCH --exclude=` line for the nodes that fail
-the checks (see [Configuration](#configuration)).
+A one-node job takes about 11 minutes on this branch, and the result is an `#SBATCH --exclude=` line for the
+nodes that fail the checks (see [Configuration](#configuration)).
 
 ## This branch: CPU clock under the B200 node power cap
-`scinet/cpu-clock-power-cap` reproduces the CPU clock drop on Trillium's 8x B200 nodes. When the GPUs reach full
-power (~8 kW for the 8 GPUs, near the node's ~10 kW cap), busy cores fall from 3200 MHz to about 2300 MHz, with no
-thermal throttle event. Three changes from `main`:
 
-- Phase B (NCCL) is skipped: the job runs phases A and C only, about 12 minutes on one node.
+`scinet/cpu-clock-power-cap` reproduces the CPU clock drop on Trillium's 8x B200 nodes (Lenovo ThinkSystem
+SR780a V3, 2x Xeon Platinum 8558P, BIOS R3E116D-3.40). When the 8 GPUs reach full power (~8 kW, near the node's
+~10 kW cap), the busy cores slow down with no thermal throttle event. The OS sees `intel_cpufreq` (passive),
+governor `performance`, turbo on, and the RAPL zones disabled, so the limit is not set from the OS.
+
+Three changes from `main`:
+
+- Phase B (NCCL tests) is skipped.
 - `cpu_load` samples every 250 ms (`cpu_load.interval_s`) instead of every second.
 - DCGM's `targeted_power` holds full GPU power for 400 s instead of 260 s ([Node Power Limit](#node-power-limit)).
+
+### Running it
 
 ```bash
 uv run healthcheck.py setup                                    # once, on trig-login01
 uv run healthcheck.py run --job-per node --nodes trig0151      # or: run --any 1
 uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>
 ```
-The report warns `cpu_load.sag` per CPU package, e.g. `median frequency degraded 25% under system load
-(3200 -> 2400 MHz)`. Every sample (`t_s`, total `gpu_w`, busy-core `mhz` per package) is under `cpu_load.data.samples`
-in `nodes/<host>.json`. Outside `rrg-bengioy-ad`, set `#SBATCH --account` and `--reservation` in
+
+Outside `rrg-bengioy-ad`, set `#SBATCH --account` and `--reservation` in
 [slurm/templates/trillium.sh](slurm/templates/trillium.sh) first.
+
+### What it shows
+
+The report warns `cpu_load.sag` per CPU package, e.g.
+`median frequency degraded 28% under system load (3200 -> 2300 MHz)`. That median hides the shape of the drop. At
+full GPU power the cores alternate between ~2300–2400 MHz and stalls at ~200 MHz on both sockets at once, ~0.75 s
+long every ~3.1 s.
+
+Every sample is under `cpu_load.data.samples` in `$SCRATCH/slurm-healthcheck/results/<job_id>/nodes/<host>.json`.
 
 ## Configuration
 
@@ -44,17 +58,18 @@ when no hostengine answers and `nv-hostengine` is missing. It skips NCCL when `s
 ```bash
 uv run healthcheck.py setup               # nccl-tests, read-test files, venv
 ```
+
 Anything already built is skipped.
 
 ## Running
 
-`run` submits and returns. A job takes at least 9 minutes; run `report` when it finishes.
+`run` submits and returns. A one-node job takes about 11 minutes on this branch; run `report` when it finishes.
 
 ```bash
 uv run healthcheck.py run                                      # one job across all eligible nodes
 uv run healthcheck.py run --job-per switch                     # one job per leaf switch
 uv run healthcheck.py run --job-per node --nodes trig0151      # one job per node, here a single node
-uv run healthcheck.py run --switches ihpc316u25                # only nodes under these leaf switches
+uv run healthcheck.py run --switches <switch>                  # only nodes under these leaf switches
 uv run healthcheck.py run --any 2                              # one job on any 2 free nodes picked by Slurm
 uv run healthcheck.py run --dependency afterok:12345           # sbatch --dependency for every job of the run
 
@@ -142,22 +157,27 @@ tell which one is slow:
    uv run healthcheck.py run --job-per cluster --nodes trig0151,trig0152,trig0108
    ```
    The three form a ring of three pairs, each node in two. The slow node is the one both slow pairs share; read the
-   pairs' `peak_busbw` in `groups/<job_id>.json` (~40 GB/s when healthy). The report may not flag it: two of the
+   pairs' `peak_busbw` in `groups/<job_id>.json` against healthy pairs. The report may not flag it: two of the
    three pairs are slow, so the median is too, and only `nccl.pair.min_busbw_GBps` still applies.
 3. NCCL debug logs, `logs/nccl/pair-<a>-<b>.<host>.<pid>.log`, are kept when a rank logged something, such as a
    `WARN` naming the failing connection.
 
 ## Node Power Limit
-cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. This
-branch sets 400 s, ~420 s at full power, well over `cpu_load.min_full_power_s` (240 s); `main` sets 260 s (~280 s). Throttling events are counted over the whole burn.
+cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets,
+and grades it only after `cpu_load.min_full_power_s` (240 s) there. Throttling events are counted over the whole
+burn. Measured on one 8x B200 node with phase B skipped:
 
-| setting | `main` | this branch | longer |
-|---|---|---|---|
-| `targeted_power.test_duration` in `dcgm.parameters` | 260 | 400 | 600 |
-| `#SBATCH --time` in `slurm/templates/trillium.sh` | 00:15:00 | 00:20:00 | 00:20:00 |
-| B200 `dcgm_timeout_s` in `gpu_gres` | 650 | 850 | 1000 |
+| setting | `main` | this branch |
+|---|---|---|
+| `targeted_power.test_duration` in `dcgm.parameters` | 260 s | 400 s |
+| time at full GPU power | ~253 s | ~388 s |
+| dcgm step | ~520 s | ~657 s |
+| B200 `dcgm_timeout_s` in `gpu_gres` | 650 s | 850 s |
+| job time | ~9 min | ~11 min |
+| `#SBATCH --time` in `slurm/templates/trillium.sh` | 00:15:00 | 00:20:00 |
 
-The CPU clocks may drop without a throttle event. The `cpu_load.sag` compares each package with its own clock before the stress test.
+The CPU clocks may drop without a throttle event. The `cpu_load.sag` compares each package with its own clock
+before the stress test.
 
 ## Tools Used
 
