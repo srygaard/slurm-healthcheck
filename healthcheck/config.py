@@ -41,8 +41,8 @@ class GpuLimits:
 gpu_gres: dict[str, GpuLimits] = {
     # 4x H100: 367 s on Trillium, ~7 min on Rorqual
     "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=540),
-    # 8x B200: 516 s on Trillium, ~35 s of it pcie
-    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=650),
+    # 8x B200: 516 s on Trillium with targeted_power at 260 s, ~35 s of it pcie; ~660 s at 400 s
+    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=850),
     "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=600),
 }
 
@@ -132,7 +132,9 @@ class Dcgm(Section):
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault
         "diagnostic.test_duration=30",  # the stress tests default to minutes each
         "targeted_stress.test_duration=15",
-        "targeted_power.test_duration=260",  # ~280 s at full GPU power with diagnostic: over cpu_load.min_full_power_s
+        # ~420 s at full GPU power with diagnostic: well over cpu_load.min_full_power_s, so the clock drop under the
+        # B200 node power cap shows over several minutes
+        "targeted_power.test_duration=400",
         # pcie's GPU-to-GPU copies, with P2P on and off for every pair: 177 of its 226 s on 8x B200. NCCL intra covers
         # the GPU-to-GPU bandwidth.
         "pcie.test_p2p_on=false",
@@ -160,7 +162,7 @@ class CpuLoad(Section):
 
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
-    interval_s: float = 1  # at 5 s the median of a ~4 min full-power window shifted with the sampling phase
+    interval_s: float = 0.25  # at 5 s the median of a ~4 min full-power window shifted with the sampling phase
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
     min_full_power_s: float = 240  # time at full GPU power needed before the clocks are graded
     min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median

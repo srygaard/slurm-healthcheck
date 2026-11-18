@@ -311,7 +311,7 @@ class HealthCheck(HealthCheckBase):
             while not self.stop_event.is_set():
                 clocks = cpu_mhz()
                 mhz = {str(package.socket): package.busy_mhz(clocks) for package in self.packages}
-                samples.append(BurnSample(t_s=round(time.monotonic() - start, 1), gpu_w=watts(), mhz=mhz))
+                samples.append(BurnSample(t_s=round(time.monotonic() - start, 2), gpu_w=watts(), mhz=mhz))
                 self.stop_event.wait(self.cfg.interval_s)
         held_s = round(time.monotonic() - start, 1)
         # A short hold (dcgm skipped, failed early, or ran without targeted_power) still counts throttle events;

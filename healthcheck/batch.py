@@ -32,10 +32,12 @@ def main() -> int:
     print(f"== {datetime.now():%T} A: sysinfo, $SCRATCH, $PROJECT, local_tmp, dcgm")
     subprocess.run(node_command("local"), check=False)
 
-    print(f"== {datetime.now():%T} B: nccl")
+    # Phase B is off on this branch: the CPU clock under the B200 node power cap needs only phase A (dcgm, cpu_load).
+    # The group file still records it as run with nothing to run, as when every NCCL kind is disabled.
+    print(f"== {datetime.now():%T} B: nccl skipped")
     code = 0
     try:
-        nccl.main()
+        nccl.HealthCheck(cfg.nccl, cfg.paths, 0).write_skipped()
     except Exception:  # noqa: BLE001 - the report shows the missing NCCL results
         traceback.print_exc()
         code = 1

@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=b200:8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
-#SBATCH --time=00:15:00
+#SBATCH --time=00:20:00
 
 source "$HC_CODE/slurm/scripts/.drac.env"
 module --version &>/dev/null || source /etc/profile  # Lmod; an exported module() may lack its helper

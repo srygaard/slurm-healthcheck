@@ -1,15 +1,34 @@
 # slurm-healthcheck
 
-A pre-flight health check for full-H100 nodes on Rorqual, run before a large multi-node training job.
+A pre-flight health check for full GPU nodes, run before a large multi-node training job.
 Each job takes about four minutes, and the result is an `#SBATCH --exclude=` line for the nodes that fail
 the checks (see [Configuration](#configuration)).
+
+## This branch: CPU clock under the B200 node power cap
+`scinet/cpu-clock-power-cap` reproduces the CPU clock drop on Trillium's 8x B200 nodes. When the GPUs reach full
+power (~8 kW for the 8 GPUs, near the node's ~10 kW cap), busy cores fall from 3200 MHz to about 2300 MHz, with no
+thermal throttle event. Three changes from `main`:
+
+- Phase B (NCCL) is skipped: the job runs phases A and C only, about 12 minutes on one node.
+- `cpu_load` samples every 250 ms (`cpu_load.interval_s`) instead of every second.
+- DCGM's `targeted_power` holds full GPU power for 400 s instead of 260 s ([Node Power Limit](#node-power-limit)).
+
+```bash
+uv run healthcheck.py setup                                    # once, on trig-login01
+uv run healthcheck.py run --job-per node --nodes trig0151      # or: run --any 1
+uv run healthcheck.py report $SCRATCH/slurm-healthcheck/results/<job_id>
+```
+The report warns `cpu_load.sag` per CPU package, e.g. `median frequency degraded 25% under system load
+(3200 -> 2400 MHz)`. Every sample (`t_s`, total `gpu_w`, busy-core `mhz` per package) is under `cpu_load.data.samples`
+in `nodes/<host>.json`. Outside `rrg-bengioy-ad`, set `#SBATCH --account` and `--reservation` in
+[slurm/templates/trillium.sh](slurm/templates/trillium.sh) first.
 
 ## Configuration
 
 | file | sets | takes effect |
 |------|------|--------------|
 | [healthcheck/config.py](healthcheck/config.py) | thresholds, `homogeneity` keys, DCGM tests, NCCL timeouts, `/tmp` test size | next job; thresholds also on `report <run>` |
-| [slurm/templates/*.sh](slurm/templates/) | GPU and count via `--gpus-per-node`: `h100:4` on Fir, Rorqual, Tamia and Trillium; `l40s:4` on Mila | next job; `report` grades that chip |
+| [slurm/templates/*.sh](slurm/templates/) | GPU and count via `--gpus-per-node`: `h100:4` on Fir and Tamia, `b200:8` on Trillium, `l40s:4` on Mila | next job; `report` grades that chip |
 | [slurm/scripts/.drac.env](slurm/scripts/.drac.env), [.mila.env](slurm/scripts/.mila.env) | modules, nccl-tests version, CUDA arch | after `setup` |
 | `healthcheck.py` options | which nodes, how they're grouped into jobs, `--exclude-on` | per command, see [Running](#running) |
 
@@ -34,7 +53,7 @@ Anything already built is skipped.
 ```bash
 uv run healthcheck.py run                                      # one job across all eligible nodes
 uv run healthcheck.py run --job-per switch                     # one job per leaf switch
-uv run healthcheck.py run --job-per node --nodes rg31601       # one job per node, here a single node
+uv run healthcheck.py run --job-per node --nodes trig0151      # one job per node, here a single node
 uv run healthcheck.py run --switches ihpc316u25                # only nodes under these leaf switches
 uv run healthcheck.py run --any 2                              # one job on any 2 free nodes picked by Slurm
 uv run healthcheck.py run --dependency afterok:12345           # sbatch --dependency for every job of the run
@@ -67,14 +86,14 @@ Each node runs three phases:
      - **sag**: warns if the median CPU clocks drop by 15% during full load. Fails when dropped by more than 40%.
 
      The clocks are graded only after 4 min at full GPU power ([Node Power Limit](#node-power-limit)).
-2. **Phase B**, `all_reduce_perf` with 4 ranks per node:
+2. **Phase B**, skipped on this branch; on `main`, `all_reduce_perf` with 4 ranks per node:
    1. each node alone (NVLink);
    2. each node alone with P2P/SHM disabled (NIC loopback);
    3. ring pairs of nodes, so a bad NIC shows up in both of a node's pairs;
    4. all of the job's nodes together, when there are more than two: a leaf switch's with `--job-per switch`,
       every node with `--job-per cluster`.
 3. **Phase C**: Xid events from a watcher that runs for the whole job, GPU error counter deltas, NCCL `WARN`
-   lines, and kernel log matches when they are readable (not on Rorqual).
+   lines, and kernel log matches when they are readable.
 
 ## Off by default
 Turn these on in `healthcheck/config.py`.
@@ -120,7 +139,7 @@ tell which one is slow:
    `groups/<job_id>.json`.
 2. If neither stands out, run the two again with a node that just passed (from a recent `include.sbatch`):
    ```bash
-   uv run healthcheck.py run --job-per cluster --nodes rg21701,rg21702,rg31603
+   uv run healthcheck.py run --job-per cluster --nodes trig0151,trig0152,trig0108
    ```
    The three form a ring of three pairs, each node in two. The slow node is the one both slow pairs share; read the
    pairs' `peak_busbw` in `groups/<job_id>.json` (~40 GB/s when healthy). The report may not flag it: two of the
@@ -129,14 +148,14 @@ tell which one is slow:
    `WARN` naming the failing connection.
 
 ## Node Power Limit
-cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
-default gives ~280 s, just over `cpu_load.min_full_power_s` (240 s). Throttling events are counted over the whole burn.
+cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. This
+branch sets 400 s, ~420 s at full power, well over `cpu_load.min_full_power_s` (240 s); `main` sets 260 s (~280 s). Throttling events are counted over the whole burn.
 
-| setting | default | longer |
-|---|---|---|
-| `targeted_power.test_duration` in `dcgm.parameters` | 260 | 600 |
-| `#SBATCH --time` in `slurm/templates/<cluster>.sh` | 00:15:00 | 00:20:00 |
-| job time, one node / a switch | ~7 / ~8 min | ~13 / ~15 min |
+| setting | `main` | this branch | longer |
+|---|---|---|---|
+| `targeted_power.test_duration` in `dcgm.parameters` | 260 | 400 | 600 |
+| `#SBATCH --time` in `slurm/templates/trillium.sh` | 00:15:00 | 00:20:00 | 00:20:00 |
+| B200 `dcgm_timeout_s` in `gpu_gres` | 650 | 850 | 1000 |
 
 The CPU clocks may drop without a throttle event. The `cpu_load.sag` compares each package with its own clock before the stress test.
 
@@ -160,8 +179,7 @@ The CPU clocks may drop without a throttle event. The `cpu_load.sag` compares ea
 - [dmesg](https://man7.org/linux/man-pages/man1/dmesg.1.html) and
   [journalctl](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html) for kernel log matches.
 - [Environment modules](https://docs.alliancecan.ca/wiki/Utiliser_des_modules/en) ([Lmod](https://lmod.readthedocs.io/))
-  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.drac.env`; see the
-  [Rorqual docs](https://docs.alliancecan.ca/wiki/Rorqual/en).
+  load the compilers, CUDA, NCCL and MPI listed in `slurm/scripts/.drac.env`.
 
 ## Tests
 ```bash
