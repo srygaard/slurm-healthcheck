@@ -4,9 +4,20 @@ set -euo pipefail
 
 # Lmod; an exported module() may lack its helper. Trillium's /etc/profile reads unset variables.
 module --version &>/dev/null || { set +u; source /etc/profile; set -u; }
-if [[ $HC_CLUSTER == mila ]]; then source "$HC_CODE/slurm/scripts/.mila.env"; else source "$HC_CODE/slurm/scripts/.drac.env"; fi
-module load $HC_MODULES
+HC_ENV="$HC_CODE/slurm/scripts/.$HC_CLUSTER.env"  # a cluster's own, else the Alliance clusters' shared one
+[[ -n $HC_CLUSTER && -f $HC_ENV ]] || HC_ENV="$HC_CODE/slurm/scripts/.drac.env"
+source "$HC_ENV"
+if [[ -n $HC_MODULES ]]; then module load $HC_MODULES; fi  # Lynx has no Lmod
 HC_PYTHON=$("$HC_UV" python find --project "$HC_CODE")  # .python-version's, from a module or uv's own installs
+
+if [[ -n ${HC_CUDA_PIP:-} ]]; then  # clusters without a CUDA toolkit
+    echo "== cuda $HC_CUDA_PIP"
+    if [[ ! -x $CUDA_HOME/bin/nvcc ]]; then
+        "$HC_UV" pip install --quiet --python "$HC_PYTHON" --target "$HC_CUDA_TARGET" $HC_CUDA_PIP
+        ln -sfn lib "$CUDA_HOME/lib64"  # where nccl-tests looks
+        ln -sf libcudart.so.13 "$CUDA_HOME/lib/libcudart.so"
+    fi
+fi
 
 if [[ -n ${HC_NCCL_PIP:-} ]]; then  # clusters without an NCCL module
     echo "== nccl $HC_NCCL_PIP"

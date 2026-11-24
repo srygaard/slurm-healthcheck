@@ -9,12 +9,12 @@ the checks (see [Configuration](#configuration)).
 | file | sets | takes effect |
 |------|------|--------------|
 | [healthcheck/config.py](healthcheck/config.py) | thresholds, `homogeneity` keys, DCGM tests, NCCL timeouts, `/tmp` test size | next job; thresholds also on `report <run>` |
-| [slurm/templates/*.sh](slurm/templates/) | GPU and count via `--gpus-per-node`: `h100:4` on Fir, Rorqual, Tamia and Trillium; `l40s:4` on Mila | next job; `report` grades that chip |
-| [slurm/scripts/.drac.env](slurm/scripts/.drac.env), [.mila.env](slurm/scripts/.mila.env) | modules, nccl-tests version, CUDA arch | after `setup` |
+| [slurm/templates/*.sh](slurm/templates/) | `#SBATCH` options, including the GPU and count (`--gpus-per-node`) | next job; `report` grades that chip |
+| [slurm/scripts/.*.env](slurm/scripts/) | modules, nccl-tests version, CUDA arch | after `setup` |
 | `healthcheck.py` options | which nodes, how they're grouped into jobs, `--exclude-on` | per command, see [Running](#running) |
 
 Jobs import the code from this checkout, so an edit to `healthcheck/config.py` also reaches jobs that are still
-queued. Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.drac.env`/`.mila.env`.
+queued. Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/scripts/.{drac|mila|lynx}.env`.
 
 ## Setup
 
