@@ -82,9 +82,29 @@ def test_available_without_dcgmi(monkeypatch, tmp_path):
     assert found.reason == "dcgmi not on PATH"
 
 
+@pytest.mark.parametrize(
+    "stdout, available, reason",
+    [
+        ("dcgmi  version: 3.3.9\n", False, "DCGM 3.3.9 is older than 4.4.2"),
+        ("dcgmi  version: 4.4.1\n", False, "DCGM 4.4.1 is older than 4.4.2"),
+        ("dcgmi  version: 4.4.2\n", True, None),
+        ("dcgmi  version: 4.5.\n", True, None),  # a trailing dot is not part of the version
+        ("no version here\n", True, None),  # unreadable: tried anyway
+    ],
+)
+def test_available_by_version(monkeypatch, tmp_path, recwarn, stdout, available, reason):
+    monkeypatch.setattr(dcgm.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(dcgm, "run", lambda cmd, **kwargs: Cmd(0, stdout if cmd[1] == "--version" else "", ""))
+    found = dcgm.HealthCheck(Dcgm(enabled=True), tmp_path, limits()).available()
+    assert (found.available, found.reason) == (available, reason)
+    warned = [w for w in recwarn if "no version in `dcgmi --version`" in str(w.message)]
+    assert bool(warned) == (stdout == "no version here\n")
+
+
 def test_available_without_hostengine(monkeypatch, tmp_path):
     monkeypatch.setattr(dcgm.shutil, "which", lambda name: "/usr/bin/dcgmi" if name == "dcgmi" else None)
-    monkeypatch.setattr(dcgm, "run", lambda cmd, **kwargs: Cmd(1, "", ""))
+    # a current DCGM, whose discovery fails
+    monkeypatch.setattr(dcgm, "run", lambda cmd, **kwargs: Cmd(0, "version: 4.4.2", "") if cmd[1] == "--version" else Cmd(1, "", ""))
     found = dcgm.HealthCheck(Dcgm(enabled=True), tmp_path, limits()).available()
     assert found.available is False
     assert found.reason == "no hostengine, and nv-hostengine is not on PATH"

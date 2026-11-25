@@ -127,6 +127,8 @@ class Dcgm(Section):
         # "nccl_tests",  # not timed; the NCCL step covers collectives
     ]
     port: int = 5556  # for a hostengine we start ourselves
+    # diag --enable-heartbeat arrived in 4.4.2
+    min_version: str = "4.4.2"
     discovery_timeout_s: float = 15  # a missing hostengine errors at once; a hung discovery must not stall phase A
     parameters: list[str] = [  # dcgmi diag -p, joined with ";"
         "software.require_persistence_mode=false",  # Rorqual leaves it off and only root can enable it: not a node fault

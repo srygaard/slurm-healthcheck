@@ -9,10 +9,14 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from packaging.version import Version
+
+from healthcheck import config
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median, per_host
 from healthcheck.config import Dcgm, GpuLimits
 from healthcheck.util.cmd import Cmd, ExitCode, run
@@ -81,6 +85,20 @@ def run_group(cmd: list[str], env: dict[str, str], timeout_s: float) -> Cmd:
         stdout, stderr = proc.communicate()
         return Cmd(ExitCode.TIMEOUT, stdout or "", f"timeout after {timeout_s}s")
     return Cmd(proc.returncode if proc.returncode is not None else 0, stdout, stderr)
+
+
+def version(timeout_s: float = 30) -> Version | None:
+    """From `dcgmi --version` ("dcgmi  version: 3.3.9"); None without dcgmi or when it doesn't say, which also
+    warns."""
+    if not shutil.which("dcgmi"):
+        return None
+    out = run(["dcgmi", "--version"], timeout=timeout_s)
+    text = out.stdout + out.stderr
+    if match := re.search(r"version: *(\d+(?:\.\d+)*)", text):
+        return Version(match[1])
+    detail = text.strip()[:200]
+    warnings.warn(f"{config.cfg.host.name} dcgm: no version in `dcgmi --version`, running anyway: {detail!r}", stacklevel=2)
+    return None
 
 
 def command(mode: Mode, args: list[str], port: int, tmp: str) -> list[str]:
@@ -234,7 +252,10 @@ class HealthCheck(HealthCheckBase):
         return self.cfg.enabled
 
     def available(self) -> Availability:
-        """The running hostengine, else one we start. Neither means the diagnostic cannot run."""
+        """The running hostengine, else one we start. Neither means the diagnostic cannot run, and nor does a DCGM
+        older than dcgm.min_version. An unreadable version is tried anyway."""
+        if (found := version()) and found < Version(self.cfg.min_version):
+            return Availability(False, f"DCGM {found} is older than {self.cfg.min_version}")
         if self._mode is None:
             self._mode = choose_mode(self.cfg.discovery_timeout_s)
         if self._mode != Mode.NONE:

@@ -10,6 +10,13 @@ source "$HC_ENV"
 if [[ -n $HC_MODULES ]]; then module load $HC_MODULES; fi  # Lynx has no Lmod
 HC_PYTHON=$("$HC_UV" python find --project "$HC_CODE")  # .python-version's, from a module or uv's own installs
 
+if [[ -n ${HC_MPI_PIP:-} ]]; then  # clusters whose MPI doesn't fit their Slurm
+    echo "== mpi $HC_MPI_PIP"
+    if [[ ! -e $HC_MPI_HOME/lib/libmpi.so ]]; then
+        "$HC_UV" pip install --quiet --python "$HC_PYTHON" --target "$HC_MPI_HOME" "$HC_MPI_PIP"
+    fi
+fi
+
 if [[ -n ${HC_CUDA_PIP:-} ]]; then  # clusters without a CUDA toolkit
     echo "== cuda $HC_CUDA_PIP"
     if [[ ! -x $CUDA_HOME/bin/nvcc ]]; then
