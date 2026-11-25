@@ -18,8 +18,8 @@ queued. Run `setup` again after changing `uv.lock`, `.python-version` or `slurm/
 
 ## Setup
 
-Build on the login node, which can reach git and PyPI. Each healthcheck job skips DCGM when `dcgmi` is missing, or
-when no hostengine answers and `nv-hostengine` is missing. It skips NCCL when `srun --mpi=list` offers neither
+Build on the login node, which can reach git and PyPI. Each healthcheck job skips DCGM when `dcgmi` is missing, when
+it is older than `dcgm.min_version`, or when no hostengine answers and `nv-hostengine` is missing. It skips NCCL when `srun --mpi=list` offers neither
 `pmix` nor `pmi2`.
 
 ```bash

@@ -214,6 +214,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "nvidia-ml-py" },
+    { name = "packaging" },
     { name = "pydantic" },
 ]
 
@@ -226,6 +227,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "nvidia-ml-py", specifier = ">=12.535" },
+    { name = "packaging", specifier = ">=26.3" },
     { name = "pydantic", specifier = ">=2.14.1" },
 ]
 
