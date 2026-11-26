@@ -214,14 +214,17 @@ def cmd_report(run_dir: Path, exclude_on: list[str]) -> int:
         gres, limits = gpu_limits(JobTemplate.load().gres)
     except ValueError as error:
         raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
-    result, exclude, include = report.write(
-        run.root,
-        cfg,
-        switch_of,
-        exclude_on,
-        limits,
-        gres.count,
-    )
+    try:
+        result, exclude, include = report.write(
+            run.root,
+            cfg,
+            switch_of,
+            exclude_on,
+            limits,
+            gres.count,
+        )
+    except report.StaleResults as error:
+        raise SystemExit(f"{Ansi.RED}{error}{Ansi.RESET}") from error
     print(report.format_text(result))
     color = Ansi.RED if "--exclude" in exclude else Ansi.GREEN
     print(f"{color}{exclude}{Ansi.RESET}{include}")

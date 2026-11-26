@@ -14,6 +14,20 @@ from healthcheck.util.file import read_json
 from healthcheck.util.hostlist import ByHost, Hostlist
 
 
+class StaleResults(Exception):
+    """Node results written with another results_version, which this checkout would misread."""
+
+    def __init__(self, run: Path, versions: ByHost[int], expected: int) -> None:
+        hosts = defaultdict(list)
+        for host, version in versions.items():
+            hosts[version].append(host)
+        found = "; ".join(f"version {version}: {Hostlist(names)}" for version, names in sorted(hosts.items()))
+        super().__init__(
+            f"{run} has node results this checkout can't read ({found}; it reads version {expected}). "
+            "Run the healthcheck again, or report from the commit that wrote them."
+        )
+
+
 def evaluate(
     run: Path,
     cfg: Config,
@@ -40,11 +54,15 @@ def evaluate(
         | set(switch_of)
         | set(job_of)
     )
+    stale: ByHost[int] = {}
     for host in sorted(hosts):
         node = read_json(layout.node(host))
         if node is None:
             job = job_of.get(host, {})
             findings[host].append(Finding("fail", "no_report", f"job {job.get('job_id')} {job.get('state', '?')}"))
+            continue
+        if (version := node.get("version", 1)) != cfg.results_version:  # unversioned results are version 1
+            stale[host] = version
             continue
         step_seconds[host] = {
             name: node[name]["elapsed_s"]
@@ -57,6 +75,8 @@ def evaluate(
                 missing[name][host] = finding
             if data is not None:
                 results[name][host] = data
+    if stale:
+        raise StaleResults(run, stale, cfg.results_version)
 
     medians: dict[str, float | None] = {}
     for name, check in STEPS.items():

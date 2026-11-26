@@ -63,7 +63,12 @@ class HealthCheck(HealthCheckBase):
             "hugepages": topology.meminfo("HugePages_Total"),
             "gpu": {"count": len(gpus), **gpu_info, "devices": [device.to_json() for device in gpus]},
             "counters": [snapshot.to_json() for snapshot in counters],
-            "nic": {"ib": [hca.to_json() for hca in hcas], **nic.collect()},
+            # fabric: the HCAs NCCL uses, the ones homogeneity compares; other: the rest, e.g. an Ethernet ConnectX-6 Dx
+            "nic": {
+                "fabric": [hca.to_json() for hca in hcas if self.link_layer in hca.link_layers],
+                "other": [hca.to_json() for hca in hcas if self.link_layer not in hca.link_layers],
+                **nic.collect(),
+            },
             # IOMMU hardware units the kernel drives (dmar0, ...); each device's domain type is in its pci.iommu_domain
             "iommu": {
                 "units": sorted(
@@ -94,7 +99,7 @@ def resolve(data: Any, path: str) -> Any:
     """
     Values at a dotted key path; "[*]" spans a list or dict, giving a tuple.
 
-    >>> resolve({"nic": {"ib": [{"fw": "1"}, {"fw": "2"}]}}, "nic.ib[*].fw")
+    >>> resolve({"nic": {"fabric": [{"fw": "1"}, {"fw": "2"}]}}, "nic.fabric[*].fw")
     ('1', '2')
     """
     head, _, rest = path.partition(".")
@@ -151,7 +156,7 @@ def _findings(
 
     active = [
         (dev["name"], port)
-        for dev in data["nic"]["ib"]
+        for dev in data["nic"]["fabric"]
         for port in dev["ports"]
         if port["state"] == "ACTIVE"
         and port["link_layer"] == nic_cfg.link_layer
@@ -164,7 +169,7 @@ def _findings(
     if nic_cfg.warn_iommu_translated:
         active_names = {name for name, _port in active}
         pci_devices = [(f"GPU{device['index']}", device) for device in devices["devices"]] + [
-            (dev["name"], dev) for dev in data["nic"]["ib"] if dev["name"] in active_names
+            (dev["name"], dev) for dev in data["nic"]["fabric"] if dev["name"] in active_names
         ]
         # A device whose domain wasn't read (None: an unparsed bus id, a pre-5.11 kernel, an older sysinfo JSON) counts
         # as untranslated, even when the node has IOMMU units

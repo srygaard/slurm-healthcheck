@@ -54,7 +54,7 @@ def healthy(host):
         },
         "counters": [dict(counter, index=index) for index in range(4)],
         "nic": {
-            "ib": [{"name": f"mlx5_{index}", "fw_ver": "28.1", "ports": [port]} for index in range(4)],
+            "fabric": [{"name": f"mlx5_{index}", "fw_ver": "28.1", "ports": [port]} for index in range(4)],
             "net": {"ib0": {"mtu": 4092}},
             "nvidia_peermem": True,
         },
@@ -75,6 +75,7 @@ def healthy(host):
         "counter_deltas": [],
     }
     return {
+        "version": Config().results_version,
         "host": host,
         "sysinfo": ok(sysinfo),
         "scratch": ok(scratch),
@@ -128,6 +129,13 @@ def statuses(run, cfg=None):
     return {host: node["status"] for host, node in evaluate(run, cfg)["nodes"].items()}
 
 
+def test_results_from_another_version_are_refused(run):
+    edit(run, "rg2", lambda node: node.pop("version"))
+    edit(run, "rg5", lambda node: node.pop("version"))
+    with pytest.raises(report.StaleResults, match=r"version 1: rg\[2,5\].*reads version 2"):
+        evaluate(run)
+
+
 def test_all_healthy(run):
     assert set(statuses(run).values()) == {"pass"}
     _, exclude, include = report.write(run, Config(), switches(run), ["fail"], gpu_gres["h100"], 4)
@@ -153,7 +161,7 @@ def test_node_without_result_is_no_report(run, lose):
 def test_gpu_and_nic_checks(run):
     def bad(node):
         node["sysinfo"]["data"]["gpu"]["devices"][2]["nvlinks_active"] = 12
-        port = node["sysinfo"]["data"]["nic"]["ib"][1]["ports"][0]
+        port = node["sysinfo"]["data"]["nic"]["fabric"][1]["ports"][0]
         port.update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
 
     edit(run, "rg2", bad)
@@ -174,12 +182,12 @@ def test_gpu_capped_below_its_default_power_limit_fails(run):
 
 def test_port_slower_than_its_peers_fails_that_node(run):
     def slow(node):
-        node["sysinfo"]["data"]["nic"]["ib"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
+        node["sysinfo"]["data"]["nic"]["fabric"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
 
     edit(run, "rg6", slow)
     nodes = evaluate(run)["nodes"]
     assert nodes["rg6"]["status"] == "fail"
-    assert "nic.ib[*].ports[*].rate" in nodes["rg6"]["findings"][0]["detail"]
+    assert "nic.fabric[*].ports[*].rate" in nodes["rg6"]["findings"][0]["detail"]
     assert nodes["rg1"]["status"] == "pass"
 
 
@@ -187,7 +195,7 @@ def test_port_slow_on_every_node_is_not_flagged(run):
     """Peers-only grading: a fleet-wide rate is the baseline, so it passes. Only a node that differs is flagged."""
 
     def slow(node):
-        node["sysinfo"]["data"]["nic"]["ib"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
+        node["sysinfo"]["data"]["nic"]["fabric"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
 
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
         edit(run, host, slow)
@@ -209,6 +217,13 @@ def test_homogeneity_without_majority_flags_every_node(run):
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5", "rg6"):
         assert nodes[host]["status"] == "fail"
         assert "(no majority)" in nodes[host]["findings"][0]["detail"]
+
+
+def test_fabric_firmware_mismatch_fails(run):
+    edit(run, "rg6", lambda node: node["sysinfo"]["data"]["nic"]["fabric"][0].update(fw_ver="28.2"))
+    nodes = evaluate(run)["nodes"]
+    assert nodes["rg6"]["status"] == "fail"
+    assert "nic.fabric[*].fw_ver" in nodes["rg6"]["findings"][0]["detail"]
 
 
 def test_bios_mismatch_warns(run):
@@ -608,9 +623,9 @@ def test_nccl_unavailable_warns():
 
 def translate_gpu_dma(node):
     data = node["sysinfo"]["data"]
-    for device in data["gpu"]["devices"] + data["nic"]["ib"]:
+    for device in data["gpu"]["devices"] + data["nic"]["fabric"]:
         device["pci"] = {"iommu_domain": "DMA-FQ"}
-    data["nic"]["ib"][3]["pci"] = {"iommu_domain": "identity"}
+    data["nic"]["fabric"][3]["pci"] = {"iommu_domain": "identity"}
 
 
 def test_iommu_translating_gpu_dma_warns(run):

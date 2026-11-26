@@ -53,6 +53,7 @@ def local() -> None:
     host = cfg.host.name
     path = cfg.paths.node(host)
     out: dict[str, Any] = {
+        "version": cfg.results_version,
         "host": host,
         "job_id": os.environ.get("SLURM_JOB_ID"),
         "started": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -82,7 +83,7 @@ def finalize() -> None:
     """Step 4, merged into the node's JSON from phase A."""
     host = cfg.host.name
     path = cfg.paths.node(host)
-    out = read_json(path) or {"host": host, "job_id": os.environ.get("SLURM_JOB_ID")}
+    out = read_json(path) or {"version": cfg.results_version, "host": host, "job_id": os.environ.get("SLURM_JOB_ID")}
     before = (out.get("sysinfo") or {}).get("data", {}).get("counters")
     since = float(os.environ.get("SLURM_JOB_START_TIME", time.time() - 600))
     out["logs"] = step(STEPS["logs"](cfg.logs, cfg.paths, host, since, before))
