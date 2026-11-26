@@ -4,6 +4,7 @@ import json
 import platform
 from collections import Counter, defaultdict
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pynvml
@@ -63,6 +64,14 @@ class HealthCheck(HealthCheckBase):
             "gpu": {"count": len(gpus), **gpu_info, "devices": [device.to_json() for device in gpus]},
             "counters": [snapshot.to_json() for snapshot in counters],
             "nic": {"ib": [hca.to_json() for hca in hcas], **nic.collect()},
+            # IOMMU hardware units the kernel drives (dmar0, ...); each device's domain type is in its pci.iommu_domain
+            "iommu": {
+                "units": sorted(
+                    unit.name
+                    for unit
+                    in Path("/sys/class/iommu").glob("*")
+                )
+            },
             "software": software.collect(),
             NUMA_LAYOUT: topology.numa_layout(nodes, gpus, hcas, self.link_layer),
         }
@@ -151,6 +160,22 @@ def _findings(
         yield Finding(
             "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
         )
+
+    if nic_cfg.warn_iommu_translated:
+        active_names = {name for name, _port in active}
+        pci_devices = [(f"GPU{device['index']}", device) for device in devices["devices"]] + [
+            (dev["name"], dev) for dev in data["nic"]["ib"] if dev["name"] in active_names
+        ]
+        # A device whose domain wasn't read (None: an unparsed bus id, a pre-5.11 kernel, an older sysinfo JSON) counts
+        # as untranslated, even when the node has IOMMU units
+        translated = {
+            label: domain
+            for label, device in pci_devices
+            if (domain := device.get("pci", {}).get("iommu_domain")) in nic_cfg.translated_iommu_domains
+        }
+        if translated:
+            domains, labels = "/".join(sorted(set(translated.values()))), ", ".join(translated)
+            yield Finding("warn", "nic.iommu", f"GPUDirect DMA translated by the IOMMU ({domains}): {labels}")
 
 
 def _homogeneity(sysinfos: ByHost[JsonDict], cfg: Homogeneity) -> ByHost[list[Finding]]:
