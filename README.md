@@ -1,6 +1,6 @@
 # slurm-healthcheck
 
-A pre-flight health check for full-H100 nodes on Rorqual, run before a large multi-node training job.
+A pre-flight health check for Nvidia GPU nodes, run before a large multi-node training job.
 Each job takes about four minutes, and the result is an `#SBATCH --exclude=` line for the nodes that fail
 the checks (see [Configuration](#configuration)).
 
@@ -92,7 +92,8 @@ majority; with only two nodes, which one counts as the majority is arbitrary.
 
 ## Results
 Every job writes to `$SCRATCH/slurm-healthcheck/results/<job_id>/`. A run with several jobs shares the directory
-of its first job:
+of its first job. Each `nodes/<host>.json` records `results_version` from `healthcheck/config.py`, and `report`
+refuses a run written with another version:
 ```
 results/<job_id>/
   report.txt  report.json            outputs
@@ -116,7 +117,7 @@ a slow pair fails both with `1/1 slow pairs`. To
 tell which one is slow:
 
 1. Look at each node's own NCCL tests in the same report: a node that also fails `nccl.loopback` (its NIC alone) or
-   `nccl.intra`, or has a `homogeneity` finding on `nic.ib[*].ports[*].rate` or a `nic.ports` finding, is the slow one. Their bandwidths are in
+   `nccl.intra`, or has a `homogeneity` finding on `nic.fabric[*].ports[*].rate` or a `nic.ports` finding, is the slow one. Their bandwidths are in
    `groups/<job_id>.json`.
 2. If neither stands out, run the two again with a node that just passed (from a recent `include.sbatch`):
    ```bash

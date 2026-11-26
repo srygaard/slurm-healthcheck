@@ -263,8 +263,8 @@ class Homogeneity(Section):
         "gpu.driver_version",
         "gpu.cuda_version",
         "gpu.devices[*].name",
-        "nic.ib[*].fw_ver",
-        "nic.ib[*].ports[*].rate",
+        "nic.fabric[*].fw_ver",  # the HCAs on nic.link_layer; nic.other has the rest
+        "nic.fabric[*].ports[*].rate",
     ]
     warn: list[str] = [
         # "gpu.devices[*].vbios",
@@ -352,6 +352,9 @@ class Paths(Section):
 
 
 class Config(Section):
+    # The layout of nodes/<host>.json. Bump it when the report would misread the previous one; the report refuses a run
+    # written with another. 1: unversioned; 2: sysinfo nic.ib split into nic.fabric and nic.other.
+    results_version: int = 2
     nic: Nic = Nic()
     scratch: Scratch = Scratch()
     project: Project = Project()
