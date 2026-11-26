@@ -63,6 +63,10 @@ class Nic(Section):
 
     min_active_ib_ports: int = 1
     link_layer: str = "InfiniBand"
+    # Warn when a GPU or an active fabric HCA is in a translated IOMMU domain.
+    warn_iommu_translated: bool = True
+    # IOMMU domain types that translate a device's DMA; "identity" (passthrough) and no IOMMU don't
+    translated_iommu_domains: set[str] = {"DMA", "DMA-FQ"}
 
 
 class Scratch(Section):
@@ -268,6 +272,7 @@ class Homogeneity(Section):
         "os_release",
         "gpu.topo_hash",
         "nic.nvidia_peermem",
+        "iommu.units",  # Lynx: only lg00701 and lg01001 boot without one, and only they reach line rate from GPU memory
         "nic.net.ib0.mtu",
         "software.ofed",
         # rg21701 lost ~30% of its CPU clock under training load yet passed every check; only its BIOS differed

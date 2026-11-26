@@ -60,12 +60,23 @@ class PciDevice(Device):
     vendor: str | None  # "0x10de"
     device: str | None  # "0x2330"
     root_port: BusId | None  # None if the device sits on the host bridge itself
+    # Its IOMMU group's domain type: "DMA" or "DMA-FQ" translate its DMA, "identity" passes it through; None without an
+    # IOMMU.
+    iommu_domain: str | None = None
 
     @classmethod
     def from_sysfs(cls, address: BusId | None, root: Path = Path("/sys"), **values: Any) -> Self:
         """The PCI fields from sysfs, the subclass's from values; an unknown or missing device leaves them None."""
         if address is None:
-            return cls(address=None, vendor=None, device=None, numa_node=None, root_port=None, **values)
+            return cls(
+                address=None,
+                vendor=None,
+                device=None,
+                numa_node=None,
+                root_port=None,
+                iommu_domain=None,
+                **values
+            )
         path = root / "bus" / "pci" / "devices" / str(address)
         numa = read_sys(path / "numa_node")
         # /sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/.../0000:03:00.0: host bridge, root port, ..., device
@@ -80,6 +91,8 @@ class PciDevice(Device):
             device=read_sys(path / "device"),
             numa_node=int(numa) if numa and numa.isdigit() else None,  # the kernel writes -1 for no affinity
             root_port=BusId.parse(below[0]) if len(below) > 1 else None,
+            # iommu_group/type came in Linux 5.11: before it, a translated device reads None, the same as no IOMMU
+            iommu_domain=read_sys(path / "iommu_group" / "type"),
             **values,
         )
 
@@ -90,5 +103,5 @@ class PciDevice(Device):
     def to_json(self) -> JsonDict:
         """The subclass's fields, with the PCI ones and numa_node under "pci"."""
         out = dict(super().to_json())
-        pci = {key: out.pop(key) for key in ("address", "vendor", "device", "numa_node", "root_port")}
+        pci = {key: out.pop(key) for key in ("address", "vendor", "device", "numa_node", "root_port", "iommu_domain")}
         return {**out, "pci": {key: str(value) if isinstance(value, BusId) else value for key, value in pci.items()}}

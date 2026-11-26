@@ -49,6 +49,18 @@ def test_from_sysfs_on_host_bridge_or_missing(tmp_path):
     assert PciDevice.from_sysfs(None, tmp_path, name="rxe0").address is None
 
 
+def test_from_sysfs_iommu_domain(tmp_path):
+    """The domain type of the device's IOMMU group; None when no IOMMU puts it in a group."""
+    translated = pci_device(tmp_path, "pci0000:00/0000:00:01.1/0000:01:00.0", 0)
+    group = tmp_path / "kernel" / "iommu_groups" / "7"
+    group.mkdir(parents=True)
+    (group / "type").write_text("DMA-FQ\n")
+    (tmp_path / "devices" / "pci0000:00" / "0000:00:01.1" / "0000:01:00.0" / "iommu_group").symlink_to(group)
+    plain = pci_device(tmp_path, "pci0000:00/0000:00:01.2/0000:02:00.0", 0)
+    assert PciDevice.from_sysfs(translated, tmp_path, name=None).iommu_domain == "DMA-FQ"
+    assert PciDevice.from_sysfs(plain, tmp_path, name=None).iommu_domain is None
+
+
 def test_to_json_nests_pci():
     hca = make(Hca, name="mlx5_2", numa_node=2, address=BusId(0, 0x43, 0, 0), root_port=BusId(0, 0x40, 1, 1), ports=[])
     assert hca.to_json() == {
@@ -58,7 +70,14 @@ def test_to_json_nests_pci():
         "board_id": None,
         "netdevs": None,
         "ports": [],
-        "pci": {"address": "0000:43:00.0", "vendor": None, "device": None, "numa_node": 2, "root_port": "0000:40:01.1"},
+        "pci": {
+            "address": "0000:43:00.0",
+            "vendor": None,
+            "device": None,
+            "numa_node": 2,
+            "root_port": "0000:40:01.1",
+            "iommu_domain": None,
+        },
     }
     assert make(Gpu, index=0).to_json()["index"] == 0
 

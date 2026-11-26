@@ -4,7 +4,7 @@ import pytest
 
 from healthcheck import dcgm, nccl, sysinfo
 from healthcheck.check import Finding
-from healthcheck.config import Config, Project, Scratch, gpu_gres
+from healthcheck.config import Config, Nic, Project, Scratch, gpu_gres
 from launcher import report
 
 
@@ -605,3 +605,34 @@ def test_nccl_unavailable_warns():
     assert result.findings["cn-l001"] == [Finding("warn", "nccl", "unavailable: missing all_reduce_perf in /build")]
     assert result.medians == {}
 
+
+def translate_gpu_dma(node):
+    data = node["sysinfo"]["data"]
+    for device in data["gpu"]["devices"] + data["nic"]["ib"]:
+        device["pci"] = {"iommu_domain": "DMA-FQ"}
+    data["nic"]["ib"][3]["pci"] = {"iommu_domain": "identity"}
+
+
+def test_iommu_translating_gpu_dma_warns(run):
+    edit(run, "rg2", translate_gpu_dma)
+    nodes = evaluate(run)["nodes"]
+    assert nodes["rg2"]["findings"] == [
+        {
+            "severity": "warn",
+            "check": "nic.iommu",
+            "detail": "GPUDirect DMA translated by the IOMMU (DMA-FQ): GPU0, GPU1, GPU2, GPU3, mlx5_0, mlx5_1, mlx5_2",
+        }
+    ]
+    assert nodes["rg1"]["status"] == "pass"
+    assert statuses(run, Config(nic=Nic(warn_iommu_translated=False)))["rg2"] == "pass"
+
+
+def test_iommu_units_differing_from_the_majority_warn(run):
+    for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
+        edit(run, host, lambda node: node["sysinfo"]["data"].update(iommu={"units": ["dmar0", "dmar1"]}))
+    edit(run, "rg6", lambda node: node["sysinfo"]["data"].update(iommu={"units": []}))
+    nodes = evaluate(run)["nodes"]
+    assert nodes["rg6"]["findings"] == [
+        {"severity": "warn", "check": "homogeneity", "detail": 'iommu.units=[] (majority ["dmar0", "dmar1"])'}
+    ]
+    assert nodes["rg1"]["status"] == "pass"
