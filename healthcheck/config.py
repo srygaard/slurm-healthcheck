@@ -23,13 +23,13 @@ class Section(BaseModel):
 class GpuLimits:
     """The GPU fields that describe the part rather than a measured floor. The count comes from JobTemplate."""
 
-    require_ecc: bool
     min_pcie_gen: int  # max link gen (current gen drops at idle)
-    min_pcie_width: int
     min_nvlinks: int
     # How long dcgmi diag may run before it counts as hung: the full dcgm.tests suite on a healthy node plus ~20-40%.
     # The job template's --time must also fit NCCL after it.
     dcgm_timeout_s: float
+    require_ecc: bool = True
+    min_pcie_width: int = 16
     max_volatile_uncorrected_ecc: int = 0
     max_remap_failures: int = 0
     max_remap_pending: int = 0
@@ -40,10 +40,12 @@ class GpuLimits:
 # L40S is a PCIe card: Gen4 x16, no NVLink. ECC is on; row remap is an HBM counter and stays at zero.
 gpu_gres: dict[str, GpuLimits] = {
     # 4x H100: 367 s on Trillium, ~7 min on Rorqual
-    "h100": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=540),
+    "h100": GpuLimits(min_pcie_gen=5, min_nvlinks=18, dcgm_timeout_s=540),
     # 8x B200: 516 s on Trillium, ~35 s of it pcie
-    "b200": GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=650),
-    "l40s": GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=600),
+    "b200": GpuLimits(min_pcie_gen=5, min_nvlinks=18, dcgm_timeout_s=650),
+    "l40s": GpuLimits(min_pcie_gen=4, min_nvlinks=0, dcgm_timeout_s=600),
+    # RTX PRO 6000 Blackwell Server Edition
+    "rtx": GpuLimits(min_pcie_gen=5, min_nvlinks=0, dcgm_timeout_s=600),
 }
 
 

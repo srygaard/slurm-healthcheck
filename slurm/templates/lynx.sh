@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=beta
-#SBATCH --partition=gpubase_bynode_b0,gpubase_bynode_b2,gpubase_bynode_b3
+#SBATCH --partition=gpubase_bynode_b0,gpubase_bynode_b1,gpubase_bynode_b2,gpubase_bynode_b3
 #SBATCH --exclusive
 #SBATCH --gpus-per-node=b200:8
 #SBATCH --ntasks-per-node=1
