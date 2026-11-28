@@ -502,8 +502,25 @@ def test_net_channels_without_gdr_fail_that_host(run):
     nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
     assert nodes["rg1"]["status"] == nodes["rg3"]["status"] == nodes["rg4"]["status"] == "pass"
     detail = "loopback: 2/16 NET channels without GPUDirect RDMA"
-    assert nodes["rg2"]["findings"] == [{"severity": "fail", "check": "nccl.gdr", "detail": detail}]
+    assert nodes["rg2"]["findings"] == [{"severity": "info", "check": "nccl.gdr", "detail": detail}]
+    assert nodes["rg2"]["status"] == "pass"
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity="warn")))["rg2"] == "warn"
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity="fail")))["rg2"] == "fail"
     assert statuses(run, Config(nccl=Nccl(no_gdr_severity=None)))["rg2"] == "pass"
+
+
+def test_a_cluster_without_gdr_notes_every_node_and_flags_none(run):
+    """No GDR set up anywhere: every rank stages through host memory, and NCCL logs no distance reason."""
+    set_tests(
+        run,
+        lambda test: True,
+        lambda test: test["kind"] == "loopback"
+        and test.update(net={test["nodes"][0]: {"channels": 16, "gdr": 0, "too_far": 0}}),
+    )
+    nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
+    detail = "loopback: 16/16 NET channels without GPUDirect RDMA"
+    assert {host: node["status"] for host, node in nodes.items()} == dict.fromkeys(nodes, "pass")
+    assert all(node["findings"] == [{"severity": "info", "check": "nccl.gdr", "detail": detail}] for node in nodes.values())
 
 
 def test_pair_below_fail_fraction_fails_that_node(run):
@@ -711,21 +728,23 @@ def test_nccl_unavailable_warns():
     assert result.medians == {}
 
 
-def test_iommu_enabled_warns_even_on_the_majority(run):
-    """Every node but rg6 has IOMMU units: they warn, and rg6, the odd one out, passes."""
+def test_iommu_enabled_is_noted_even_on_the_majority(run):
+    """Every node but rg6 has IOMMU units: each gets an info finding and still passes, as rg6 does."""
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
         edit(run, host, lambda node: node["sysinfo"]["data"].update(iommu={"units": ["dmar0", "dmar1"]}))
     edit(run, "rg6", lambda node: node["sysinfo"]["data"].update(iommu={"units": []}))
     nodes = evaluate(run)["nodes"]
     assert nodes["rg1"]["findings"] == [
         {
-            "severity": "warn",
+            "severity": "info",
             "check": "nic.iommu",
             "detail": "IOMMU enabled (2 units): GPUDirect may route through the root complex",
         }
     ]
-    assert nodes["rg6"]["status"] == "pass"
-    assert statuses(run, Config(nic=Nic(warn_iommu_enabled=False)))["rg1"] == "pass"
+    assert nodes["rg1"]["status"] == nodes["rg6"]["status"] == "pass"
+    assert nodes["rg6"]["findings"] == []
+    assert statuses(run, Config(nic=Nic(iommu_severity="warn")))["rg1"] == "warn"
+    assert evaluate(run, Config(nic=Nic(iommu_severity=None)))["nodes"]["rg1"]["findings"] == []
 
 
 def test_iommu_missing_from_older_sysinfo_passes(run):

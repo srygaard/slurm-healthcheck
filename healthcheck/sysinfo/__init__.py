@@ -172,10 +172,10 @@ def _findings(
             "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
         )
 
-    # An older sysinfo JSON has no "iommu" key and doesn't warn
-    if nic_cfg.warn_iommu_enabled and (units := data.get("iommu", {}).get("units")):
+    # An older sysinfo JSON has no "iommu" key and isn't flagged
+    if nic_cfg.iommu_severity and (units := data.get("iommu", {}).get("units")):
         detail = f"IOMMU enabled ({len(units)} units): GPUDirect may route through the root complex"
-        yield Finding("warn", "nic.iommu", detail)
+        yield Finding(nic_cfg.iommu_severity, "nic.iommu", detail)
 
 
 def _homogeneity(sysinfos: ByHost[JsonDict], cfg: Homogeneity) -> ByHost[list[Finding]]:

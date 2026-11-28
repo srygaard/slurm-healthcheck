@@ -80,9 +80,10 @@ class Nic(Section):
 
     min_active_ib_ports: int = 1
     link_layer: str = "InfiniBand"
-    # Warn when the node boots with IOMMU units (VT-d or AMD-Vi on). Lynx B200s with VT-d on lose ~35% GPU-to-NIC
-    # bandwidth in passthrough as well as translated mode, likely from the PCIe ACS the BIOS enables with it
-    warn_iommu_enabled: bool = True
+    # A node booted with IOMMU units (VT-d or AMD-Vi on); None turns this off. Lynx B200s with VT-d on lose ~35%
+    # GPU-to-NIC bandwidth in passthrough as well as translated mode, likely from the PCIe ACS the BIOS enables with it.
+    # info: the loss shows up as nccl.loopback, and this explains it; every Lynx RTX node has it, with no slower one.
+    iommu_severity: Literal["fail", "warn", "info"] | None = "info"
 
 
 class Scratch(Section):
@@ -227,8 +228,9 @@ class Nccl(Section):
     # GPUDirect RDMA shows up. Only NCCL WARN and the other logs.nccl_fail_patterns fail a node.
     debug: str = "INFO"
     debug_subsys: str = "INIT,NET"
-    # A host whose NET channels don't all use GPUDirect RDMA ("via NET/IB/0" without "/GDRDMA"); None turns this off
-    no_gdr_severity: Literal["fail", "warn"] | None = "fail"
+    # A host whose NET channels don't all use GPUDirect RDMA ("via NET/IB/0" without "/GDRDMA"); None turns this off.
+    # info until it has run on a cluster without GDR set up (Mila L40S, Rorqual): there every node would be flagged.
+    no_gdr_severity: Literal["fail", "warn", "info"] | None = "info"
     # Intra depends on the GPU-to-GPU link, not the NVLink count alone: H100 and B200 both have 18 links, but B200's
     # NVLink 5 is twice as fast. Without NVLink, 8 RTX PRO 6000s on Gen5 (64 GB/s) reach ~24.5 on Lynx; a Mila run of
     # 4 L40S on Gen4 (32 GB/s) reached ~10. A quarter of the link gives 16 and 8.
