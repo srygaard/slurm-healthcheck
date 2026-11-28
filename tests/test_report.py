@@ -5,7 +5,7 @@ import pytest
 
 from healthcheck import dcgm, nccl, sysinfo
 from healthcheck.check import Finding
-from healthcheck.config import Config, Nic, Project, Scratch, gpu_gres
+from healthcheck.config import Config, Nccl, Nic, Project, Scratch, gpu_gres
 from launcher import report
 
 
@@ -480,6 +480,23 @@ def test_a_gpu_type_can_set_a_loopback_warn_floor(run):
     assert nodes["rg1"]["status"] == "pass"
     assert nodes["rg2"]["findings"] == [{"severity": "warn", "check": "nccl.loopback", "detail": "busbw 12.9 < 18.0"}]
     assert statuses(run)["rg2"] == "pass"  # h100 sets no floor
+
+
+def test_net_channels_without_gdr_fail_that_host(run):
+    """rg2's loopback falls back to host memory on 2 of 16 channels; rg1 uses GDR on all, and older results have none."""
+    channels = {"rg1": {"channels": 16, "gdr": 16}, "rg2": {"channels": 16, "gdr": 14}}
+    set_tests(
+        run,
+        lambda test: True,
+        lambda test: test["kind"] == "loopback"
+        and test["nodes"][0] in channels
+        and test.update(net={test["nodes"][0]: channels[test["nodes"][0]]}),
+    )
+    nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
+    assert nodes["rg1"]["status"] == nodes["rg3"]["status"] == "pass"
+    detail = "loopback: 2/16 NET channels without GPUDirect RDMA"
+    assert nodes["rg2"]["findings"] == [{"severity": "fail", "check": "nccl.gdr", "detail": detail}]
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity=None)))["rg2"] == "pass"
 
 
 def test_pair_below_fail_fraction_fails_that_node(run):

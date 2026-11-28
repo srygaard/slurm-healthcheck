@@ -67,6 +67,34 @@ def parse(text: str) -> dict[str, Any]:
     }
 
 
+# A NET channel's line at NCCL_DEBUG=INFO: "Channel 00/0 : 0[0] -> 1[1] [send] via NET/IB/0/GDRDMA"
+NET_CHANNEL = re.compile(r"\[(?:send|receive)\] via NET/[^/\s]+/\d+(\S*)")
+
+
+def net_channels(logs: list[Path]) -> ByHost[dict[str, int]]:
+    """
+    Per host, its ranks' NET channels and how many use GPUDirect RDMA, from logs named <label>.<host>.<pid>.log.
+    Hosts with no NET channel, as in intra or at NCCL_DEBUG=WARN, are left out.
+
+    >>> import tempfile
+    >>> root = Path(tempfile.mkdtemp())
+    >>> _ = (root / "pair-a-b.a.7.log").write_text("x [send] via NET/IB/0/GDRDMA\\nx [receive] via NET/IB/1\\n")
+    >>> _ = (root / "pair-a-b.b.8.log").write_text("x [send] via P2P/CUMEM\\n")
+    >>> net_channels(sorted(root.iterdir()))
+    {'a': {'channels': 2, 'gdr': 1}}
+    """
+    out: ByHost[dict[str, int]] = {}
+    for log in logs:
+        # The label has no dots, the pid is last, and %h may add the host's domain: keep the short name
+        host = log.name.split(".")[1]
+        suffixes = NET_CHANNEL.findall(log.read_text(errors="replace"))
+        if suffixes:
+            counts = out.setdefault(host, {"channels": 0, "gdr": 0})
+            counts["channels"] += len(suffixes)
+            counts["gdr"] += sum("/GDRDMA" in suffix for suffix in suffixes)
+    return out
+
+
 def pair_rounds(nodes: list[str]) -> list[list[tuple[str, str]]]:
     """
     Ring pairs (i, i+1) split into rounds where no node appears twice.
@@ -135,9 +163,10 @@ def run_round(
     """
     Run tests concurrently; a straggler past timeout is terminated and reported as such.
 
-    Each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and the empty ones of tests that
-    finished are removed after it: at NCCL_DEBUG=WARN a healthy rank writes nothing, rank 0 only the version. A
-    timed-out test's are all kept, since its remote ranks may outlive srun and still be writing.
+    Each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and each result records its hosts'
+    NET channels from them (net_channels). The logs are kept for debugging, except the empty ones of tests that
+    finished, which only NCCL_DEBUG=WARN leaves: a timed-out test's remote ranks may outlive srun and still be
+    writing.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
@@ -197,6 +226,7 @@ def run_round(
                 ],
                 "wrong": parsed["wrong"],
                 "log": str(log),
+                "net": net_channels(sorted(debug_dir.glob(f"{test.label}.*.log"))),
             }
         )
     # Only this round's finished tests: the run's other jobs share debug_dir, and their ranks may still be writing
@@ -326,6 +356,7 @@ class HealthCheck(HealthCheckBase):
         # srun passes these to every rank; run_round names each rank's debug log, and finalize scans them for warnings
         results.nccl_logs.mkdir(parents=True, exist_ok=True)
         os.environ["NCCL_DEBUG"] = self.settings.debug
+        os.environ["NCCL_DEBUG_SUBSYS"] = self.settings.debug_subsys
         job_id, nodes = self._job()
         # No plugin means no rounds: one empty result either way, and the report warns when mpi is none.
         mpi = self._mpi if self._mpi is not None else mpi_plugin()
@@ -466,6 +497,12 @@ class HealthCheck(HealthCheckBase):
                 )
                 for node in test["nodes"]:
                     out[node].append(Finding(severity, f"{name}.{spec.name}", detail))
+        if cfg.no_gdr_severity:
+            for test in tests:
+                for host, counts in (test.get("net") or {}).items():  # older results have no "net"
+                    if missing := counts["channels"] - counts["gdr"]:
+                        detail = f"{test['kind']}: {missing}/{counts['channels']} NET channels without GPUDirect RDMA"
+                        out[host].append(Finding(cfg.no_gdr_severity, f"{name}.gdr", detail))
         prefixed = {f"nccl_{kind}_busbw_GBps": value for kind, value in kind_medians.items()}
         return Report(dict(out), prefixed)
 

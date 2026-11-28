@@ -103,7 +103,7 @@ results/<job_id>/
   switches.json                      leaf switch -> its nodes, written at submit
   nodes/<host>.json                  per-node results
   groups/<job_id>.json               NCCL results; raw output in groups/<job_id>/
-  logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log), kept only if a rank wrote one
+  logs/nccl/<test>-<host>-<pid>      NCCL debug logs (.log) at INFO for INIT,NET: transports, GPUDirect RDMA
   logs/dcgm/<host>/diag.txt          dcgmi diag stdout; diag.stderr.txt when the command wrote any
   numa/<host>.json                   per-node NUMA layout table
   xid/<host>.jsonl                   Xid events
@@ -126,8 +126,10 @@ tell which one is slow:
    The three form a ring of three pairs, each node in two. The slow node is the one both slow pairs share; read the
    pairs' `peak_busbw` in `groups/<job_id>.json` (~40 GB/s when healthy). The report may not flag it: two of the
    three pairs are slow, so the median is too, and only `nccl.pair.min_busbw_GBps` still applies.
-3. NCCL debug logs, `logs/nccl/pair-<a>-<b>.<host>.<pid>.log`, are kept when a rank logged something, such as a
-   `WARN` naming the failing connection.
+3. NCCL debug logs, `logs/nccl/pair-<a>-<b>.<host>.<pid>.log`, hold each rank's NCCL setup at INFO (subsystems
+   INIT and NET) and any `WARN` naming the failing connection. Each channel line ends in its transport:
+   `via NET/IB/0/GDRDMA` is GPUDirect RDMA, and `via NET/IB/0` alone stages through host memory, which `nccl.gdr`
+   reports.
 
 ## Node Power Limit
 cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The
