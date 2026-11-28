@@ -483,8 +483,15 @@ def test_a_gpu_type_can_set_a_loopback_warn_floor(run):
 
 
 def test_net_channels_without_gdr_fail_that_host(run):
-    """rg2's loopback falls back to host memory on 2 of 16 channels; rg1 uses GDR on all, and older results have none."""
-    channels = {"rg1": {"channels": 16, "gdr": 16}, "rg2": {"channels": 16, "gdr": 14}}
+    """
+    rg2's loopback falls back to host memory on 2 of 16 channels. rg1 uses GDR on all, rg3's GPUs are too far from the
+    NIC for NCCL to try (as on a single-NIC RTX node), and older results have no channel counts.
+    """
+    channels = {
+        "rg1": {"channels": 16, "gdr": 16, "too_far": 0},
+        "rg2": {"channels": 16, "gdr": 14, "too_far": 0},
+        "rg3": {"channels": 32, "gdr": 4, "too_far": 28},
+    }
     set_tests(
         run,
         lambda test: True,
@@ -493,7 +500,7 @@ def test_net_channels_without_gdr_fail_that_host(run):
         and test.update(net={test["nodes"][0]: channels[test["nodes"][0]]}),
     )
     nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
-    assert nodes["rg1"]["status"] == nodes["rg3"]["status"] == "pass"
+    assert nodes["rg1"]["status"] == nodes["rg3"]["status"] == nodes["rg4"]["status"] == "pass"
     detail = "loopback: 2/16 NET channels without GPUDirect RDMA"
     assert nodes["rg2"]["findings"] == [{"severity": "fail", "check": "nccl.gdr", "detail": detail}]
     assert statuses(run, Config(nccl=Nccl(no_gdr_severity=None)))["rg2"] == "pass"

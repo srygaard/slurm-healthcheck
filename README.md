@@ -128,8 +128,9 @@ tell which one is slow:
    three pairs are slow, so the median is too, and only `nccl.pair.min_busbw_GBps` still applies.
 3. NCCL debug logs, `logs/nccl/pair-<a>-<b>.<host>.<pid>.log`, hold each rank's NCCL setup at INFO (subsystems
    INIT and NET) and any `WARN` naming the failing connection. Each channel line ends in its transport:
-   `via NET/IB/0/GDRDMA` is GPUDirect RDMA, and `via NET/IB/0` alone stages through host memory, which `nccl.gdr`
-   reports.
+   `via NET/IB/0/GDRDMA` is GPUDirect RDMA, and `via NET/IB/0` alone stages through host memory. `nccl.gdr` reports
+   the latter unless NCCL logged that the GPU is too far from its NIC (`GPU Direct RDMA Disabled ... (distance 9 >
+   6)`), as for 7 of the 8 GPUs sharing one NIC on a Lynx RTX node.
 
 ## Node Power Limit
 cpu_load compares the CPU clock only while the GPUs are at full power, which dcgm's `targeted_power` test sets. The

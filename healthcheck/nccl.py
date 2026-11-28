@@ -67,31 +67,45 @@ def parse(text: str) -> dict[str, Any]:
     }
 
 
-# A NET channel's line at NCCL_DEBUG=INFO: "Channel 00/0 : 0[0] -> 1[1] [send] via NET/IB/0/GDRDMA"
+# At NCCL_DEBUG=INFO, a rank's NET channels ("Channel 00/0 : 2[2] -> 3[3] [send] via NET/IB/0/GDRDMA"), and NCCL's
+# GDR decision for each GPU ("GPU Direct RDMA Disabled for GPU/0-c8000 (rank 1) - NET/0-0 (distance 9 > 6)")
 NET_CHANNEL = re.compile(r"\[(?:send|receive)\] via NET/[^/\s]+/\d+(\S*)")
+SENDER = re.compile(r"(\d+)\[\d+\] -> \d+\[\d+\] \[send\] via ")
+TOO_FAR = re.compile(r"GPU Direct RDMA Disabled for GPU/\S+ \(rank (\d+)\).*\(distance \d+ > \d+")
 
 
 def net_channels(logs: list[Path]) -> ByHost[dict[str, int]]:
     """
-    Per host, its ranks' NET channels and how many use GPUDirect RDMA, from logs named <label>.<host>.<pid>.log.
-    Hosts with no NET channel, as in intra or at NCCL_DEBUG=WARN, are left out.
+    Per host, its ranks' NET channels, how many use GPUDirect RDMA, and how many of the rest NCCL ruled out because
+    the GPU is too far from its NIC (past NCCL_NET_GDR_LEVEL, as when the path crosses the CPU). Logs are named
+    <label>.<host>.<pid>.log, one per rank. Hosts with no NET channel, as in intra or at NCCL_DEBUG=WARN, are left
+    out.
 
     >>> import tempfile
     >>> root = Path(tempfile.mkdtemp())
-    >>> _ = (root / "pair-a-b.a.7.log").write_text("x [send] via NET/IB/0/GDRDMA\\nx [receive] via NET/IB/1\\n")
-    >>> _ = (root / "pair-a-b.b.8.log").write_text("x [send] via P2P/CUMEM\\n")
+    >>> near = "0[0] -> 1[1] [send] via NET/IB/0/GDRDMA\\n1[1] -> 0[0] [receive] via NET/IB/0\\n"
+    >>> far = "GPU Direct RDMA Disabled for GPU/0-1 (rank 1) - NET/0-0 (distance 9 > 6)\\n1[1] -> 0[0] [send] via NET/IB/0\\n"
+    >>> _ = (root / "pair-a-b.a.7.log").write_text(near)
+    >>> _ = (root / "pair-a-b.a.8.log").write_text(far)
+    >>> _ = (root / "pair-a-b.b.9.log").write_text("0[0] -> 1[1] [send] via P2P/CUMEM\\n")
     >>> net_channels(sorted(root.iterdir()))
-    {'a': {'channels': 2, 'gdr': 1}}
+    {'a': {'channels': 3, 'gdr': 1, 'too_far': 1}}
     """
     out: ByHost[dict[str, int]] = {}
     for log in logs:
+        text = log.read_text(errors="replace")
+        suffixes = NET_CHANNEL.findall(text)
+        if not suffixes:
+            continue
         # The label has no dots, the pid is last, and %h may add the host's domain: keep the short name
-        host = log.name.split(".")[1]
-        suffixes = NET_CHANNEL.findall(log.read_text(errors="replace"))
-        if suffixes:
-            counts = out.setdefault(host, {"channels": 0, "gdr": 0})
-            counts["channels"] += len(suffixes)
-            counts["gdr"] += sum("/GDRDMA" in suffix for suffix in suffixes)
+        counts = out.setdefault(log.name.split(".")[1], {"channels": 0, "gdr": 0, "too_far": 0})
+        gdr = sum("/GDRDMA" in suffix for suffix in suffixes)
+        counts["channels"] += len(suffixes)
+        counts["gdr"] += gdr
+        # Each rank's log also holds other ranks' decisions; only its own GPU's counts
+        own = set(SENDER.findall(text))
+        if own & set(TOO_FAR.findall(text)):
+            counts["too_far"] += len(suffixes) - gdr
     return out
 
 
@@ -500,7 +514,8 @@ class HealthCheck(HealthCheckBase):
         if cfg.no_gdr_severity:
             for test in tests:
                 for host, counts in (test.get("net") or {}).items():  # older results have no "net"
-                    if missing := counts["channels"] - counts["gdr"]:
+                    # A GPU past NCCL's GDR distance stages through host memory by design, not for a fault
+                    if missing := counts["channels"] - counts["gdr"] - counts.get("too_far", 0):
                         detail = f"{test['kind']}: {missing}/{counts['channels']} NET channels without GPUDirect RDMA"
                         out[host].append(Finding(cfg.no_gdr_severity, f"{name}.gdr", detail))
         prefixed = {f"nccl_{kind}_busbw_GBps": value for kind, value in kind_medians.items()}
