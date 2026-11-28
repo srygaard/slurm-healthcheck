@@ -181,6 +181,18 @@ def test_gpu_capped_below_its_default_power_limit_fails(run):
     ]
 
 
+def test_gpu_capped_slightly_below_its_default_power_limit_warns(run):
+    def capped(node):
+        node["sysinfo"]["data"]["counters"][3]["power_limit_w"] = 650.0  # 0.93, like Mila's L40S at 325 of 350 W
+
+    edit(run, "rg2", capped)
+    result = evaluate(run)["nodes"]["rg2"]
+    assert result["status"] == "warn"
+    assert [(f["severity"], f["check"], f["detail"]) for f in result["findings"]] == [
+        ("warn", "gpu.power_limit", "GPU3 power limit 650 W < default 700 W")
+    ]
+
+
 def test_port_slower_than_its_peers_fails_that_node(run):
     def slow(node):
         node["sysinfo"]["data"]["nic"]["fabric"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)

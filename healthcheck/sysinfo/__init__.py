@@ -144,9 +144,11 @@ def _findings(
             enforced_w=counters.get("power_limit_w"),
             default_w=counters.get("default_power_limit_w"),
         )
-        if limits.power_capped(gpu_cfg.min_power_limit_frac):
-            detail = f"GPU{index} power limit {limits.enforced_w:.0f} W < default {limits.default_w:.0f} W"
-            yield Finding("fail", "gpu.power_limit", detail)
+        for severity, frac in (("fail", gpu_cfg.min_power_limit_frac), ("warn", gpu_cfg.warn_power_limit_frac)):
+            if limits.power_capped(frac):
+                detail = f"GPU{index} power limit {limits.enforced_w:.0f} W < default {limits.default_w:.0f} W"
+                yield Finding(severity, "gpu.power_limit", detail)
+                break
         if (counters["ecc_volatile"]["uncorrected"] or 0) > gpu_cfg.max_volatile_uncorrected_ecc:
             yield Finding("fail", "gpu.ecc", f"GPU{index} {counters['ecc_volatile']['uncorrected']} uncorrected ECC")
         if rows := counters["remapped_rows"]:

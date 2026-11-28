@@ -36,7 +36,9 @@ class GpuLimits:
     # Rows remapped after an uncorrectable error: the repair worked, but a job likely crashed when the row failed.
     # Corrected remaps are routine HBM repair and aren't graded; an increase during the run still fails in logs.
     max_remap_uncorrected: int = 0  # warn above
-    min_power_limit_frac: float = 0.95
+    # The enforced power limit against the board's default: fail and warn below these. Mila caps L40S at 325 of 350 W.
+    min_power_limit_frac: float = 0.90
+    warn_power_limit_frac: float = 0.95
     # NCCL loopback busbw, GPU memory to its NIC: fail and warn below these, whatever the run's median
     min_loopback_busbw_GBps: float = 3  # Rorqual H100: single-node ~6.4, a 65-node run near 3.7, lowest 3.22
     warn_loopback_busbw_GBps: float = 0
