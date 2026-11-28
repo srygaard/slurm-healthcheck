@@ -7,6 +7,6 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=256
 #SBATCH --mem=0
-#SBATCH --time=00:30:00
+#SBATCH --time=00:35:00
 
 source "$HC_CODE/slurm/scripts/.lynx-rtx.env"  # no Lmod: HC_MODULES is empty

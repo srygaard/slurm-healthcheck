@@ -121,7 +121,7 @@ def test_an_older_record_with_a_throttle_delta_still_reads():
 
 
 def test_time_at_full_power_comes_from_the_runs_own_sampling_interval():
-    # An older run sampled every 5 s, though interval_s is now 1: 6 readings at full power are 30 s, not 6 s
+    # An older run sampled every 5 s, though interval_s is now 0.5: 6 readings at full power are 30 s, not 6 s
     rows = [(0, 3200, 300), (5, 3200, 1000), (10, 3200, 2000)] + [(15 + 5 * k, 2300, 8000) for k in range(6)]
     samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
     assert cpu_load.Summary.from_samples(samples, CpuLoad(min_full_power_s=30)).of("0").full_power_mhz == 2300

@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from healthcheck import dcgm, nccl, sysinfo
 from healthcheck.check import Finding
-from healthcheck.config import Config, Nic, Project, Scratch, gpu_gres
+from healthcheck.config import Config, Nccl, Nic, Project, Scratch, gpu_gres
 from launcher import report
 
 
@@ -69,7 +70,7 @@ def healthy(host):
         "smart": {"status": "unavailable", "disks": {}},
     }
     logs = {
-        "kernel": {"dmesg": {"status": "unavailable"}},
+        "kernel": {"dmesg": {"status": "ok", "matches": []}},
         "nccl": {"files": 4, "count": 0, "matches": []},
         "xid": {"status": "ok", "events": []},
         "counter_deltas": [],
@@ -180,6 +181,18 @@ def test_gpu_capped_below_its_default_power_limit_fails(run):
     ]
 
 
+def test_gpu_capped_slightly_below_its_default_power_limit_warns(run):
+    def capped(node):
+        node["sysinfo"]["data"]["counters"][3]["power_limit_w"] = 650.0  # 0.93, like Mila's L40S at 325 of 350 W
+
+    edit(run, "rg2", capped)
+    result = evaluate(run)["nodes"]["rg2"]
+    assert result["status"] == "warn"
+    assert [(f["severity"], f["check"], f["detail"]) for f in result["findings"]] == [
+        ("warn", "gpu.power_limit", "GPU3 power limit 650 W < default 700 W")
+    ]
+
+
 def test_port_slower_than_its_peers_fails_that_node(run):
     def slow(node):
         node["sysinfo"]["data"]["nic"]["fabric"][0]["ports"][0].update(rate="100 Gb/sec (2X HDR)", rate_gbps=100.0)
@@ -260,7 +273,7 @@ def test_cpu_load_throttle_events_and_slow_package_warn_per_package(run):
     findings = report_["nodes"]["rg6"]["findings"]
     assert [(finding["severity"], finding["check"]) for finding in findings] == [
         ("warn", "cpu_load.throttle"),
-        ("warn", "cpu_load.median"),
+        ("warn", "cpu_load.clock"),
     ]
     assert findings[0]["detail"] == "CPU Package 1: 3 thermal throttling episodes"
     assert findings[1]["detail"].startswith("CPU Package 1: busy-core clock 1500 < ")
@@ -292,6 +305,16 @@ def test_historical_corrected_ecc_does_not_warn(run):
     assert not [finding for finding in result["findings"] if finding["check"] in ("gpu.ecc", "gpu.remap")]
 
 
+def test_rows_remapped_after_uncorrectable_errors_warn(run):
+    edit(run, "rg2", lambda node: node["sysinfo"]["data"]["counters"][1]["remapped_rows"].update(uncorrected=1))
+    result = evaluate(run)["nodes"]["rg2"]
+    remap = [finding for finding in result["findings"] if finding["check"] == "gpu.remap"]
+    assert [(finding["severity"], finding["detail"]) for finding in remap] == [
+        ("warn", "GPU1 1 rows remapped after uncorrectable errors")
+    ]
+    assert result["status"] == "warn"
+
+
 def test_known_kernel_lines_warn_and_other_lines_fail(run):
     dmesg = {
         "status": "ok",
@@ -312,6 +335,25 @@ def test_known_kernel_lines_warn_and_other_lines_fail(run):
     assert "query_mcia_reg failed" in findings[1]["detail"]
     assert "Xid" in findings[2]["detail"]
     assert evaluate(run)["nodes"]["rg1"]["status"] == "fail"
+
+
+def test_unreadable_kernel_log_is_info_only(run):
+    unreadable = {
+        "dmesg": {"status": "unavailable", "error": "dmesg: read kernel buffer failed: Operation not permitted"},
+        "journal": {"status": "unavailable", "error": "No journal files were opened due to insufficient permissions."},
+    }
+    edit(run, "rg1", lambda node: node["logs"]["data"].update(kernel=unreadable))
+    result = evaluate(run)["nodes"]["rg1"]
+    kernel = [finding for finding in result["findings"] if finding["check"] == "logs.kernel"]
+    assert [finding["severity"] for finding in kernel] == ["info"]
+    assert "Operation not permitted" in kernel[0]["detail"] and "insufficient permissions" in kernel[0]["detail"]
+    assert result["status"] == "pass"
+
+
+def test_one_readable_kernel_log_is_enough(run):
+    kernel = {"dmesg": {"status": "unavailable", "error": "denied"}, "journal": {"status": "ok", "matches": []}}
+    edit(run, "rg1", lambda node: node["logs"]["data"].update(kernel=kernel))
+    assert not [f for f in evaluate(run)["nodes"]["rg1"]["findings"] if f["check"] == "logs.kernel"]
 
 
 def test_cpu_load_skipped_or_absent_passes(run):
@@ -416,6 +458,69 @@ def test_intra_below_fail_fraction_fails_and_the_warn_band_warns(run):
     set_intra(None)  # an ok result with no bandwidth is graded as 0, and the message says 0
     findings = evaluate(run)["nodes"]["rg3"]["findings"]
     assert findings[0]["detail"] == "busbw 0 < 315.0"
+
+
+def test_gpus_without_nvlink_use_the_pcie_intra_floor(run):
+    """Every node near 24.5 GB/s: under intra's 120 GB/s NVLink floor, over a quarter of Gen5 x16's 64 GB/s."""
+    set_tests(run, lambda test: True, lambda test: test["kind"] == "intra" and test.update(peak_busbw=24.5))
+    pcie = replace(gpu_gres["h100"], min_nvlinks=0)
+    nodes = report.evaluate(run, Config(), switches(run), pcie, 4)["nodes"]
+    assert {host: node["status"] for host, node in nodes.items()} == dict.fromkeys(nodes, "pass")
+    assert evaluate(run)["nodes"]["rg1"]["findings"][0]["detail"] == "busbw 24.5 < 120.0"
+
+
+def test_a_gpu_type_can_set_a_loopback_warn_floor(run):
+    """Every node but rg1 near 12.9 GB/s: the median is slow too, so only the part's 18 GB/s floor catches them."""
+    set_tests(
+        run,
+        lambda test: True,
+        lambda test: test["kind"] == "loopback" and test.update(peak_busbw=20.1 if test["nodes"] == ["rg1"] else 12.9),
+    )
+    nodes = report.evaluate(run, Config(), switches(run), gpu_gres["b200"], 4)["nodes"]
+    assert nodes["rg1"]["status"] == "pass"
+    assert nodes["rg2"]["findings"] == [{"severity": "warn", "check": "nccl.loopback", "detail": "busbw 12.9 < 18.0"}]
+    assert statuses(run)["rg2"] == "pass"  # h100 sets no floor
+
+
+def test_net_channels_without_gdr_fail_that_host(run):
+    """
+    rg2's loopback falls back to host memory on 2 of 16 channels. rg1 uses GDR on all, rg3's GPUs are too far from the
+    NIC for NCCL to try (as on a single-NIC RTX node), and older results have no channel counts.
+    """
+    channels = {
+        "rg1": {"channels": 16, "gdr": 16, "too_far": 0},
+        "rg2": {"channels": 16, "gdr": 14, "too_far": 0},
+        "rg3": {"channels": 32, "gdr": 4, "too_far": 28},
+    }
+    set_tests(
+        run,
+        lambda test: True,
+        lambda test: test["kind"] == "loopback"
+        and test["nodes"][0] in channels
+        and test.update(net={test["nodes"][0]: channels[test["nodes"][0]]}),
+    )
+    nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
+    assert nodes["rg1"]["status"] == nodes["rg3"]["status"] == nodes["rg4"]["status"] == "pass"
+    detail = "loopback: 2/16 NET channels without GPUDirect RDMA"
+    assert nodes["rg2"]["findings"] == [{"severity": "info", "check": "nccl.gdr", "detail": detail}]
+    assert nodes["rg2"]["status"] == "pass"
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity="warn")))["rg2"] == "warn"
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity="fail")))["rg2"] == "fail"
+    assert statuses(run, Config(nccl=Nccl(no_gdr_severity=None)))["rg2"] == "pass"
+
+
+def test_a_cluster_without_gdr_notes_every_node_and_flags_none(run):
+    """No GDR set up anywhere: every rank stages through host memory, and NCCL logs no distance reason."""
+    set_tests(
+        run,
+        lambda test: True,
+        lambda test: test["kind"] == "loopback"
+        and test.update(net={test["nodes"][0]: {"channels": 16, "gdr": 0, "too_far": 0}}),
+    )
+    nodes = report.evaluate(run, Config(), switches(run), gpu_gres["h100"], 4)["nodes"]
+    detail = "loopback: 16/16 NET channels without GPUDirect RDMA"
+    assert {host: node["status"] for host, node in nodes.items()} == dict.fromkeys(nodes, "pass")
+    assert all(node["findings"] == [{"severity": "info", "check": "nccl.gdr", "detail": detail}] for node in nodes.values())
 
 
 def test_pair_below_fail_fraction_fails_that_node(run):
@@ -578,6 +683,7 @@ def test_nccl_without_mpi_warns_instead_of_failing():
     result = nccl.HealthCheck.report(
         [{"job_id": 1, "nodes": ["cn-l001"], "mpi": "none", "tests": [], "elapsed_s": 0}],
         Config().nccl,
+        gpu_gres["h100"],
         "nccl",
     )
     assert result.findings["cn-l001"] == [Finding("warn", "nccl", "skipped: no MPI plugin")]
@@ -615,39 +721,32 @@ def test_nccl_unavailable_warns():
             }
         ],
         Config().nccl,
+        gpu_gres["h100"],
         "nccl",
     )
     assert result.findings["cn-l001"] == [Finding("warn", "nccl", "unavailable: missing all_reduce_perf in /build")]
     assert result.medians == {}
 
 
-def translate_gpu_dma(node):
-    data = node["sysinfo"]["data"]
-    for device in data["gpu"]["devices"] + data["nic"]["fabric"]:
-        device["pci"] = {"iommu_domain": "DMA-FQ"}
-    data["nic"]["fabric"][3]["pci"] = {"iommu_domain": "identity"}
-
-
-def test_iommu_translating_gpu_dma_warns(run):
-    edit(run, "rg2", translate_gpu_dma)
-    nodes = evaluate(run)["nodes"]
-    assert nodes["rg2"]["findings"] == [
-        {
-            "severity": "warn",
-            "check": "nic.iommu",
-            "detail": "GPUDirect DMA translated by the IOMMU (DMA-FQ): GPU0, GPU1, GPU2, GPU3, mlx5_0, mlx5_1, mlx5_2",
-        }
-    ]
-    assert nodes["rg1"]["status"] == "pass"
-    assert statuses(run, Config(nic=Nic(warn_iommu_translated=False)))["rg2"] == "pass"
-
-
-def test_iommu_units_differing_from_the_majority_warn(run):
+def test_iommu_enabled_is_noted_even_on_the_majority(run):
+    """Every node but rg6 has IOMMU units: each gets an info finding and still passes, as rg6 does."""
     for host in ("rg1", "rg2", "rg3", "rg4", "rg5"):
         edit(run, host, lambda node: node["sysinfo"]["data"].update(iommu={"units": ["dmar0", "dmar1"]}))
     edit(run, "rg6", lambda node: node["sysinfo"]["data"].update(iommu={"units": []}))
     nodes = evaluate(run)["nodes"]
-    assert nodes["rg6"]["findings"] == [
-        {"severity": "warn", "check": "homogeneity", "detail": 'iommu.units=[] (majority ["dmar0", "dmar1"])'}
+    assert nodes["rg1"]["findings"] == [
+        {
+            "severity": "info",
+            "check": "nic.iommu",
+            "detail": "IOMMU enabled (2 units): GPUDirect may route through the root complex",
+        }
     ]
-    assert nodes["rg1"]["status"] == "pass"
+    assert nodes["rg1"]["status"] == nodes["rg6"]["status"] == "pass"
+    assert nodes["rg6"]["findings"] == []
+    assert statuses(run, Config(nic=Nic(iommu_severity="warn")))["rg1"] == "warn"
+    assert evaluate(run, Config(nic=Nic(iommu_severity=None)))["nodes"]["rg1"]["findings"] == []
+
+
+def test_iommu_missing_from_older_sysinfo_passes(run):
+    edit(run, "rg1", lambda node: node["sysinfo"]["data"].pop("iommu", None))
+    assert statuses(run)["rg1"] == "pass"

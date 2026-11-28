@@ -90,7 +90,7 @@ def evaluate(
             findings[host].append(finding)
         for host, found in result.findings.items():
             findings[host] += found
-    nccl_report = nccl.HealthCheck.report(groups, cfg.nccl, "nccl")
+    nccl_report = nccl.HealthCheck.report(groups, cfg.nccl, gpu, "nccl")
     for host, found in nccl_report.findings.items():
         findings[host] += found
     medians |= nccl_report.medians

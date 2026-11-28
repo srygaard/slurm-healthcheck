@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median
-from healthcheck.config import Nccl, NcclTest, Paths, cfg
+from healthcheck.config import GpuLimits, Nccl, NcclTest, Paths, cfg
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict, write_json
 from healthcheck.util.hostlist import ByHost, Hostlist
@@ -65,6 +65,48 @@ def parse(text: str) -> dict[str, Any]:
         "avg_busbw": float(avg.group(1)) if avg else None,
         "wrong": sum(row["wrong"] for row in rows),
     }
+
+
+# At NCCL_DEBUG=INFO, a rank's NET channels ("Channel 00/0 : 2[2] -> 3[3] [send] via NET/IB/0/GDRDMA"), and NCCL's
+# GDR decision for each GPU ("GPU Direct RDMA Disabled for GPU/0-c8000 (rank 1) - NET/0-0 (distance 9 > 6)")
+NET_CHANNEL = re.compile(r"\[(?:send|receive)\] via NET/[^/\s]+/\d+(\S*)")
+SENDER = re.compile(r"(\d+)\[\d+\] -> \d+\[\d+\] \[send\] via ")
+TOO_FAR = re.compile(r"GPU Direct RDMA Disabled for GPU/\S+ \(rank (\d+)\).*\(distance \d+ > \d+")
+
+
+def net_channels(logs: list[Path]) -> ByHost[dict[str, int]]:
+    """
+    Per host, its ranks' NET channels, how many use GPUDirect RDMA, and how many of the rest NCCL ruled out because
+    the GPU is too far from its NIC (past NCCL_NET_GDR_LEVEL, as when the path crosses the CPU). Logs are named
+    <label>.<host>.<pid>.log, one per rank. Hosts with no NET channel, as in intra or at NCCL_DEBUG=WARN, are left
+    out.
+
+    >>> import tempfile
+    >>> root = Path(tempfile.mkdtemp())
+    >>> near = "0[0] -> 1[1] [send] via NET/IB/0/GDRDMA\\n1[1] -> 0[0] [receive] via NET/IB/0\\n"
+    >>> far = "GPU Direct RDMA Disabled for GPU/0-1 (rank 1) - NET/0-0 (distance 9 > 6)\\n1[1] -> 0[0] [send] via NET/IB/0\\n"
+    >>> _ = (root / "pair-a-b.a.7.log").write_text(near)
+    >>> _ = (root / "pair-a-b.a.8.log").write_text(far)
+    >>> _ = (root / "pair-a-b.b.9.log").write_text("0[0] -> 1[1] [send] via P2P/CUMEM\\n")
+    >>> net_channels(sorted(root.iterdir()))
+    {'a': {'channels': 3, 'gdr': 1, 'too_far': 1}}
+    """
+    out: ByHost[dict[str, int]] = {}
+    for log in logs:
+        text = log.read_text(errors="replace")
+        suffixes = NET_CHANNEL.findall(text)
+        if not suffixes:
+            continue
+        # The label has no dots, the pid is last, and %h may add the host's domain: keep the short name
+        counts = out.setdefault(log.name.split(".")[1], {"channels": 0, "gdr": 0, "too_far": 0})
+        gdr = sum("/GDRDMA" in suffix for suffix in suffixes)
+        counts["channels"] += len(suffixes)
+        counts["gdr"] += gdr
+        # Each rank's log also holds other ranks' decisions; only its own GPU's counts
+        own = set(SENDER.findall(text))
+        if own & set(TOO_FAR.findall(text)):
+            counts["too_far"] += len(suffixes) - gdr
+    return out
 
 
 def pair_rounds(nodes: list[str]) -> list[list[tuple[str, str]]]:
@@ -135,9 +177,10 @@ def run_round(
     """
     Run tests concurrently; a straggler past timeout is terminated and reported as such.
 
-    Each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and the empty ones of tests that
-    finished are removed after it: at NCCL_DEBUG=WARN a healthy rank writes nothing, rank 0 only the version. A
-    timed-out test's are all kept, since its remote ranks may outlive srun and still be writing.
+    Each rank writes NCCL's debug log to <debug_dir>/<label>.<host>.<pid>.log, and each result records its hosts'
+    NET channels from them (net_channels). The logs are kept for debugging, except the empty ones of tests that
+    finished, which only NCCL_DEBUG=WARN leaves: a timed-out test's remote ranks may outlive srun and still be
+    writing.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     procs = []
@@ -197,6 +240,7 @@ def run_round(
                 ],
                 "wrong": parsed["wrong"],
                 "log": str(log),
+                "net": net_channels(sorted(debug_dir.glob(f"{test.label}.*.log"))),
             }
         )
     # Only this round's finished tests: the run's other jobs share debug_dir, and their ranks may still be writing
@@ -326,6 +370,7 @@ class HealthCheck(HealthCheckBase):
         # srun passes these to every rank; run_round names each rank's debug log, and finalize scans them for warnings
         results.nccl_logs.mkdir(parents=True, exist_ok=True)
         os.environ["NCCL_DEBUG"] = self.settings.debug
+        os.environ["NCCL_DEBUG_SUBSYS"] = self.settings.debug_subsys
         job_id, nodes = self._job()
         # No plugin means no rounds: one empty result either way, and the report warns when mpi is none.
         mpi = self._mpi if self._mpi is not None else mpi_plugin()
@@ -361,7 +406,8 @@ class HealthCheck(HealthCheckBase):
         return out
 
     @staticmethod
-    def report(groups: list[dict[str, Any]], cfg: Nccl, name: str) -> Report:
+    def report(groups: list[dict[str, Any]], cfg: Nccl, gpu: GpuLimits, name: str) -> Report:
+        """The GPU type picks intra's NVLink or PCIe floor and sets loopback's."""
         out: ByHost[list[Finding]] = defaultdict(list)
         for group in groups:
             if group.get("mpi") == "none":
@@ -388,8 +434,8 @@ class HealthCheck(HealthCheckBase):
             for kind, kind_tests in by_kind.items()
         }
         for spec in (cfg.intra, cfg.loopback):
-            fail_floor = _floor(spec, kind_medians)
-            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
+            fail_floor = _floor(spec, gpu, kind_medians)
+            warn_floor = _warn_floor(spec, gpu, kind_medians, fail_floor)
             for test in by_kind[spec.name]:
                 busbw = test["peak_busbw"] or 0
                 if not ok(test):
@@ -408,8 +454,8 @@ class HealthCheck(HealthCheckBase):
         # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
         # bad fails too: with two nodes there is one pair, and nothing tells the two apart. A pair under the warn
         # floor but over the fail floor warns both nodes and fails neither.
-        fail_floor = _floor(cfg.pair, kind_medians)
-        warn_floor = _warn_floor(cfg.pair, kind_medians, fail_floor)
+        fail_floor = _floor(cfg.pair, gpu, kind_medians)
+        warn_floor = _warn_floor(cfg.pair, gpu, kind_medians, fail_floor)
         failed: ByHost[list[str]] = defaultdict(list)
         warned: ByHost[list[str]] = defaultdict(list)
         pairs_of: Counter[str] = Counter()
@@ -442,8 +488,8 @@ class HealthCheck(HealthCheckBase):
         for spec in (cfg.group, cfg.alltoall):
             # A slow whole-job result warns at either floor: it names no node. An unblamed timeout uses
             # timeout_severity.
-            fail_floor = _floor(spec, kind_medians)
-            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
+            fail_floor = _floor(spec, gpu, kind_medians)
+            warn_floor = _warn_floor(spec, gpu, kind_medians, fail_floor)
             slow_below = warn_floor if warn_floor is not None else fail_floor
             op = spec.binary.removesuffix("_perf")
             for test in by_kind[spec.name]:
@@ -465,19 +511,41 @@ class HealthCheck(HealthCheckBase):
                 )
                 for node in test["nodes"]:
                     out[node].append(Finding(severity, f"{name}.{spec.name}", detail))
+        if cfg.no_gdr_severity:
+            for test in tests:
+                for host, counts in (test.get("net") or {}).items():  # older results have no "net"
+                    # A GPU past NCCL's GDR distance stages through host memory by design, not for a fault
+                    if missing := counts["channels"] - counts["gdr"] - counts.get("too_far", 0):
+                        detail = f"{test['kind']}: {missing}/{counts['channels']} NET channels without GPUDirect RDMA"
+                        out[host].append(Finding(cfg.no_gdr_severity, f"{name}.gdr", detail))
         prefixed = {f"nccl_{kind}_busbw_GBps": value for kind, value in kind_medians.items()}
         return Report(dict(out), prefixed)
 
 
-def _floor(spec: NcclTest, kind_medians: dict[str, float | None]) -> float:
-    return max(spec.min_busbw_GBps, (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
+def _fixed_floors(spec: NcclTest, gpu: GpuLimits) -> tuple[float, float]:
+    """The fail and warn floors that don't depend on the run's median."""
+    fail = spec.min_busbw_GBps
+    if not gpu.min_nvlinks and spec.min_frac_of_pcie is not None:
+        fail = spec.min_frac_of_pcie * gpu.pcie_GBps
+    if spec.name == "loopback":
+        return max(fail, gpu.min_loopback_busbw_GBps), gpu.warn_loopback_busbw_GBps
+    return fail, 0
 
 
-def _warn_floor(spec: NcclTest, kind_medians: dict[str, float | None], fail_floor: float) -> float | None:
-    """The warn line, or None when this kind has no warn fraction. It is never below the fail floor."""
-    if spec.warn_frac_of_median is None:
+def _floor(spec: NcclTest, gpu: GpuLimits, kind_medians: dict[str, float | None]) -> float:
+    relative = (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0)
+    return max(_fixed_floors(spec, gpu)[0], relative)
+
+
+def _warn_floor(
+    spec: NcclTest, gpu: GpuLimits, kind_medians: dict[str, float | None], fail_floor: float
+) -> float | None:
+    """The warn line, or None when this kind has neither a warn fraction nor floor. It is never below the fail floor."""
+    fixed = _fixed_floors(spec, gpu)[1]
+    if spec.warn_frac_of_median is None and not fixed:
         return None
-    return max(fail_floor, (kind_medians.get(spec.name) or 0) * spec.warn_frac_of_median)
+    relative = (kind_medians.get(spec.name) or 0) * (spec.warn_frac_of_median or 0)
+    return max(fail_floor, fixed, relative)
 
 
 def main() -> int:
