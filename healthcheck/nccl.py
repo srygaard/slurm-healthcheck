@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from healthcheck.check import Availability, Finding, HealthCheckBase, Report, Severity, median
-from healthcheck.config import Nccl, NcclTest, Paths, cfg
+from healthcheck.config import GpuLimits, Nccl, NcclTest, Paths, cfg
 from healthcheck.util.cmd import run
 from healthcheck.util.file import Json, JsonDict, write_json
 from healthcheck.util.hostlist import ByHost, Hostlist
@@ -361,7 +361,8 @@ class HealthCheck(HealthCheckBase):
         return out
 
     @staticmethod
-    def report(groups: list[dict[str, Any]], cfg: Nccl, name: str) -> Report:
+    def report(groups: list[dict[str, Any]], cfg: Nccl, gpu: GpuLimits, name: str) -> Report:
+        """The GPU type picks intra's NVLink or PCIe floor and sets loopback's."""
         out: ByHost[list[Finding]] = defaultdict(list)
         for group in groups:
             if group.get("mpi") == "none":
@@ -388,8 +389,8 @@ class HealthCheck(HealthCheckBase):
             for kind, kind_tests in by_kind.items()
         }
         for spec in (cfg.intra, cfg.loopback):
-            fail_floor = _floor(spec, kind_medians)
-            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
+            fail_floor = _floor(spec, gpu, kind_medians)
+            warn_floor = _warn_floor(spec, gpu, kind_medians, fail_floor)
             for test in by_kind[spec.name]:
                 busbw = test["peak_busbw"] or 0
                 if not ok(test):
@@ -408,8 +409,8 @@ class HealthCheck(HealthCheckBase):
         # A bad node makes both of its ring pairs slow; its healthy neighbours see only one. A node whose every pair is
         # bad fails too: with two nodes there is one pair, and nothing tells the two apart. A pair under the warn
         # floor but over the fail floor warns both nodes and fails neither.
-        fail_floor = _floor(cfg.pair, kind_medians)
-        warn_floor = _warn_floor(cfg.pair, kind_medians, fail_floor)
+        fail_floor = _floor(cfg.pair, gpu, kind_medians)
+        warn_floor = _warn_floor(cfg.pair, gpu, kind_medians, fail_floor)
         failed: ByHost[list[str]] = defaultdict(list)
         warned: ByHost[list[str]] = defaultdict(list)
         pairs_of: Counter[str] = Counter()
@@ -442,8 +443,8 @@ class HealthCheck(HealthCheckBase):
         for spec in (cfg.group, cfg.alltoall):
             # A slow whole-job result warns at either floor: it names no node. An unblamed timeout uses
             # timeout_severity.
-            fail_floor = _floor(spec, kind_medians)
-            warn_floor = _warn_floor(spec, kind_medians, fail_floor)
+            fail_floor = _floor(spec, gpu, kind_medians)
+            warn_floor = _warn_floor(spec, gpu, kind_medians, fail_floor)
             slow_below = warn_floor if warn_floor is not None else fail_floor
             op = spec.binary.removesuffix("_perf")
             for test in by_kind[spec.name]:
@@ -469,15 +470,30 @@ class HealthCheck(HealthCheckBase):
         return Report(dict(out), prefixed)
 
 
-def _floor(spec: NcclTest, kind_medians: dict[str, float | None]) -> float:
-    return max(spec.min_busbw_GBps, (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0))
+def _fixed_floors(spec: NcclTest, gpu: GpuLimits) -> tuple[float, float]:
+    """The fail and warn floors that don't depend on the run's median."""
+    fail = spec.min_busbw_GBps
+    if not gpu.min_nvlinks and spec.min_frac_of_pcie is not None:
+        fail = spec.min_frac_of_pcie * gpu.pcie_GBps
+    if spec.name == "loopback":
+        return max(fail, gpu.min_loopback_busbw_GBps), gpu.warn_loopback_busbw_GBps
+    return fail, 0
 
 
-def _warn_floor(spec: NcclTest, kind_medians: dict[str, float | None], fail_floor: float) -> float | None:
-    """The warn line, or None when this kind has no warn fraction. It is never below the fail floor."""
-    if spec.warn_frac_of_median is None:
+def _floor(spec: NcclTest, gpu: GpuLimits, kind_medians: dict[str, float | None]) -> float:
+    relative = (kind_medians.get(spec.name) or 0) * (spec.min_frac_of_median or 0)
+    return max(_fixed_floors(spec, gpu)[0], relative)
+
+
+def _warn_floor(
+    spec: NcclTest, gpu: GpuLimits, kind_medians: dict[str, float | None], fail_floor: float
+) -> float | None:
+    """The warn line, or None when this kind has neither a warn fraction nor floor. It is never below the fail floor."""
+    fixed = _fixed_floors(spec, gpu)[1]
+    if spec.warn_frac_of_median is None and not fixed:
         return None
-    return max(fail_floor, (kind_medians.get(spec.name) or 0) * spec.warn_frac_of_median)
+    relative = (kind_medians.get(spec.name) or 0) * (spec.warn_frac_of_median or 0)
+    return max(fail_floor, fixed, relative)
 
 
 def main() -> int:

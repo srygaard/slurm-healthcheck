@@ -158,6 +158,13 @@ def _findings(data: JsonDict, cfg: Logs) -> Iterator[Finding]:
         )
     for source, result in data["kernel"].items():
         yield from _kernel_findings(source, result.get("matches") or [], cfg.kernel_warn)
+    # Unreadable for a normal user on most clusters: not a node fault, but the report should say errors went unchecked
+    if data["kernel"] and all(result.get("status") == Status.UNAVAILABLE for result in data["kernel"].values()):
+        why = "; ".join(  # dmesg's own errors already start with "dmesg: "
+            f"{source}: {(result.get('error') or 'unavailable').removeprefix(f'{source}: ')}"
+            for source, result in data["kernel"].items()
+        )
+        yield Finding("info", "logs.kernel", f"kernel log unreadable, its errors went unchecked ({why})")
 
 
 def _kernel_findings(source: str, matches: list[str], warn: list[str]) -> Iterator[Finding]:

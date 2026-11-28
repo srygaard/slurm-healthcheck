@@ -69,7 +69,8 @@ class HealthCheck(HealthCheckBase):
                 "other": [hca.to_json() for hca in hcas if self.link_layer not in hca.link_layers],
                 **nic.collect(),
             },
-            # IOMMU hardware units the kernel drives (dmar0, ...); each device's domain type is in its pci.iommu_domain
+            # IOMMU hardware units the kernel drives (dmar0, ...), none when VT-d/AMD-Vi is off; each device's domain
+            # type is in its pci.iommu_domain
             "iommu": {
                 "units": sorted(
                     unit.name
@@ -153,6 +154,9 @@ def _findings(
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap failure")
             if rows["pending"] > gpu_cfg.max_remap_pending:
                 yield Finding("fail", "gpu.remap", f"GPU{index} row remap pending (needs reset)")
+            if (rows["uncorrected"] or 0) > gpu_cfg.max_remap_uncorrected:
+                detail = f"GPU{index} {rows['uncorrected']} rows remapped after uncorrectable errors"
+                yield Finding("warn", "gpu.remap", detail)
 
     active = [
         (dev["name"], port)
@@ -166,21 +170,10 @@ def _findings(
             "fail", "nic.ports", f"{len(active)} active {nic_cfg.link_layer} ports < {nic_cfg.min_active_ib_ports}"
         )
 
-    if nic_cfg.warn_iommu_translated:
-        active_names = {name for name, _port in active}
-        pci_devices = [(f"GPU{device['index']}", device) for device in devices["devices"]] + [
-            (dev["name"], dev) for dev in data["nic"]["fabric"] if dev["name"] in active_names
-        ]
-        # A device whose domain wasn't read (None: an unparsed bus id, a pre-5.11 kernel, an older sysinfo JSON) counts
-        # as untranslated, even when the node has IOMMU units
-        translated = {
-            label: domain
-            for label, device in pci_devices
-            if (domain := device.get("pci", {}).get("iommu_domain")) in nic_cfg.translated_iommu_domains
-        }
-        if translated:
-            domains, labels = "/".join(sorted(set(translated.values()))), ", ".join(translated)
-            yield Finding("warn", "nic.iommu", f"GPUDirect DMA translated by the IOMMU ({domains}): {labels}")
+    # An older sysinfo JSON has no "iommu" key and doesn't warn
+    if nic_cfg.warn_iommu_enabled and (units := data.get("iommu", {}).get("units")):
+        detail = f"IOMMU enabled ({len(units)} units): GPUDirect may route through the root complex"
+        yield Finding("warn", "nic.iommu", detail)
 
 
 def _homogeneity(sysinfos: ByHost[JsonDict], cfg: Homogeneity) -> ByHost[list[Finding]]:

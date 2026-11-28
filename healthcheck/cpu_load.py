@@ -139,7 +139,7 @@ class BurnSample(TypedDict):
 
 
 class Clocks(NamedTuple):
-    """A package's median busy-core clock at full GPU power and at baseline."""
+    """A package's mean busy-core clock at full GPU power and at baseline."""
 
     full_power_mhz: int | None
     baseline_mhz: int | None
@@ -191,25 +191,25 @@ class Summary:
 
     def of(self, socket: str) -> Clocks:
         """
-        A package's clocks: medians, so a few halted readings don't set them. Both None when full power didn't span
-        min_full_power_s; the baseline None with under two samples.
+        A package's clocks: means, so brief dips lower them in proportion to the time spent in them. Both None when full
+        power didn't span min_full_power_s; the baseline None with under two samples.
 
-        >>> rows = ((0, 3900, 300), (5, 3200, 1000), (10, 3200, 2000))  # start-up reading, then the baseline ramp
-        >>> rows += ((15, 2400, 7000), (20, 200, 7000), (25, 2400, 7000))  # full power: 15 s
+        >>> rows = ((0, 3900, 300), (5, 3200, 1000), (10, 3000, 2000))  # start-up reading, then the baseline ramp
+        >>> rows += ((15, 2400, 7000), (20, 300, 7000), (25, 2400, 7000))  # full power: 15 s, with one dip
         >>> samples = [{"t_s": t, "mhz": {"0": mhz}, "gpu_w": w} for t, mhz, w in rows]
         >>> Summary.from_samples(samples, CpuLoad(min_full_power_s=15)).of("0")
-        Clocks(full_power_mhz=2400, baseline_mhz=3200)
+        Clocks(full_power_mhz=1700, baseline_mhz=3100)
         >>> Summary.from_samples(samples, CpuLoad(min_full_power_s=25)).of("0")
         Clocks(full_power_mhz=None, baseline_mhz=None)
         """
 
-        def median(samples: list[BurnSample]) -> int | None:
+        def mean(samples: list[BurnSample]) -> int | None:
             values = [mhz for sample in samples if (mhz := sample["mhz"].get(socket)) is not None]
-            return round(statistics.median(values)) if values else None
+            return round(statistics.mean(values)) if values else None
 
         if self.full_power_s < self.min_full_power_s:
             return Clocks(None, None)
-        return Clocks(median(self.loaded), median(self.unloaded) if len(self.unloaded) >= 2 else None)
+        return Clocks(mean(self.loaded), mean(self.unloaded) if len(self.unloaded) >= 2 else None)
 
 
 @dataclass(frozen=True)
@@ -218,7 +218,7 @@ class PackageRecord:
 
     socket: str
     thermal_throttles: int | None  # package thermal throttling episodes during the burn
-    full_power_mhz: int | None  # the median busy-core clock at full GPU power
+    full_power_mhz: int | None  # the mean busy-core clock at full GPU power
     baseline_mhz: int | None  # and while the GPUs drew under baseline_power_frac of their peak
     busy_cpus: str | None = None  # a cpulist
 
@@ -269,13 +269,13 @@ class PackageRecord:
         mhz = self.full_power_mhz
         baseline = self.baseline_mhz
         if mhz is not None and mhz < floor:
-            yield Finding("warn", "cpu_load.median", f"{self.label}busy-core clock {mhz} < {floor:.0f} MHz")
+            yield Finding("warn", "cpu_load.clock", f"{self.label}busy-core clock {mhz} < {floor:.0f} MHz")
         if mhz is None or not baseline:
             return
-        # Sag: the median against the package's own clock before the GPUs loaded up
+        # Sag: the mean against the package's own clock before the GPUs loaded up
         for severity, frac in (("fail", fail_frac), ("warn", warn_frac)):
             if mhz < frac * baseline:
-                drop = f"median frequency degraded {1 - mhz / baseline:.0%} under system load ({baseline} -> {mhz} MHz)"
+                drop = f"mean frequency degraded {1 - mhz / baseline:.0%} under system load ({baseline} -> {mhz} MHz)"
                 yield Finding(severity, "cpu_load.sag", f"{self.label}{drop}")
                 break
 

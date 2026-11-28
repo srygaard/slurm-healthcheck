@@ -7,16 +7,19 @@ from launcher.slurm import Gres
 
 
 def test_sxm_link_and_ecc_limits():
-    """The hardware fields. dcgm_timeout_s is tuned from measured suite times, so it is left out."""
+    """The hardware fields. The timeout and bandwidth floors are tuned from measurements, so they're left out."""
+
+    measured = {"dcgm_timeout_s": 0, "warn_loopback_busbw_GBps": 0}
 
     def part(name):
-        return replace(gpu_gres[name], dcgm_timeout_s=0)
+        return replace(gpu_gres[name], **measured)
 
-    sxm = GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, dcgm_timeout_s=0)
+    sxm = GpuLimits(require_ecc=True, min_pcie_gen=5, min_pcie_width=16, min_nvlinks=18, **measured)
     assert part("h100") == part("b200") == sxm
     assert sxm.max_volatile_uncorrected_ecc == sxm.max_remap_failures == sxm.max_remap_pending == 0
-    pcie = GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, dcgm_timeout_s=0)
+    pcie = GpuLimits(require_ecc=True, min_pcie_gen=4, min_pcie_width=16, min_nvlinks=0, **measured)
     assert part("l40s") == pcie
+    assert (gpu_gres["l40s"].pcie_GBps, gpu_gres["rtx"].pcie_GBps) == (32, 64)
 
 
 def test_gpu_limits_rejects_a_missing_or_unknown_chip():

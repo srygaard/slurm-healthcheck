@@ -21,7 +21,7 @@ class Section(BaseModel):
 
 @dataclass(frozen=True, kw_only=True)
 class GpuLimits:
-    """The GPU fields that describe the part rather than a measured floor. The count comes from JobTemplate."""
+    """The part's limits, including its NCCL loopback floors. The count comes from JobTemplate."""
 
     min_pcie_gen: int  # max link gen (current gen drops at idle)
     min_nvlinks: int
@@ -33,7 +33,18 @@ class GpuLimits:
     max_volatile_uncorrected_ecc: int = 0
     max_remap_failures: int = 0
     max_remap_pending: int = 0
+    # Rows remapped after an uncorrectable error: the repair worked, but a job likely crashed when the row failed.
+    # Corrected remaps are routine HBM repair and aren't graded; an increase during the run still fails in logs.
+    max_remap_uncorrected: int = 0  # warn above
     min_power_limit_frac: float = 0.95
+    # NCCL loopback busbw, GPU memory to its NIC: fail and warn below these, whatever the run's median
+    min_loopback_busbw_GBps: float = 3  # Rorqual H100: single-node ~6.4, a 65-node run near 3.7, lowest 3.22
+    warn_loopback_busbw_GBps: float = 0
+
+    @property
+    def pcie_GBps(self) -> float:
+        """The PCIe link's nominal bandwidth one way: ~1 GB/s per lane at Gen3, doubling each generation."""
+        return self.min_pcie_width * 2 ** (self.min_pcie_gen - 3)
 
 
 # Keyed by the Slurm GRES type in --gpus-per-node. H100 and B200 are PCIe Gen5 x16 with 18 NVLinks.
@@ -42,7 +53,9 @@ gpu_gres: dict[str, GpuLimits] = {
     # 4x H100: 367 s on Trillium, ~7 min on Rorqual
     "h100": GpuLimits(min_pcie_gen=5, min_nvlinks=18, dcgm_timeout_s=540),
     # 8x B200: 516 s on Trillium, ~35 s of it pcie
-    "b200": GpuLimits(min_pcie_gen=5, min_nvlinks=18, dcgm_timeout_s=650),
+    # The loopback warn line catches a slow majority, which the median fractions can't: on Lynx 18 of 20 B200 nodes
+    # sat near 12.9 GB/s, against ~20 with VT-d off.
+    "b200": GpuLimits(min_pcie_gen=5, min_nvlinks=18, dcgm_timeout_s=650, warn_loopback_busbw_GBps=18),
     "l40s": GpuLimits(min_pcie_gen=4, min_nvlinks=0, dcgm_timeout_s=600),
     # RTX PRO 6000 Blackwell Server Edition
     "rtx": GpuLimits(min_pcie_gen=5, min_nvlinks=0, dcgm_timeout_s=600),
@@ -65,10 +78,9 @@ class Nic(Section):
 
     min_active_ib_ports: int = 1
     link_layer: str = "InfiniBand"
-    # Warn when a GPU or an active fabric HCA is in a translated IOMMU domain.
-    warn_iommu_translated: bool = True
-    # IOMMU domain types that translate a device's DMA; "identity" (passthrough) and no IOMMU don't
-    translated_iommu_domains: set[str] = {"DMA", "DMA-FQ"}
+    # Warn when the node boots with IOMMU units (VT-d or AMD-Vi on). Lynx B200s with VT-d on lose ~35% GPU-to-NIC
+    # bandwidth in passthrough as well as translated mode, likely from the PCIe ACS the BIOS enables with it
+    warn_iommu_enabled: bool = True
 
 
 class Scratch(Section):
@@ -168,7 +180,9 @@ class CpuLoad(Section):
 
     enabled: bool = True
     busy_frac: float = 0.75  # of the job's CPUs, at SCHED_IDLE so the other steps still get CPU time when they need it
-    interval_s: float = 1  # at 5 s the median of a ~4 min full-power window shifted with the sampling phase
+    # At 5 s the clock of a ~4 min full-power window shifted with the sampling phase. 0.5 s catches dips of about a
+    # second, which the clock's mean then counts.
+    interval_s: float = 0.5
     full_power_frac: float = 0.9  # samples at this share of the run's peak GPU power count as full power
     min_full_power_s: float = 240  # time at full GPU power needed before the clocks are graded
     min_frac_of_median: float = 0.9  # a package's busy-core clock at full GPU power, against the run's packages' median
@@ -190,7 +204,9 @@ class NcclTest(Section):
     env: dict[str, str] = Field(default_factory=dict)
     # A round's stragglers are terminated and reported as timeout, so a hung test can't use up the job and skip phase C.
     timeout_s: float = 120
-    min_busbw_GBps: float = 0
+    min_busbw_GBps: float = 0  # loopback also uses GpuLimits.min_loopback_busbw_GBps
+    # On GPUs without NVLink (min_nvlinks 0), replaces min_busbw_GBps with this share of GpuLimits.pcie_GBps
+    min_frac_of_pcie: float | None = None
     min_frac_of_median: float | None = 0.9
     warn_frac_of_median: float | None = 0.95
     # Severity of an unblamed timeout of a whole-job test. A slow result still warns.
@@ -200,16 +216,20 @@ class NcclTest(Section):
 class Nccl(Section):
     """One NcclTest per kind. Turn a kind off with enabled=false.
 
-    Timeouts are about 3x the healthy times on Rorqual (intra 11 s, loopback 35 s, pair 15 s, a 21-node group 24 s,
-    a leaf alltoall 58 s). A node failing its socket connections took ~140 s per pair. alltoall_perf's busbw is
-    algbw * (n-1)/n and all_reduce_perf's is 2 * algbw * (n-1)/n, so the two don't compare.
+    Timeouts are ~3x the slowest healthy time seen (Lynx, tests run concurrently): intra 31 s, loopback 73 s,
+    pair 41 s, a 4-node group 113 s. A node failing its socket connections took ~140 s per pair.
+    alltoall_perf's busbw is algbw * (n-1)/n, half of all_reduce_perf's, so the two don't compare.
     """
 
     debug: str = "WARN"
+    # Intra depends on the GPU-to-GPU link, not the NVLink count alone: H100 and B200 both have 18 links, but B200's
+    # NVLink 5 is twice as fast. Without NVLink, 8 RTX PRO 6000s on Gen5 (64 GB/s) reach ~24.5 on Lynx; a Mila run of
+    # 4 L40S on Gen4 (32 GB/s) reached ~10. A quarter of the link gives 16 and 8.
     intra: NcclTest = NcclTest(
         name="intra",
-        timeout_s=45,
-        min_busbw_GBps=120,  # single-node ~337; a 65-node run sat near 149, with two nodes near 20
+        timeout_s=120,
+        min_busbw_GBps=120,  # Rorqual H100: single-node ~337; a 65-node run sat near 149, with two nodes near 20
+        min_frac_of_pcie=0.25,
     )
     loopback: NcclTest = NcclTest(
         name="loopback",
@@ -218,11 +238,10 @@ class Nccl(Section):
             "NCCL_SHM_DISABLE": "1",  # the same-node fallback is host shared memory, still off the NIC
             "NCCL_NVLS_ENABLE": "0",  # NVLink SHARP would still carry the reduction
         },
-        timeout_s=90,
-        min_busbw_GBps=3,  # single-node ~6.4; the same 65-node run sat near 3.7, lowest 3.22
+        timeout_s=240,
     )
-    pair: NcclTest = NcclTest(name="pair", timeout_s=45, min_busbw_GBps=20)
-    group: NcclTest = NcclTest(name="group", timeout_s=120, min_busbw_GBps=20)
+    pair: NcclTest = NcclTest(name="pair", timeout_s=150, min_busbw_GBps=20)
+    group: NcclTest = NcclTest(name="group", timeout_s=360, min_busbw_GBps=20)
     alltoall: NcclTest = NcclTest(
         name="alltoall",
         # Off: a 65-node alltoall was still starting at 180 s, and this 600 s timeout does not fit in the template's
@@ -274,7 +293,6 @@ class Homogeneity(Section):
         "os_release",
         "gpu.topo_hash",
         "nic.nvidia_peermem",
-        "iommu.units",  # Lynx: only lg00701 and lg01001 boot without one, and only they reach line rate from GPU memory
         "nic.net.ib0.mtu",
         "software.ofed",
         # rg21701 lost ~30% of its CPU clock under training load yet passed every check; only its BIOS differed
